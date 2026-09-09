@@ -1,0 +1,33 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pod-oomkilled-001
+case_version: "1"
+suite: phase1
+description: Container exceeds its memory limit and is repeatedly OOMKilled
+target:
+  apiVersion: v1
+  kind: Pod
+  namespace: eval-pod-oomkilled-001
+  name: oom-demo
+setup:
+  manifests:
+    - manifests/pod-oomkilled-001.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_equals
+  path: status.containerStatuses[0].lastState.terminated.reason
+  value: OOMKilled
+  timeout_seconds: 120
+ground_truth:
+  accepted_root_cause_codes: [CONTAINER_OOMKILLED]
+  required_evidence:
+    - source: kubernetes.status
+      path: actual_state.container_states[0].last_termination.reason
+      operator: equals
+      value: OOMKilled
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

@@ -1,0 +1,36 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pod-imagepullbackoff-001
+case_version: "1"
+suite: phase1
+description: Container image does not exist, kubelet cannot pull it
+target:
+  apiVersion: v1
+  kind: Pod
+  namespace: eval-pod-imagepullbackoff-001
+  name: imagepull-demo
+setup:
+  manifests:
+    - manifests/pod-imagepullbackoff-001.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_equals
+  path: status.containerStatuses[0].state.waiting.reason
+  value: ImagePullBackOff
+  timeout_seconds: 120
+ground_truth:
+  accepted_root_cause_codes: [IMAGE_PULL_FAILED]
+  required_evidence:
+    - source: kubernetes.status
+      path: actual_state.container_states[0].reason
+      operator: equals
+      value: ImagePullBackOff
+    - source: kubernetes.events
+      operator: equals
+      value: ErrImagePull
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

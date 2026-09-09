@@ -1,0 +1,371 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-kubelet
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - nodes
+  - nodes/metrics
+  - nodes/proxy
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ''
+  resources:
+  - services
+  - endpoints
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-kubelet
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-kubelet
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: observability
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: observability
+data:
+  prometheus.yml: "global:\n  scrape_interval: 15s\n  evaluation_interval: 15s\nscrape_configs:\n\
+    \  # Pod/container memory & cpu via kubelet cAdvisor (proxied by API server).\n\
+    \  - job_name: kubelet-cadvisor\n    kubernetes_sd_configs:\n      - role: node\n\
+    \    scheme: https\n    tls_config:\n      insecure_skip_verify: true\n    bearer_token_file:\
+    \ /var/run/secrets/kubernetes.io/serviceaccount/token\n    relabel_configs:\n\
+    \      - target_label: __address__\n        replacement: kubernetes.default.svc:443\n\
+    \      - source_labels: [__meta_kubernetes_node_name]\n        regex: (.+)\n \
+    \       target_label: __metrics_path__\n        replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor\n\
+    \    metric_relabel_configs:\n      - source_labels: [__name__]\n        regex:\
+    \ \"(container_memory_working_set_bytes|container_cpu_usage_seconds_total|container_restart_count)\"\
+    \n        action: keep\n  # Node-level metrics via node-exporter DaemonSet (hostNetwork\
+    \ :9100).\n  - job_name: node-exporter\n    kubernetes_sd_configs:\n      - role:\
+    \ node\n    relabel_configs:\n      - source_labels: [__address__]\n        regex:\
+    \ \"([^:]+)(:\\\\d+)?\"\n        replacement: \"${1}:9100\"\n        target_label:\
+    \ __address__\n  # Prometheus own metrics (sanity).\n  - job_name: prometheus\n\
+    \    static_configs:\n      - targets: [\"localhost:9090\"]\n"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: observability
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+      - name: prometheus
+        image: docker.m.daocloud.io/prom/prometheus:v2.53.0
+        args:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.retention.time=24h
+        - --web.enable-lifecycle
+        ports:
+        - name: http
+          containerPort: 9090
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+        - name: data
+          mountPath: /prometheus
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  selector:
+    app: prometheus
+  ports:
+  - name: http
+    port: 9090
+    targetPort: http
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: observability
+  labels:
+    app: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      hostNetwork: true
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: node-exporter
+        image: quay.m.daocloud.io/prometheus/node-exporter:v1.8.2
+        args:
+        - --path.procfs=/host/proc
+        - --path.sysfs=/host/sys
+        - --path.rootfs=/host/root
+        ports:
+        - name: metrics
+          containerPort: 9100
+          hostPort: 9100
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        - name: root
+          mountPath: /host/root
+          readOnly: true
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: root
+        hostPath:
+          path: /
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: observability
+data:
+  loki.yaml: "auth_enabled: false\nserver:\n  http_listen_port: 3100\ncommon:\n  path_prefix:\
+    \ /loki\n  storage:\n    filesystem:\n      chunks_directory: /loki/chunks\n \
+    \     rules_directory: /loki/rules\n  replication_factor: 1\n  ring:\n    instance_addr:\
+    \ 127.0.0.1\n    kvstore:\n      store: inmemory\nschema_config:\n  configs:\n\
+    \    - from: 2022-01-11\n      store: boltdb-shipper\n      object_store: filesystem\n\
+    \      schema: v11\n      index:\n        prefix: index_\n        period: 24h\n\
+    limits_config:\n  allow_structured_metadata: false\n"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: loki
+  namespace: observability
+  labels:
+    app: loki
+spec:
+  serviceName: loki
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki
+  template:
+    metadata:
+      labels:
+        app: loki
+    spec:
+      containers:
+      - name: loki
+        image: docker.m.daocloud.io/grafana/loki:2.9.7
+        args:
+        - -config.file=/etc/loki/loki.yaml
+        ports:
+        - name: http
+          containerPort: 3100
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+        volumeMounts:
+        - name: config
+          mountPath: /etc/loki
+        - name: data
+          mountPath: /loki
+      volumes:
+      - name: config
+        configMap:
+          name: loki-config
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: observability
+spec:
+  selector:
+    app: loki
+  ports:
+  - name: http
+    port: 3100
+    targetPort: http
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluent-bit
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluent-bit
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluent-bit
+subjects:
+- kind: ServiceAccount
+  name: fluent-bit
+  namespace: observability
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: observability
+data:
+  fluent-bit.conf: "[SERVICE]\n    Flush 1\n    Log_Level info\n    Parsers_File parsers.conf\n\
+    \n[INPUT]\n    Name tail\n    Tag kube.*\n    Path /var/log/containers/*.log\n\
+    \    Parser cri\n    DB /var/fluent-bit/flb_kube.db\n    Mem_Buf_Limit 8MB\n \
+    \   Skip_Long_Lines On\n    Refresh_Interval 10\n\n[FILTER]\n    Name kubernetes\n\
+    \    Match kube.*\n    Kube_URL https://kubernetes.default.svc:443\n    Kube_CA_File\
+    \ /var/run/secrets/kubernetes.io/serviceaccount/ca.crt\n    Kube_Token_File /var/run/secrets/kubernetes.io/serviceaccount/token\n\
+    \    Kube_Tag_Prefix kube.var.log.containers.\n    Merge_Log On\n    Merge_Log_Key\
+    \ log_processed\n\n[OUTPUT]\n    Name loki\n    Match kube.*\n    Host loki.observability.svc.cluster.local\n\
+    \    Port 3100\n    Labels job=fluent-bit, namespace=$kubernetes['namespace_name'],\
+    \ pod=$kubernetes['pod_name'], container=$kubernetes['container_name']\n    Remove_Keys\
+    \ kubernetes,stream,logtag,time,log_processed\n    Drop_Single_Key On\n    Line_Format\
+    \ json\n"
+  parsers.conf: "[PARSER]\n    Name cri\n    Format regex\n    Regex ^(?<time>[^ ]+)\
+    \ (?<stream>stdout|stderr) (?<logtag>[^ ]*) (?<message>.*)$\n    Time_Key time\n\
+    \    Time_Format %Y-%m-%dT%H:%M:%S.%L%z\n"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: observability
+  labels:
+    app: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+    spec:
+      serviceAccountName: fluent-bit
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: fluent-bit
+        image: docker.m.daocloud.io/fluent/fluent-bit:3.1.9
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 300m
+            memory: 256Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+        - name: run
+          mountPath: /var/fluent-bit
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: config
+          mountPath: /fluent-bit/etc/
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: config
+        configMap:
+          name: fluent-bit-config
+      - name: run
+        emptyDir: {}

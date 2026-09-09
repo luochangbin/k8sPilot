@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eval-pod-imagepullbackoff-001
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: imagepull-demo
+  namespace: eval-pod-imagepullbackoff-001
+  labels:
+    app: imagepull-demo
+spec:
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: registry.example.com/nonexistent/nope:v9

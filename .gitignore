@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets / local config
+.env
+
+# Node / plugin
+node_modules/
+dist/
+.eslintcache
+
+# Go
+connector/connector.exe
+
+# Embedded upstream checkout
+headlamp/
+
+# Runtime data
+*.pid
+*.log
+*.db
+*.db-wal
+*.db-shm
+eval-trace/
+eval-trace-degraded/
+
+# Eval run artifacts (baselines are published intentionally, not by default)
+eval/reports/
+reports/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

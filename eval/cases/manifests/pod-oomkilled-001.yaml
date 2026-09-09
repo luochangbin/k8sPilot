@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eval-pod-oomkilled-001
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oom-demo
+  namespace: eval-pod-oomkilled-001
+  labels:
+    app: oom-demo
+spec:
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: python:3-alpine
+      # Allocate 256Mi of anonymous memory against a 128Mi limit:
+      # the kernel OOM-kills the main process -> reason OOMKilled.
+      command: ["python3", "-c", "b = bytearray(256 * 1024 * 1024)"]
+      resources:
+        limits:
+          memory: 128Mi

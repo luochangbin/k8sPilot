@@ -1,0 +1,32 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pod-failedmount-pvc-001
+case_version: "1"
+suite: phase1
+description: Pod mounts a PVC that stays Pending (no matching storage class), mount never succeeds
+target:
+  apiVersion: v1
+  kind: Pod
+  namespace: eval-pod-failedmount-pvc-001
+  name: failedmount-pvc-demo
+setup:
+  manifests:
+    - manifests/pod-failedmount-pvc-001.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_equals
+  path: status.phase
+  value: Pending
+  timeout_seconds: 90
+ground_truth:
+  accepted_root_cause_codes: [VOLUME_MOUNT_FAILED, CONFIG_ERROR]
+  required_evidence:
+    - source: kubernetes.events
+      operator: equals
+      value: FailedMount
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

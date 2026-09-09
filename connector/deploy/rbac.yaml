@@ -1,0 +1,38 @@
+# Read-only RBAC for the connector. Phase 1 carries no write permissions
+# (create/update/patch/delete) anywhere in the system.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ai-agent-connector-readonly
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - events
+      - nodes
+      - namespaces
+      - services
+      - endpoints
+      - persistentvolumeclaims
+    verbs: [get, list, watch]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ai-agent-connector-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ai-agent-connector-readonly
+subjects:
+  - kind: ServiceAccount
+    name: ai-agent-connector
+    namespace: k8spilot
