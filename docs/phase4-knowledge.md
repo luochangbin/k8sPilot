@@ -1,8 +1,6 @@
 # Phase 4：知识增强与历史经验检索（RAG）
 
-设计依据：`K8S管理平台智能诊断系统设计.md` §25（Knowledge & Experience）。
-
-目标：在 Phase 3 的实时诊断之上叠加「文档知识 + 已验证历史 Incident」两类参考信息，帮助 Agent 在知识缺口处选择下一步实时 Tool、解释现象、生成建议。参考信息**永不**充当 Root Cause 证据——实时 Evidence 优先级恒高于任何检索结果（§25.1、§25.6、§25.7）。
+目标：在 Phase 3 的实时诊断之上叠加「文档知识 + 已验证历史 Incident」两类参考信息，帮助 Agent 在知识缺口处选择下一步实时 Tool、解释现象、生成建议。参考信息**永不**充当 Root Cause 证据——实时 Evidence 优先级恒高于任何检索结果。
 
 ## 范围与实现
 
@@ -128,12 +126,12 @@ KNOWLEDGE_DB=D:\AI\k8sPilot\data\knowledge.db
 ### Agent 集成（请求 → 工具门控）
 
 - `DiagnosisRequest.enable_knowledge` / `enable_incidents`：可选布尔；`None` = 模块可用即默认开启。二者都关闭等价于 Phase 2/3 的 Kubernetes-only（消融 A 组条件）。
-- 门控在 Agent 侧 `_retrieval_flags()` 决定工具是否暴露；关闭时 `search_*` 根本不进 Tool Schema，模型无法调用（§25.9 的 A/B/C 组因此成立）。
+- 门控在 Agent 侧 `_retrieval_flags()` 决定工具是否暴露；关闭时 `search_*` 根本不进 Tool Schema，模型无法调用，因此 A/B/C 消融组成立。
 - 结果解析在 `_parse_result()`：只接受 `retrieval_id` 命中本轮实际检索的引用，再注入 `used_for`，防止模型编造来源。
 
 ### 检索优先级与防误导
 
-提示词约定：实时 Evidence > 历史 Incident > 文档 > 模型自身。示例（§25.7）：历史 Case 指向数据库连接池，但当前 exitCode=137 / reason=OOMKilled / 内存贴近 Limit 时，Agent 必须判定内存超限，历史 Case 只能记为被否定的低优先级假设。冲突 Case 的合规行为已有单测与真机验证覆盖。
+提示词约定：实时 Evidence > 历史 Incident > 文档 > 模型自身。示例：历史 Case 指向数据库连接池，但当前 exitCode=137 / reason=OOMKilled / 内存贴近 Limit 时，Agent 必须判定内存超限，历史 Case 只能记为被否定的低优先级假设。冲突 Case 的合规行为已有单测与真机验证覆盖。
 
 ## UI：三分区展示
 
@@ -147,7 +145,7 @@ KNOWLEDGE_DB=D:\AI\k8sPilot\data\knowledge.db
 
 ## Eval：四组消融
 
-`eval` Runner/CLI 增加两个 tri-state 检索开关，每次 run 传一组条件（与 §25.9 表一致）：
+`eval` Runner/CLI 增加两个 tri-state 检索开关，每次 run 传一组条件：
 
 ```powershell
 python -m eval run --suite phase1 --runs N --profile <group> `
@@ -219,9 +217,9 @@ python -m eval run --suite phase1 --runs N --profile <group> `
 
 **门控证据**：开关值与实际暴露严格一致——A 组（双关）36 次全部零 `search_*`；B 组只发生知识检索、C 组只发生 Incident 检索；引用数等于命中数（无凭空引用）。模型在工具开放时自选是否检索（B/D 中部分 Case 未调用），符合「知识缺口才检索」策略。
 
-**证据完整性**：四组全部 144 个结果中，`evidence[]` 内**无任何**引用来源条目（无 `kb_`/`inc_`/`retrieval` source），检索引用从未冒充实时证据——§25.6 三类信息隔离与优先级成立。
+**证据完整性**：四组全部 144 个结果中，`evidence[]` 内**无任何**引用来源条目（无 `kb_`/`inc_`/`retrieval` source），检索引用从未冒充实时证据——三类信息隔离与优先级成立。
 
-对照 §25.9 发布门槛：
+对照发布门槛：
 
 - **关键 Case 无回归**：oomkilled/oomkilled-recovered/imagepull*/crashloop/failedmount-pvc/failedscheduling-node/configerror-env/healthy 四组 RCA 均 1.0 且稳定；`failedscheduling-resource` 由 A 0.333 升至 B/C/D 0.667（受益于检索）。
 - **Wrong Root Cause Rate 不升高**：A=0.059 → B/C/D≈0.028–0.029（下降）。
@@ -244,17 +242,17 @@ python -m eval run --suite phase1 --runs 3 --profile ablation-d --enable-knowled
 
 ## 偏离记录
 
-1. **ACL 标签入库但未强制鉴权**：文档/Incident 的 `acl_tags` 已建模入库，但当前 `search_knowledge`/`search_incidents` 未按调用者身份过滤（设计 §25.8 要求未授权内容不得进入候选）。原因：单集群、单 SRE 用户、无认证层，无「当前用户身份」可绑定。后续引入多用户/鉴权时必须补过滤，否则不得宣称 ACL 隔离生效。
-2. **Knowledge 为 agent-service 内模块而非独立服务**：设计初稿考虑独立 Knowledge Service；当前按 agent 内模块实现（`app/knowledge/`，进程内调用）。影响：无独立降级/超时边界——设计 §25.8 的 `knowledge_degraded`/`no_knowledge_match` 语义由 Agent 侧的「知识缺口才检索 + 检索失败不影响结论」近似覆盖，而非独立服务探活。可观测性（独立 service span、独立 P95）随本偏离受限。
+1. **ACL 标签入库但未强制鉴权**：文档/Incident 的 `acl_tags` 已建模入库，但当前 `search_knowledge`/`search_incidents` 未按调用者身份过滤；未授权内容不应进入候选。原因：单集群、单 SRE 用户、无认证层，无「当前用户身份」可绑定。后续引入多用户/鉴权时必须补过滤，否则不得宣称 ACL 隔离生效。
+2. **Knowledge 为 agent-service 内模块而非独立服务**：早期方案考虑独立 Knowledge Service；当前按 agent 内模块实现（`app/knowledge/`，进程内调用）。影响：无独立降级/超时边界——`knowledge_degraded`/`no_knowledge_match` 语义由 Agent 侧的「知识缺口才检索 + 检索失败不影响结论」近似覆盖，而非独立服务探活。可观测性（独立 service span、独立 P95）随本偏离受限。
 3. **检索失败路径的显式标记未落地**：`knowledge_degraded` / `no_knowledge_match` 尚未作为结构化字段写回 `DiagnosisResult`。已探针验证（2026-09-09）：`KNOWLEDGE_DB` 指向不可开路径（目录）时 app 启动即抛 `sqlite3.OperationalError` 退出（exit 1）——模块**配置可用但运行期 DB 不可开**时属非预期降级（无 `knowledge_degraded` 兜底）；而模块**未配置**（`KNOWLEDGE_DB` 为空）时降级正常（见验证记录 degraded 运行）。
-4. **历史 Incident 检索用 keyword（fts5），非向量**：设计 §25.9 的 Retrieval 指标（Recall@K、MRR/nDCG）为向量检索口径；当前实现为小型 curated 语料上的关键词检索，直接套用该指标集意义有限，正式评测应说明口径。
+4. **历史 Incident 检索用 keyword（fts5），非向量**：Retrieval 指标（Recall@K、MRR/nDCG）通常采用向量检索口径；当前实现为小型 curated 语料上的关键词检索，直接套用该指标集意义有限，正式评测应说明口径。
 
 ## 验证记录
 
 - `agent-service`：`.\.venv\Scripts\python -m pytest -q` → 34 passed（含 knowledge ingest/filter/search/gating/引用解析）。
 - `eval`：`python -m pytest eval/tests -q` → 14 passed（新增 3：`_run_diagnosis` 透传开/关、`auto` 省略键、CLI `_tri_state` 解析）。
 - **正式消融**（2026-09-09，12 Case × 4 组 × 3 次，n=36/组，全部完成）：见上文聚合/逐 Case/门控统计；报告目录 `reports/ablation-{a,b,c,d}-20260909T12/18xxxx/`。门控与配置一致（A=0 search，B 仅 kb 9/16，C 仅 inc 9/10，D kb8+inc7）；144 结果 evidence 完整性违规 = 0。
-- **降级运行（§25.10 验收6）**：临时第二实例（端口 8001，`KNOWLEDGE_DB` 置空、独立 DIAGNOSIS_DB/trace）跑 `reports/degraded-20260909T122847/`（configerror-env/oomkilled × 2）：4/4 `diagnosis_correct`，trace 仅实时工具、零 `search_*`。验证后实例已停止。
+- **降级运行**：临时第二实例（端口 8001，`KNOWLEDGE_DB` 置空、独立 DIAGNOSIS_DB/trace）跑 `reports/degraded-20260909T122847/`（configerror-env/oomkilled × 2）：4/4 `diagnosis_correct`，trace 仅实时工具、零 `search_*`。验证后实例已停止。
 - **崩溃路径探针（偏离3）**：`KNOWLEDGE_DB` 指向目录启动临时实例（端口 8002）→ `sqlite3.OperationalError: unable to open database file`，进程 exit 1（app 启动即失败，无优雅降级）。
 - 引用结构抽查：D 组 `diag_c4a5bc6bc729` 的真实 API 返回与 TS 端接口字段一致（`incident_id/product/.../verification/used_for`）。
 - Headlamp 插件：`tsc --noEmit` 0 错误、eslint 0 错误 0 警告、prettier 通过、`npm run build` 成功并复制到 `%APPDATA%\Headlamp\Config\plugins\ai-diagnosis-plugin\`。

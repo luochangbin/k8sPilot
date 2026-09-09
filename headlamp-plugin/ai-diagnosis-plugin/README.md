@@ -2,8 +2,6 @@
 
 Headlamp 插件（Phase 1）：在 **Pod 详情页**提供「智能诊断」入口，点击后向 k8sPilot Agent Service 提交诊断请求，轮询 Diagnosis Session，并展示结构化诊断结果（症状、调查过程、Root Cause、证据、置信度、修复建议）。
 
-设计参考：`K8S管理平台智能诊断系统设计.md` §22。
-
 ## 功能
 
 - Pod 详情页新增「智能诊断」区块。

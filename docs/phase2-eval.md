@@ -1,7 +1,5 @@
 # Phase 2：Agent 评测与能力改进
 
-设计依据：`K8S管理平台智能诊断系统设计.md` §23（Eval Harness）、§32（Trace）、§33（评测原则）。
-
 Phase 2 不扩展生产诊断能力，而是把 Phase 1 的 Kubernetes-only Agent 变成**可重复、可比较、可回归**的工程事实：版本化故障 Case → 注入 → 诊断 → Trace → 确定性评分 → 冻结基线 → 候选版本成对对照。
 
 ## 新增组件
@@ -48,7 +46,7 @@ python -m eval compare --baseline baseline-<ts> --candidate candidate-<ts> --rep
 
 Phase 3 引入 Prometheus/Loki 时，用同一 `--suite phase1` 跑 `K8s`、`K8s+Prometheus`、`K8s+Loki`、`K8s+Prometheus+Loki` 四组对照，证明每个数据源的净收益。
 
-## 验收标准（设计 §23.10）
+## 验收标准
 
 1. 一条命令完成 注入→判稳→诊断→Trace→评分→清理→报告，无人工改结果。
 2. 每 Case ≥5 次；报告区分 Agent/系统/Fixture 错误，可从 `diagnosis_id` 定位 Tool 路径。
@@ -58,6 +56,6 @@ Phase 3 引入 Prometheus/Loki 时，用同一 `--suite phase1` 跑 `K8s`、`K8s
 
 ## 已知边界
 
-- Trace 为轻量 JSONL（设计 §32 允许），未部署 OTLP Collector；Phase 2 不以完整观测平台为验收前提。
+- Trace 为轻量 JSONL，未部署 OTLP Collector；Phase 2 不以完整观测平台为验收前提。
 - Scorer 纯确定性，不引入 LLM 盲审；同义根因覆盖问题留给独立盲审维度。
 - `kubectl` 缺失或集群不可达时，Case 记为 `fixture_failed`（不计入准确率）。

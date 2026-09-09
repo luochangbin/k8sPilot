@@ -267,7 +267,6 @@ npm run build
 
 | 文档 | 内容 |
 |---|---|
-| [系统设计](K8S管理平台智能诊断系统设计.md) | 完整架构、契约、安全边界、阶段演进与验收标准 |
 | [Phase 1 E2E](docs/phase1-e2e.md) | 部署、故障注入和 Headlamp 端到端验收 |
 | [Phase 2 Eval](docs/phase2-eval.md) | Case、Runner、评分、基线与候选版本对照 |
 | [Phase 3 Deploy](docs/phase3-deploy.md) | Prometheus、Loki、持久化历史与降级验证 |
