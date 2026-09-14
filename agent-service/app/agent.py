@@ -254,12 +254,7 @@ class Agent:
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": msg.content}
             if tool_calls:
                 assistant_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in tool_calls
+                    self._tool_call_payload(tc) for tc in tool_calls
                 ]
             # Reasoning models (e.g. DeepSeek thinking mode) require their
             # reasoning_content to be passed back verbatim on the next turn.
@@ -384,6 +379,24 @@ class Agent:
                      result=DiagnosisResult(investigation_steps=steps))
 
     @staticmethod
+    def _tool_call_payload(tc: Any) -> dict[str, Any]:
+        """Serialize a tool call for the next request, preserving any
+        provider-specific fields. Gemini thinking models attach a
+        thought_signature (via `extra_content`) that must be echoed back
+        verbatim, otherwise the follow-up request fails with HTTP 400."""
+        payload: dict[str, Any] = {
+            "id": tc.id,
+            "type": "function",
+            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+        }
+        for key, value in (getattr(tc, "model_extra", None) or {}).items():
+            payload.setdefault(key, value)
+        extra_content = getattr(tc, "extra_content", None)
+        if extra_content is not None:
+            payload.setdefault("extra_content", extra_content)
+        return payload
+
+    @staticmethod
     def _inject_target_uid(name: str, args: dict[str, Any], target: ResourceRef) -> dict[str, Any]:
         """Pass the platform-provided UID into inspect calls for the target itself.
 
@@ -416,13 +429,50 @@ class Agent:
         return bool(args.get("symptom") or args.get("root_cause_code")
                     or args.get("root_cause") or args.get("evidence"))
 
+    @staticmethod
+    def _as_str_list(value: Any) -> list[str]:
+        """Normalize a list-of-str field. Lists pass through; a JSON-encoded
+        array string (sometimes emitted by reasoning models) is decoded; any
+        other non-empty string is kept as a single item. Never char-split."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(x) for x in value]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed]
+            return [text]
+        return [str(value)]
+
+    @staticmethod
+    def _as_dict_list(value: Any) -> list[dict[str, Any]]:
+        """Normalize a list-of-dict field; drops anything that is not a dict."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                return []
+            if not isinstance(parsed, list):
+                return []
+            value = parsed
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, dict)]
+
     def _parse_result(self, args: dict[str, Any], steps: list[str],
                       retrieved: Optional[dict[str, Any]] = None) -> DiagnosisResult:
         retrieved = retrieved or {}
         evidence: list[Evidence] = []
-        for e in args.get("evidence") or []:
-            if not isinstance(e, dict):
-                continue
+        for e in self._as_dict_list(args.get("evidence")):
             evidence.append(Evidence(
                 source=str(e.get("source", "")),
                 observed_at=str(e.get("observed_at")) if e.get("observed_at") else None,
@@ -437,13 +487,13 @@ class Agent:
             root_cause_code = root_cause_code.strip() or None
         knowledge_references = [
             {**retrieved[it["retrieval_id"]], "used_for": it.get("used_for", "")}
-            for it in (args.get("knowledge_references") or [])
-            if isinstance(it, dict) and it.get("retrieval_id") in retrieved
+            for it in self._as_dict_list(args.get("knowledge_references"))
+            if it.get("retrieval_id") in retrieved
         ]
         historical_cases = [
             {**retrieved[it["retrieval_id"]], "used_for": it.get("used_for", "")}
-            for it in (args.get("historical_cases") or [])
-            if isinstance(it, dict) and it.get("retrieval_id") in retrieved
+            for it in self._as_dict_list(args.get("historical_cases"))
+            if it.get("retrieval_id") in retrieved
         ]
         return DiagnosisResult(
             symptom=str(args.get("symptom", "")),
@@ -451,8 +501,8 @@ class Agent:
             root_cause=args.get("root_cause") or None,
             root_cause_code=root_cause_code,
             confidence=args.get("confidence"),
-            recommendations=[str(r) for r in (args.get("recommendations") or [])],
-            missing_evidence=[str(m) for m in (args.get("missing_evidence") or [])],
+            recommendations=self._as_str_list(args.get("recommendations")),
+            missing_evidence=self._as_str_list(args.get("missing_evidence")),
             insufficient_evidence=bool(args.get("insufficient_evidence", False)),
             investigation_steps=steps,
             knowledge_references=knowledge_references,

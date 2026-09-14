@@ -60,6 +60,89 @@ def test_successful_diagnosis_completes_with_parsed_result():
     assert connector.call_log[0] == "inspect"
 
 
+def test_stringified_json_list_fields_are_normalized_not_char_split():
+    """Reasoning models sometimes emit array fields as a JSON-encoded string.
+    Parsing must deserialize them; iterating over the raw string would split
+    every character into its own item (regression: 修复建议竖排展示)."""
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "Pod 持续重启",
+            "evidence": json.dumps([{"source": "kubernetes.status", "summary": "OOMKilled"}]),
+            "root_cause": "容器内存上限不足",
+            "confidence": "high",
+            "recommendations": json.dumps(["提高 memory limit", "重启前检查堆配置"], ensure_ascii=False),
+            "missing_evidence": json.dumps(["Prometheus 指标缺失"], ensure_ascii=False),
+        }),
+    ])
+    d = run(make_agent(llm))
+
+    assert d.status == "completed"
+    assert d.result is not None
+    assert len(d.result.evidence) == 1
+    assert d.result.evidence[0].summary == "OOMKilled"
+    assert d.result.recommendations == ["提高 memory limit", "重启前检查堆配置"]
+    assert d.result.missing_evidence == ["Prometheus 指标缺失"]
+
+
+def test_plain_string_single_field_is_wrapped_not_split():
+    """A bare string for a list field is treated as a single item."""
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "Pod 持续重启",
+            "evidence": [{"source": "kubernetes.status", "summary": "OOMKilled"}],
+            "root_cause": "容器内存上限不足",
+            "confidence": "high",
+            "recommendations": "建议先核对 ConfigMap 挂载再重启",
+        }),
+    ])
+    d = run(make_agent(llm))
+
+    assert d.status == "completed"
+    assert d.result.recommendations == ["建议先核对 ConfigMap 挂载再重启"]
+
+
+def test_dict_list_helper_rejects_non_list_or_bad_json_string():
+    from app.agent import Agent
+    assert Agent._as_dict_list('[{"a": 1}, {"a": 2}]') == [{"a": 1}, {"a": 2}]
+    assert Agent._as_dict_list("not-json") == []
+    assert Agent._as_dict_list({"a": 1}) == []
+
+
+def test_tool_call_provider_extras_are_echoed_back():
+    """Gemini thinking models require the thought_signature attached to a
+    function call part to be sent back verbatim; dropping it yields HTTP 400
+    ('Function call is missing a thought_signature')."""
+    seen_messages = []
+
+    class RecordingLLM(ScriptedLLM):
+        def chat(self, messages, tools, tool_choice):
+            seen_messages.append(messages)
+            return super().chat(messages, tools, tool_choice)
+
+    extra = {"google": {"thought_signature": "sig-abc"}}
+    llm = RecordingLLM([
+        ScriptedLLM.tool_response_with_extra(
+            "inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}, extra),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "Pod 持续重启",
+            "evidence": [{"source": "kubernetes.status", "summary": "OOMKilled"}],
+            "root_cause": "容器内存上限不足",
+            "confidence": "high",
+            "recommendations": [],
+        }),
+    ])
+    d = run(make_agent(llm))
+
+    assert d.status == "completed"
+    assistant = next(
+        m for m in seen_messages[1]
+        if m.get("role") == "assistant" and m.get("tool_calls")
+    )
+    assert assistant["tool_calls"][0]["extra_content"] == extra
+
+
 def test_insufficient_evidence_is_completed_not_failed():
     llm = ScriptedLLM([
         ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}),

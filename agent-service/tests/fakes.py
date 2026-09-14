@@ -85,6 +85,21 @@ class ScriptedLLM:
         )
 
     @staticmethod
+    def tool_response_with_extra(name: str, args: dict, extra_content: dict,
+                                 call_id: str = "call_1") -> Any:
+        """Simulate a provider (e.g. Gemini thinking) that attaches extra data
+        such as thought_signature to the function call part."""
+        tc = SimpleNamespace(
+            id=call_id,
+            type="function",
+            function=SimpleNamespace(name=name, arguments=json.dumps(args)),
+        )
+        tc.model_extra = {"extra_content": extra_content}
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=None, tool_calls=[tc]),
+        )])
+
+    @staticmethod
     def tool_response_with_reasoning(name: str, args: dict, reasoning: str, call_id: str = "call_1") -> Any:
         msg = SimpleNamespace(
             content=None,
