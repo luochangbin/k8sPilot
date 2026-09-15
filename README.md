@@ -27,7 +27,7 @@ k8sPilot 是一个面向单集群 Kubernetes 的 **Headlamp 智能诊断插件**
 - **Headlamp 原生入口**：无需切换到独立控制台，在资源详情页发起诊断并查看结果。
 - **Agentic 故障调查**：Agent 根据已获得的证据动态选择 `inspect`、`relations`、`events`、`logs`、`query_metrics` 和 `query_logs`，而不是一次性抓取全部集群数据。
 - **多源实时证据**：融合 Kubernetes API、Pod Logs、Prometheus 指标和 Loki 日志；外部数据源不可用时自动降级到 Kubernetes-only 路径。
-- **知识与经验增强**：检索 Runbook、已知问题和已验证的历史 Incident，辅助形成假设和选择调查路径。
+- **知识与经验增强（Phase 4，暂不实现：缺乏知识库）**：Runbook / 已知问题 / 已验证历史 Incident 的检索机制与消融实验代码已保留，但当前没有真实运维知识库，默认关闭（`KNOWLEDGE_DB` 未设置即不启用）。
 - **可解释诊断结果**：Root Cause 必须由实时 Evidence 支撑；证据不足时明确返回缺失证据，不编造唯一结论。
 - **可重复能力评测**：通过故障注入、Trace、自动评分、冻结基线和候选版本对照，量化准确率、证据质量、成本与延迟。
 - **最小权限边界**：Agent 不持有 kubeconfig；集群访问集中在使用只读 ServiceAccount 的 Connector 中。
@@ -39,7 +39,7 @@ flowchart LR
     User["SRE / Developer"] --> Headlamp["Headlamp<br/>AI Diagnosis Plugin"]
     Headlamp --> Agent["Agent Service<br/>Session + Tool Calling"]
     Agent <--> LLM["OpenAI-compatible LLM"]
-    Agent --> Knowledge["Knowledge & Incident Store"]
+    Agent --> Knowledge["Knowledge & Incident Store<br/>(Phase 4 · 暂不实现)"]
     Agent --> Connector["Read-only Connector"]
     Connector --> K8s["Kubernetes API"]
     Connector --> Prometheus["Prometheus"]
@@ -55,7 +55,7 @@ Headlamp 中点击「智能诊断」
   → Agent 形成初始假设
   → 按需调用 Connector 获取实时事实
   → 用新证据验证、修正或放弃假设
-  → 必要时检索历史 Incident / Runbook
+  → 必要时检索历史 Incident / Runbook（Phase 4，暂不实现：缺乏知识库）
   → 输出 Root Cause、Evidence、Confidence 与 Recommendations
 ```
 
@@ -165,7 +165,9 @@ kubectl -n observability get pods
 
 Connector 会通过 `/capabilities` 暴露可用数据源。Prometheus 或 Loki 不可用时，诊断仍会继续，并在结果中记录降级原因。详细部署与验收方式见 [Phase 3 部署文档](docs/phase3-deploy.md)。
 
-### 5. 导入并启用知识库（可选）
+### 5. 导入并启用知识库（可选 · Phase 4 暂不实现）
+
+> **状态：暂不实现（缺乏知识库）**。当前没有可用的真实运维知识库，`KNOWLEDGE_DB` 默认未设置、知识检索模块默认关闭。代码与消融实验保留在 `agent-service/app/knowledge` 与 `eval` 中作机制记录，以下步骤仅在未来接入知识库时使用，不属当前交付范围。
 
 Phase 4 使用本地 SQLite FTS5 保存 Runbook、Known Issue 和人工验证过的 Incident。当前支持复用由 k8sPilot 生成的兼容 `knowledge.db`，或先把已有资料映射为 `KnowledgeDocument` / `IncidentCase` 种子数据，再执行内置摄取命令：
 
@@ -227,8 +229,8 @@ python -m eval compare --baseline <baseline-run> --candidate <candidate-run> --r
 | Phase 1 | Headlamp 单集群人工诊断 | ✅ 已完成 |
 | Phase 2 | Agent 评测、基线与回归闭环 | ✅ 已完成 |
 | Phase 3 | Prometheus/Loki、持久化历史、多资源入口 | ✅ 已实现 |
-| Phase 4 | Runbook RAG 与历史 Incident 检索 | 🟡 已实现，测试中 |
-| Phase 5 | Alertmanager 告警自动诊断 | 🗺️ 规划中 |
+| Phase 4 | Runbook RAG 与历史 Incident 检索 | ⏸️ 暂不实现（缺乏知识库） |
+| Phase 5 | Alertmanager 告警自动诊断 | 🚧 实现中 |
 | Phase 6 | 只读修复计划与人工审批 | 🗺️ 规划中 |
 | Phase 7 | Policy + Executor 受控执行与审计 | 🗺️ 规划中 |
 
@@ -270,7 +272,7 @@ npm run build
 | [Phase 1 E2E](docs/phase1-e2e.md) | 部署、故障注入和 Headlamp 端到端验收 |
 | [Phase 2 Eval](docs/phase2-eval.md) | Case、Runner、评分、基线与候选版本对照 |
 | [Phase 3 Deploy](docs/phase3-deploy.md) | Prometheus、Loki、持久化历史与降级验证 |
-| [Phase 4 Knowledge](docs/phase4-knowledge.md) | 知识摄取、历史 Incident、引用约束与消融实验 |
+| [Phase 4 Knowledge](docs/phase4-knowledge.md) | 知识摄取、历史 Incident、引用约束与消融实验（**暂不实现：缺乏知识库**） |
 | [Model Benchmark](docs/model-benchmark.md) | 评分口径 v3、模型 Profile、多模型评测与报告 |
 
 ## 模型对比（2026-09-15）
