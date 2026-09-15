@@ -1,0 +1,165 @@
+"""Multi-model benchmark tests (offline: plan, budget, identity, failure)."""
+
+import json
+from pathlib import Path
+
+from eval.benchmark import build_plan, run_benchmark
+from eval.cases import Budgets, Case, GroundTruth, ReadyWhen, Target
+
+SUITE = Path(__file__).resolve().parents[1] / "suites" / "phase1.yaml"
+
+
+def _case(cid: str) -> Case:
+    return Case(
+        schema_version="eval.k8spilot.io/v1alpha1", id=cid, case_version="1", suite="test",
+        description="", target=Target(apiVersion="v1", kind="Pod", namespace="ns", name=cid),
+        ready_when=ReadyWhen(type="jsonpath_equals", path="status.phase", value="Running"),
+        ground_truth=GroundTruth(), budgets=Budgets(),
+    )
+
+
+def _row(case_id, *, verdict="diagnosis_correct", status="completed"):
+    return {
+        "case_id": case_id, "case_version": "1", "verdict": verdict,
+        "fixture_ready": True, "abstention_expected": False, "explicit_root_cause": True,
+        "valid_abstention": False, "conflicting_abstention": False, "invalid_output": False,
+        "root_cause_correct": verdict == "diagnosis_correct", "wrong_root_cause": False,
+        "abstention_correct": None, "evidence_recall": 1.0,
+        "required_evidence_match_ratio": 1.0, "evidence_returned": 1, "required_evidence": 1,
+        "tool_calls": 1, "duplicate_tool_calls": 0, "llm_calls": 1, "token_usage": 10,
+        "token_usage_complete": True, "trace_present": True,
+        "duration_ms": 1.0, "trace_failure_layer": None, "truncated_logs": False,
+        "diagnosis_id": None, "status": status, "error": None,
+    }
+
+
+def _write_trace(trace_dir: Path, diagnosis_id: str, model: str,
+                 include_response: bool = True) -> None:
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    llm_attrs = {"prompt_tokens": 10, "completion_tokens": 5, "attempts": 2}
+    if include_response:
+        llm_attrs["response_model_id"] = model
+    spans = [
+        {"kind": "diagnosis_root", "name": "diagnosis", "resolved_profile": model,
+         "requested_model_id": model, "provider": "commandcode",
+         "protocol": "openai_chat_completions", "config_fingerprint": "fp123",
+         "effective_parameters": {"max_tokens": 2048}},
+        {"kind": "llm_call", "name": "llm.call", "attributes": llm_attrs},
+    ]
+    (trace_dir / f"{diagnosis_id}.jsonl").write_text(
+        "\n".join(json.dumps(s) for s in spans) + "\n", encoding="utf-8")
+
+
+class FakeRunner:
+    def __init__(self, *, cleanup_fail_at=None, verdict="diagnosis_correct",
+                 trace_dir=None, include_response=True):
+        self.calls = []
+        self.cleanup_fail_at = cleanup_fail_at
+        self.verdict = verdict
+        self.trace_dir = Path(trace_dir) if trace_dir else None
+        self.include_response = include_response
+
+    def _k8s_version(self):
+        return "fake"
+
+    def run_case_attempt(self, case, run_id, attempt_index, *, enable_knowledge=None,
+                         enable_incidents=None, model_profile=None):
+        self.calls.append((case.id, model_profile))
+        row = _row(case.id, verdict=self.verdict)
+        row["diagnosis_id"] = f"diag_{len(self.calls)}"
+        if self.trace_dir and model_profile:
+            _write_trace(self.trace_dir, row["diagnosis_id"], model_profile,
+                         include_response=self.include_response)
+        if self.cleanup_fail_at == len(self.calls):
+            row["cleanup_failed"] = "boom"
+        return row
+
+
+def test_build_plan_2x2x2_is_eight_unique_and_seed_reproducible():
+    cases = [_case("a"), _case("b")]
+    plan = build_plan(cases, ["m1", "m2"], 2, seed=42)
+    assert len(plan) == 8
+    assert len({p["attempt_id"] for p in plan}) == 8
+    assert [p["execution_order"] for p in plan] == list(range(1, 9))
+    assert build_plan(cases, ["m1", "m2"], 2, seed=42) == plan
+    assert build_plan(cases, ["m1", "m2"], 2, seed=7) != plan
+
+
+def _run(tmp_path, *, runner, trace_dir=None, **kw):
+    return run_benchmark(
+        suite_path=SUITE, case_ids=["pod-healthy-001", "pod-oomkilled-001"],
+        models=["m1", "m2"], runs_per_case=2, seed=1, agent_url="http://x",
+        trace_dir=trace_dir, reports_dir=str(tmp_path), runner=runner, **kw)
+
+
+def test_benchmark_records_all_attempts_and_null_usage(tmp_path):
+    runner = FakeRunner()
+    benchmark_id, run_dir = _run(tmp_path, runner=runner)
+    assert len(runner.calls) == 8
+    report = json.loads((run_dir / "model-benchmark.json").read_text(encoding="utf-8"))
+    assert report["attempts"] == 8
+    assert report["stop_reason"] is None
+    assert report["per_model"]["m1"]["attempt_count"] == 4
+    assert report["per_model"]["m2"]["attempt_count"] == 4
+    assert len((run_dir / "attempts.jsonl").read_text(encoding="utf-8").splitlines()) == 8
+    first = json.loads((run_dir / "attempts.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert first["input_tokens"] is None
+    assert first["output_tokens"] is None
+    assert first["cost_estimate"] is None
+    assert first["usage_complete"] is False
+    # No Trace -> no execution identity evidence -> must not claim comparability.
+    assert report["comparable"] is False
+    assert "identity" in report["incomparable_reason"]
+
+
+def test_benchmark_comparable_only_with_verified_identity(tmp_path):
+    trace_dir = tmp_path / "trace"
+    runner = FakeRunner(trace_dir=trace_dir)
+    benchmark_id, run_dir = _run(tmp_path, runner=runner, trace_dir=str(trace_dir))
+    report = json.loads((run_dir / "model-benchmark.json").read_text(encoding="utf-8"))
+    assert report["comparable"] is True
+    assert report["incomparable_reason"] is None
+    assert report["per_model"]["m1"]["identity_verified_attempts"] == 4
+    assert report["per_model"]["m1"]["resolved_profiles"] == ["m1"]
+    lines = [json.loads(l) for l in
+             (run_dir / "attempts.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert all(a["identity_ok"] is True for a in lines)
+    assert all(a["llm_request_attempts"] == 2 for a in lines)
+
+
+def test_benchmark_missing_response_identity_is_incomparable(tmp_path):
+    trace_dir = tmp_path / "trace"
+    runner = FakeRunner(trace_dir=trace_dir, include_response=False)
+    benchmark_id, run_dir = _run(tmp_path, runner=runner, trace_dir=str(trace_dir))
+    report = json.loads((run_dir / "model-benchmark.json").read_text(encoding="utf-8"))
+    assert report["comparable"] is False
+    assert "missing_response_identity" in report["incomparable_reason"]
+    lines = [json.loads(l) for l in
+             (run_dir / "attempts.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert all(a["identity_ok"] is False for a in lines)
+
+
+def test_benchmark_max_diagnoses_stops(tmp_path):
+    runner = FakeRunner()
+    benchmark_id, run_dir = _run(tmp_path, runner=runner, max_diagnoses=3)
+    assert len(runner.calls) == 3
+    report = json.loads((run_dir / "model-benchmark.json").read_text(encoding="utf-8"))
+    assert report["attempts"] == 3
+    assert report["stop_reason"] == "max_diagnoses_reached"
+
+
+def test_benchmark_cleanup_failure_stops(tmp_path):
+    runner = FakeRunner(cleanup_fail_at=2)
+    benchmark_id, run_dir = _run(tmp_path, runner=runner)
+    assert len(runner.calls) == 2
+    report = json.loads((run_dir / "model-benchmark.json").read_text(encoding="utf-8"))
+    assert report["stop_reason"] == "cleanup_failed"
+
+
+def test_benchmark_records_failed_attempts(tmp_path):
+    runner = FakeRunner(verdict="system_failed")
+    benchmark_id, run_dir = _run(tmp_path, runner=runner)
+    report = json.loads((run_dir / "model-benchmark.json").read_text(encoding="utf-8"))
+    assert report["attempts"] == 8
+    lines = (run_dir / "attempts.jsonl").read_text(encoding="utf-8").splitlines()
+    assert any(json.loads(l)["failure_category"] == "system_failed" for l in lines)

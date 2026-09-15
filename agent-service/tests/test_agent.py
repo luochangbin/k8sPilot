@@ -529,3 +529,38 @@ def test_empty_submit_result_is_steered_not_accepted():
     assert d.status == "completed"
     assert d.result.root_cause_code == "CRASH_LOOP_BACKOFF"
     assert seen_steers == 1
+
+def test_trace_records_actual_llm_attempts(tmp_path):
+    cfg = Config()
+    cfg.trace_dir = str(tmp_path)
+    cfg.max_tool_calls = 12
+
+    class RetryLLM(ScriptedLLM):
+        def __init__(self, script, attempts):
+            super().__init__(script)
+            self._attempts = attempts
+            self.last_attempt_count = 1
+            self.max_retries = 5
+
+        def chat(self, messages, tools, tool_choice):
+            resp = super().chat(messages, tools, tool_choice)
+            self.last_attempt_count = self._attempts
+            return resp
+
+    llm = RetryLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "s", "evidence": [{"source": "kubernetes.status", "summary": "x"}],
+            "root_cause": "r", "confidence": "high", "recommendations": [],
+        }),
+    ], attempts=2)
+    store = SessionStore()
+    d = store.create(make_request())
+    Agent(cfg, StubConnector(), llm).run(make_request(), store, d.diagnosis_id)
+
+    spans = [json.loads(l) for l in
+             (tmp_path / f"{d.diagnosis_id}.jsonl").read_text(encoding="utf-8").splitlines()]
+    llm_spans = [s for s in spans if s.get("kind") == "llm_call"]
+    assert llm_spans
+    assert all(s["attributes"]["attempts"] == 2 and s["attributes"]["retries"] == 1
+               for s in llm_spans)

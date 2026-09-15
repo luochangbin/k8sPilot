@@ -43,16 +43,21 @@ def _case(**overrides):
     return Case(**base)
 
 
-def _row(case, *, verdict=VERDICT_CORRECT, **kw):
+def _row(case, *, verdict=VERDICT_CORRECT, abstention_expected=False, **kw):
     row = {
         "case_id": case.id,
         "case_version": case.case_version,
         "verdict": verdict,
-        "root_cause_correct": verdict == VERDICT_CORRECT and not case.ground_truth.abstention_expected,
-        "abstention_correct": verdict == VERDICT_CORRECT if case.ground_truth.abstention_expected else None,
-        "wrong_root_cause": False,
+        "fixture_ready": True,
+        "abstention_expected": abstention_expected,
+        "explicit_root_cause": verdict == VERDICT_CORRECT and not abstention_expected,
+        "valid_abstention": verdict == VERDICT_CORRECT and abstention_expected,
+        "conflicting_abstention": False,
+        "root_cause_correct": verdict == VERDICT_CORRECT and not abstention_expected,
+        "wrong_root_cause": verdict == VERDICT_INCORRECT and not abstention_expected,
+        "abstention_correct": (verdict == VERDICT_CORRECT) if abstention_expected else None,
         "evidence_recall": None,
-        "evidence_precision": None,
+        "required_evidence_match_ratio": None,
         "evidence_returned": 0,
         "required_evidence": 1,
         "tool_calls": 0,
@@ -147,6 +152,133 @@ def test_score_abstention():
                      result={"root_cause_code": "CONFIG_ERROR", "insufficient_evidence": False, "evidence": []},
                      error=None, trace=None)
     assert bad["verdict"] == VERDICT_INCORRECT
+
+
+def test_score_conflicting_abstention_is_not_valid_abstention():
+    case = _case()
+    case.ground_truth.abstention_expected = True
+    result = {"root_cause_code": "CONFIG_ERROR", "insufficient_evidence": True, "evidence": []}
+    row = score_case(case, fixture_ready=True, diagnosis_status="completed",
+                     result=result, error=None, trace=None)
+    assert row["valid_abstention"] is False
+    assert row["conflicting_abstention"] is True
+    assert row["wrong_root_cause"] is True
+    assert row["abstention_correct"] is False
+    assert row["verdict"] == VERDICT_INCORRECT
+
+
+def test_score_extra_evidence_not_fabricated_but_lowers_match_ratio():
+    case = _case()
+    result = {
+        "root_cause_code": "CONTAINER_OOMKILLED", "insufficient_evidence": False,
+        "evidence": [
+            {"source": "kubernetes.status",
+             "path": "status.containerStatuses[0].lastState.terminated.reason",
+             "operator": "equals", "value": "OOMKilled"},
+            {"source": "kubernetes.logs", "path": "data", "operator": "contains", "value": "noise"},
+        ],
+    }
+    row = score_case(case, fixture_ready=True, diagnosis_status="completed",
+                     result=result, error=None, trace=None)
+    assert row["evidence_recall"] == 1.0
+    assert row["required_evidence_match_ratio"] == 0.5
+    assert row["evidence_returned"] == 2
+
+
+def test_score_duplicate_evidence_deduped_not_inflating():
+    case = _case()
+    req = {"source": "kubernetes.status",
+           "path": "status.containerStatuses[0].lastState.terminated.reason",
+           "operator": "equals", "value": "OOMKilled"}
+    result = {"root_cause_code": "CONTAINER_OOMKILLED", "insufficient_evidence": False,
+              "evidence": [dict(req), dict(req)]}
+    row = score_case(case, fixture_ready=True, diagnosis_status="completed",
+                     result=result, error=None, trace=None)
+    assert row["evidence_returned"] == 1
+    assert row["required_evidence_match_ratio"] == 1.0
+    assert row["evidence_recall"] == 1.0
+
+
+def test_report_zero_denominator_is_null():
+    case = _case()
+    rows = [_row(case, verdict=VERDICT_CORRECT, abstention_expected=True, abstention_correct=True)]
+    rep = build_report(rows)
+    assert rep["root_cause_accuracy"] is None
+    assert rep["answerable_coverage"] is None
+    assert rep["abstention_recall"] == 1.0
+
+
+def test_report_no_fixture_ok_yields_null_rates():
+    case = _case()
+    rows = [_row(case, verdict=VERDICT_FIXTURE_FAILED, fixture_ready=False, root_cause_correct=None)]
+    rep = build_report(rows)
+    assert rep["end_to_end_correct_rate"] is None
+    assert rep["wrong_root_cause_rate"] is None
+    assert rep["fixture_failed_rate"] == 1.0
+
+
+def test_score_conflicting_abstention_on_answerable_is_invalid_not_correct():
+    """insufficient_evidence=true with an explicit root cause is contradictory
+    output: even if the code matches ground truth it must not be scored correct,
+    and it must not be silently dropped (explicit risk marker stays)."""
+    case = _case()
+    result = {
+        "root_cause_code": "CONTAINER_OOMKILLED", "root_cause": "内存超限",
+        "insufficient_evidence": True,
+        "evidence": [{"source": "kubernetes.status",
+                      "path": "status.containerStatuses[0].lastState.terminated.reason",
+                      "operator": "equals", "value": "OOMKilled"}],
+    }
+    row = score_case(case, fixture_ready=True, diagnosis_status="completed",
+                     result=result, error=None, trace=None)
+    assert row["conflicting_abstention"] is True
+    assert row["invalid_output"] is True
+    assert row["explicit_root_cause"] is True
+    assert row["root_cause_correct"] is False
+    assert row["wrong_root_cause"] is False
+    assert row["verdict"] == VERDICT_INCORRECT
+
+
+def test_summarize_trace_unknown_tokens_are_none_not_zero():
+    empty = summarize_trace(None)
+    assert empty["token_usage"] is None
+    assert empty["token_usage_complete"] is False
+    no_usage = summarize_trace({"spans": [
+        {"kind": "llm_call", "name": "llm.call", "attributes": {"duration_ms": 1.0}},
+    ]})
+    assert no_usage["token_usage"] is None
+    assert no_usage["token_usage_complete"] is False
+
+
+def test_required_evidence_missing_operator_does_not_match():
+    from eval.cases import EvidenceRequirement
+    case = _case()
+    case.ground_truth.required_evidence = [EvidenceRequirement(
+        source="kubernetes.status", path="p", operator="equals", value="OOMKilled")]
+    result = {"root_cause_code": "CONTAINER_OOMKILLED", "insufficient_evidence": False,
+              "evidence": [{"source": "kubernetes.status", "path": "p", "value": "OOMKilled"}]}
+    row = score_case(case, fixture_ready=True, diagnosis_status="completed",
+                     result=result, error=None, trace=None)
+    assert row["evidence_recall"] == 0.0
+    assert row["required_evidence_match_ratio"] == 0.0
+
+
+def test_required_evidence_resource_uid_enforced():
+    from eval.cases import EvidenceRequirement
+    req = EvidenceRequirement(source="kubernetes.status", path="p", operator="equals",
+                              value="v", resource_uid="uid-1")
+    case = _case()
+    case.ground_truth.required_evidence = [req]
+    good = {"root_cause_code": "CONTAINER_OOMKILLED", "insufficient_evidence": False,
+            "evidence": [{"source": "kubernetes.status", "path": "p", "operator": "equals",
+                          "value": "v", "resource_uid": "uid-1"}]}
+    bad = {"root_cause_code": "CONTAINER_OOMKILLED", "insufficient_evidence": False,
+           "evidence": [{"source": "kubernetes.status", "path": "p", "operator": "equals",
+                         "value": "v", "resource_uid": "uid-2"}]}
+    assert score_case(case, fixture_ready=True, diagnosis_status="completed",
+                      result=good, error=None, trace=None)["evidence_recall"] == 1.0
+    assert score_case(case, fixture_ready=True, diagnosis_status="completed",
+                      result=bad, error=None, trace=None)["evidence_recall"] == 0.0
 
 
 def test_summarize_trace_counts():
@@ -252,3 +384,60 @@ def test_cli_tri_state_parsing():
     assert _tri_state("on") is True
     assert _tri_state("off") is False
     assert _tri_state("auto") is None
+
+def test_compare_marks_mixed_scorer_versions_incomparable(tmp_path):
+    from eval.compare import compare_runs
+
+    def _mk(name, ver, verdict):
+        d = tmp_path / name
+        d.mkdir()
+        rep = {"run": {"run_id": name}, "report": {
+            "scorer_version": ver,
+            "root_cause_accuracy": 0.5, "wrong_root_cause_rate": 0.0,
+            "schema_valid_rate": 1.0, "evidence_recall_avg": 0.5,
+            "diagnosis_duration_ms": {"p50": 1, "p95": 1},
+            "token_usage": {"p50": 1, "p95": 1}}}
+        (d / "report.json").write_text(json.dumps(rep), encoding="utf-8")
+        (d / "case-results.jsonl").write_text(
+            json.dumps({"case_id": "c", "verdict": verdict}) + "\n", encoding="utf-8")
+        return d
+
+    base = _mk("b", "1", "diagnosis_correct")
+    cand = _mk("c", "2", "diagnosis_incorrect")
+    out = compare_runs(base, cand)
+    assert out["comparable"] is False
+    assert "scorer_version" in out["incomparable_reason"]
+    assert out["aggregate"]["root_cause_accuracy"]["delta"] is None
+
+def test_score_evidence_extra_and_unsupported_counts():
+    from eval.cases import EvidenceRequirement
+    case = _case()
+    case.ground_truth.required_evidence = [EvidenceRequirement(
+        source="kubernetes.status", path="p", operator="equals", value="v")]
+    result = {"root_cause_code": "CONTAINER_OOMKILLED", "insufficient_evidence": False,
+              "evidence": [
+                  {"source": "kubernetes.status", "path": "p", "operator": "equals", "value": "v"},
+                  {"source": "kubernetes.events", "value": "x"},
+                  {"summary": "no identifiers"},
+              ]}
+    row = score_case(case, fixture_ready=True, diagnosis_status="completed",
+                     result=result, error=None, trace=None)
+    assert row["evidence_total_entries"] == 3
+    assert row["evidence_matched_entries"] == 1
+    assert row["evidence_extra_entries"] == 1
+    assert row["evidence_unsupported_entries"] == 1
+
+
+def test_report_evidence_rates_and_llm_duration():
+    case = _case()
+    rows = [
+        _row(case, evidence_total_entries=4, evidence_matched_entries=2,
+             evidence_extra_entries=2, evidence_unsupported_entries=1, llm_duration_ms=100.0),
+        _row(case, evidence_total_entries=0, evidence_matched_entries=0,
+             evidence_extra_entries=0, evidence_unsupported_entries=0, llm_duration_ms=300.0),
+    ]
+    rep = build_report(rows)
+    assert rep["evidence_extra_rate"] == 0.5
+    assert rep["evidence_unsupported_rate"] == 0.25
+    assert rep["llm_duration_ms"]["p50"] == 100.0
+    assert rep["llm_duration_ms"]["mean"] == 200.0

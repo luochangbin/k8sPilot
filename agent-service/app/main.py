@@ -9,20 +9,49 @@ from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-from .agent import Agent, OpenAILLM
+from .agent import Agent
 from .config import Config
 from .connector import ConnectorClient
+from .llm import (
+    ExecutionContext,
+    OpenAILLM,
+    ProfileError,
+    UnknownProfileError,
+    resolve_model,
+)
 from .models import DIAGNOSABLE_KINDS, DiagnosisRequest
 from .store import SessionStore
 
 
 def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = None,
-               connector: Optional[ConnectorClient] = None, llm: Any = None) -> FastAPI:
+               connector: Optional[ConnectorClient] = None, llm: Any = None,
+               execution_resolver: Any = None) -> FastAPI:
     """App factory with injectable dependencies for testing."""
     cfg = cfg or Config()
     store = store or SessionStore(cfg.db_path or None)
     connector = connector or ConnectorClient(cfg.connector_base_url, cfg.connector_timeout)
+    llm_provided = llm is not None
     llm = llm or OpenAILLM(cfg)
+
+    def _metadata(resolved) -> dict[str, Any]:
+        return {**resolved.public_metadata(), "config_fingerprint": resolved.config_fingerprint()}
+
+    def _default_execution() -> ExecutionContext:
+        # An injected client is the default-profile client (tests / embedding);
+        # otherwise resolve the configured default profile.
+        if llm_provided:
+            return ExecutionContext(llm=llm,
+                                    metadata={"resolved_profile": "default", "provider": "injected"})
+        resolved = resolve_model(cfg, None)
+        client = llm if resolved.provider == "env" else OpenAILLM.from_resolved(resolved)
+        return ExecutionContext(llm=client, metadata=_metadata(resolved))
+
+    def _requested_execution(name: str) -> ExecutionContext:
+        if execution_resolver is not None:
+            return execution_resolver(name)
+        resolved = resolve_model(cfg, name)
+        return ExecutionContext(llm=OpenAILLM.from_resolved(resolved), metadata=_metadata(resolved))
+
     knowledge = None
     if cfg.knowledge_db_path:
         from .knowledge.service import KnowledgeService
@@ -49,7 +78,7 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
         return {"status": "ok"}
 
     @app.post("/api/v1/diagnoses", status_code=201)
-    def create_diagnosis(req: DiagnosisRequest) -> dict[str, str]:
+    def create_diagnosis(req: DiagnosisRequest) -> dict[str, Any]:
         if req.trigger != "manual":
             raise HTTPException(status_code=400, detail="Phase 1 仅支持 manual 触发")
         if req.resource.kind not in DIAGNOSABLE_KINDS:
@@ -58,14 +87,32 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
         if req.resource.uid is None and req.resource.kind in ("Pod", "Deployment", "PersistentVolumeClaim"):
             raise HTTPException(status_code=400, detail="需要提供 resource.uid")
 
+        # Fix an immutable execution context before creating the session, so
+        # concurrent diagnoses never share a model configuration (handoff §5).
+        if req.model_profile:
+            if not cfg.enable_model_profile_selection:
+                raise HTTPException(status_code=403, detail="model profile selection is disabled")
+            try:
+                execution = _requested_execution(req.model_profile)
+            except UnknownProfileError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+            except ProfileError as exc:
+                raise HTTPException(status_code=500, detail=f"model profile error: {exc}")
+        else:
+            try:
+                execution = _default_execution()
+            except ProfileError as exc:
+                raise HTTPException(status_code=500, detail=f"model profile error: {exc}")
+
         d = store.create(req)
         threading.Thread(
             target=agent.run,
             args=(req, store, d.diagnosis_id),
+            kwargs={"execution": execution},
             daemon=True,
         ).start()
         # Acceptance response is always "queued"; the client polls for progress.
-        return {"diagnosis_id": d.diagnosis_id, "status": "queued"}
+        return {"diagnosis_id": d.diagnosis_id, "status": "queued", "model": execution.metadata}
 
     @app.get("/api/v1/diagnoses")
     def list_diagnoses(limit: int = 50) -> list[Any]:

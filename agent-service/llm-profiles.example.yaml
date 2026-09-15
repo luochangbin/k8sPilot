@@ -1,0 +1,43 @@
+# Example model profiles (handoff §4). Copy to `llm-profiles.yaml` (or any
+# path set via LLM_PROFILES_FILE) and export the referenced key in `.env`.
+#
+# Only server-side profiles are allowed: requests select a profile *name*,
+# never a URL, key or header. Only the OpenAI-compatible /chat/completions path
+# is supported in this phase (Claude models go to /messages and are out of scope).
+#
+# Verify real model IDs against the live catalog before running:
+#   GET https://api.commandcode.ai/provider/v1/models   (Authorization: Bearer <key>)
+
+default_profile: reference
+
+providers:
+  commandcode:
+    protocol: openai_chat_completions
+    base_url: https://api.commandcode.ai/provider/v1
+    api_key_env: COMMANDCODE_API_KEY
+    headers: {}
+
+models:
+  reference:
+    provider: commandcode
+    remote_model_id: REPLACE_WITH_VERIFIED_MODEL_ID
+    parameters:
+      max_tokens: 2048
+    timeout_seconds: 120
+    max_retries: 2
+
+  candidate-a:
+    provider: commandcode
+    remote_model_id: REPLACE_WITH_VERIFIED_MODEL_ID
+    parameters:
+      max_tokens: 2048
+    timeout_seconds: 120
+    max_retries: 2
+
+  candidate-b:
+    provider: commandcode
+    remote_model_id: REPLACE_WITH_VERIFIED_MODEL_ID
+    parameters:
+      max_tokens: 2048
+    timeout_seconds: 120
+    max_retries: 2

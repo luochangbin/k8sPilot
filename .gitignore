@@ -9,6 +9,8 @@ htmlcov/
 
 # Secrets / local config
 .env
+# Local model profile instances; the *.example.yaml template stays tracked.
+agent-service/llm-profiles.yaml
 
 # Node / plugin
 node_modules/

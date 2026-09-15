@@ -39,8 +39,11 @@ class ReadyWhen:
 class EvidenceRequirement:
     source: str
     path: str
-    operator: str
+    operator: Optional[str]
     value: str
+    # Optional resource identity constraint; enforced only when the ground
+    # truth specifies it (evidence must carry a matching resource_uid).
+    resource_uid: Optional[str] = None
 
 
 @dataclass
@@ -121,7 +124,8 @@ def load_case(path: Path) -> Case:
     gt_raw = raw.get("ground_truth") or {}
     required = [
         EvidenceRequirement(source=e["source"], path=e.get("path", ""),
-                            operator=e.get("operator", "equals"), value=str(e.get("value", "")))
+                            operator=e.get("operator"), value=str(e.get("value", "")),
+                            resource_uid=e.get("resource_uid"))
         for e in (gt_raw.get("required_evidence") or [])
     ]
     ground_truth = GroundTruth(

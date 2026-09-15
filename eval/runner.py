@@ -38,7 +38,8 @@ class Runner:
 
     def run(self, suite_path: Path, case_ids: list[str], runs_per_case: int,
             profile: str, *, enable_knowledge: Optional[bool] = None,
-            enable_incidents: Optional[bool] = None) -> tuple[str, Path]:
+            enable_incidents: Optional[bool] = None,
+            model_profile: Optional[str] = None) -> tuple[str, Path]:
         suite_raw = load_suite(suite_path)
         cases = [self._load_case(cid) for cid in case_ids]
 
@@ -58,6 +59,7 @@ class Runner:
             "runs_per_case": runs_per_case,
             "enable_knowledge": enable_knowledge,
             "enable_incidents": enable_incidents,
+            "model_profile": model_profile,
             "cases": [c.key() for c in cases],
         }
         write_json(run_dir / "run.json", meta)
@@ -66,7 +68,8 @@ class Runner:
         for case in cases:
             for attempt in range(runs_per_case):
                 row = self._run_case(case, run_id, attempt, enable_knowledge=enable_knowledge,
-                                     enable_incidents=enable_incidents)
+                                     enable_incidents=enable_incidents,
+                                     model_profile=model_profile)
                 rows.append(row)
                 write_jsonl(run_dir / "case-results.jsonl", [row])
 
@@ -78,6 +81,17 @@ class Runner:
 
     # ---- helpers ----
 
+    def run_case_attempt(self, case: Case, run_id: str, attempt_index: int, *,
+                         enable_knowledge: Optional[bool] = None,
+                         enable_incidents: Optional[bool] = None,
+                         model_profile: Optional[str] = None) -> dict[str, Any]:
+        """Run one inject→diagnose→collect→cleanup attempt (public seam for the
+        multi-model benchmark orchestration)."""
+        return self._run_case(case, run_id, attempt_index,
+                              enable_knowledge=enable_knowledge,
+                              enable_incidents=enable_incidents,
+                              model_profile=model_profile)
+
     def _load_case(self, case_id: str) -> Case:
         path = self._cases_dir() / f"{case_id}.yaml"
         return load_case(path)
@@ -87,7 +101,8 @@ class Runner:
 
     def _run_case(self, case: Case, run_id: str, attempt_index: int,
                   *, enable_knowledge: Optional[bool] = None,
-                  enable_incidents: Optional[bool] = None) -> dict[str, Any]:
+                  enable_incidents: Optional[bool] = None,
+                  model_profile: Optional[str] = None) -> dict[str, Any]:
         base = {
             "eval_run_id": run_id,
             "case_id": case.id,
@@ -131,7 +146,8 @@ class Runner:
             diagnosis, error = self._run_diagnosis(case, uid, base,
                                                    timeout=case.budgets.diagnosis_timeout_seconds,
                                                    enable_knowledge=enable_knowledge,
-                                                   enable_incidents=enable_incidents)
+                                                   enable_incidents=enable_incidents,
+                                                   model_profile=model_profile)
             trace = self._collect_trace(diagnosis.get("diagnosis_id") if diagnosis else None)
 
         cleanup_failed = None
@@ -143,7 +159,8 @@ class Runner:
 
     def _run_diagnosis(self, case: Case, uid: str, base: dict[str, Any],
                        timeout: int, *, enable_knowledge: Optional[bool] = None,
-                       enable_incidents: Optional[bool] = None) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+                       enable_incidents: Optional[bool] = None,
+                       model_profile: Optional[str] = None) -> tuple[Optional[dict[str, Any]], Optional[str]]:
         payload = {
             "trigger": "manual",
             "resource": {
@@ -164,6 +181,9 @@ class Runner:
             payload["enable_knowledge"] = enable_knowledge
         if enable_incidents is not None:
             payload["enable_incidents"] = enable_incidents
+        # Model benchmark: explicit profile selection (agent must enable it).
+        if model_profile is not None:
+            payload["model_profile"] = model_profile
         try:
             resp = httpx.post(f"{self._agent_url}/api/v1/diagnoses", json=payload,
                               timeout=30, trust_env=False)

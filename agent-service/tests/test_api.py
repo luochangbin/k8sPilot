@@ -5,6 +5,7 @@ import time
 from fastapi.testclient import TestClient
 
 from app.config import Config
+from app.llm import ExecutionContext, UnknownProfileError
 from app.main import create_app
 from app.store import SessionStore
 
@@ -22,8 +23,8 @@ VALID_BODY = {
 }
 
 
-def make_client(llm_script=None) -> TestClient:
-    cfg = Config()
+def make_client(llm_script=None, cfg=None, execution_resolver=None) -> TestClient:
+    cfg = cfg or Config()
     store = SessionStore()
     connector = StubConnector()
     llm = ScriptedLLM(llm_script or [
@@ -36,7 +37,8 @@ def make_client(llm_script=None) -> TestClient:
             "recommendations": ["提高 memory limit"],
         }),
     ])
-    app = create_app(cfg=cfg, store=store, connector=connector, llm=llm)
+    app = create_app(cfg=cfg, store=store, connector=connector, llm=llm,
+                     execution_resolver=execution_resolver)
     return TestClient(app)
 
 
@@ -102,3 +104,61 @@ def test_get_unknown_diagnosis_returns_404():
     client = make_client()
     resp = client.get("/api/v1/diagnoses/diag_missing")
     assert resp.status_code == 404
+
+def test_model_profile_selection_disabled_returns_403():
+    cfg = Config()
+    cfg.enable_model_profile_selection = False
+    client = make_client(cfg=cfg)
+    body = dict(VALID_BODY)
+    body["model_profile"] = "ref-model"
+    resp = client.post("/api/v1/diagnoses", json=body)
+    assert resp.status_code == 403
+
+
+def test_unknown_model_profile_returns_422():
+    cfg = Config()
+    cfg.enable_model_profile_selection = True
+
+    def resolver(name):
+        raise UnknownProfileError(f"unknown model profile: {name!r}")
+
+    client = make_client(cfg=cfg, execution_resolver=resolver)
+    body = dict(VALID_BODY)
+    body["model_profile"] = "nope"
+    resp = client.post("/api/v1/diagnoses", json=body)
+    assert resp.status_code == 422
+
+
+def test_concurrent_diagnoses_bind_distinct_models():
+    cfg = Config()
+    cfg.enable_model_profile_selection = True
+
+    def resolver(name):
+        llm = ScriptedLLM([
+            ScriptedLLM.tool_response(
+                "inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}),
+            ScriptedLLM.tool_response("submit_result", {
+                "symptom": "s",
+                "evidence": [{"source": "kubernetes.status", "summary": "x"}],
+                "root_cause": name,
+                "confidence": "high",
+                "recommendations": [],
+            }),
+        ])
+        return ExecutionContext(llm=llm, metadata={
+            "resolved_profile": name, "requested_model_id": f"{name}-remote"})
+
+    client = make_client(cfg=cfg, execution_resolver=resolver)
+    ids = {}
+    for name in ("model-a", "model-b"):
+        body = dict(VALID_BODY)
+        body["model_profile"] = name
+        resp = client.post("/api/v1/diagnoses", json=body)
+        assert resp.status_code == 201
+        assert resp.json()["model"]["resolved_profile"] == name
+        ids[name] = resp.json()["diagnosis_id"]
+
+    for name, diag_id in ids.items():
+        result = wait_for_terminal(client, diag_id)
+        assert result["status"] == "completed"
+        assert result["result"]["root_cause"] == name

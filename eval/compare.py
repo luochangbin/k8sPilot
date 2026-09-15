@@ -80,8 +80,17 @@ def compare_runs(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
                                     "delta": _delta(acc_b, acc_c)},
         }
 
-    gates = _evaluate_gates(agg)
+    b_ver = b_rep.get("scorer_version")
+    c_ver = c_rep.get("scorer_version")
+    comparable = b_ver == c_ver
+    reason = None if comparable else f"scorer_version mismatch: baseline={b_ver} candidate={c_ver}"
+    if not comparable:
+        # Results scored under different semantics must not be diffed silently.
+        for metric in agg.values():
+            metric["delta"] = None
+    gates = _evaluate_gates(agg) if comparable else []
     return {"aggregate": agg, "per_case": per_case, "gates": gates,
+            "comparable": comparable, "incomparable_reason": reason,
             "baseline_run": b["run"].get("run_id"), "candidate_run": c["run"].get("run_id")}
 
 
@@ -125,6 +134,8 @@ def render_compare_markdown(result: dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"- baseline: {result['baseline_run']}")
     lines.append(f"- candidate: {result['candidate_run']}")
+    lines.append(f"- comparable: {result.get('comparable')}"
+                 + (f" ({result['incomparable_reason']})" if result.get("incomparable_reason") else ""))
     lines.append("")
     lines.append("## Aggregate deltas")
     lines.append("")

@@ -2,6 +2,10 @@
 
 Reproducibility: `build_report` is computed from a list of case-result rows
 only, so the same `case-results.jsonl` always yields the same `report.json`.
+
+Scoring semantics v2 (handoff §3): every rate exposes its numerator and
+denominator; fixture failures are excluded from diagnosis-quality denominators
+but reported separately; zero denominators yield null.
 """
 
 import json
@@ -9,7 +13,14 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from .scorer import VERDICT_CORRECT, VERDICT_FIXTURE_FAILED, VERDICT_INCORRECT, VERDICT_SCHEMA_FAILED, VERDICT_SYSTEM_FAILED
+from .scorer import (
+    SCORER_VERSION,
+    VERDICT_CORRECT,
+    VERDICT_FIXTURE_FAILED,
+    VERDICT_INCORRECT,
+    VERDICT_SCHEMA_FAILED,
+    VERDICT_SYSTEM_FAILED,
+)
 
 
 def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -24,8 +35,8 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _valid(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [r for r in rows if r["verdict"] not in (VERDICT_FIXTURE_FAILED, VERDICT_SYSTEM_FAILED, VERDICT_SCHEMA_FAILED)]
+def _rate(num: int, den: int) -> Optional[float]:
+    return round(num / den, 3) if den else None
 
 
 def _mean(values: list[Optional[float]]) -> Optional[float]:
@@ -43,39 +54,84 @@ def _percentile(values: list[float], p: float) -> Optional[float]:
     return round(vals[idx], 3)
 
 
+def _pct(value: Optional[float]) -> str:
+    """Render a 0..1 ratio as a percentage (JSON keeps the raw ratio)."""
+    return "null" if value is None else f"{round(value * 100, 1)}%"
+
+
 def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(rows)
-    valid = _valid(rows)
     counts = Counter(r["verdict"] for r in rows)
 
-    root_cause_correct = sum(1 for r in valid if r["root_cause_correct"])
-    root_cause_accuracy = round(root_cause_correct / len(valid), 3) if valid else None
-    wrong_root_cause = sum(1 for r in valid if r["wrong_root_cause"])
-    wrong_root_cause_rate = round(wrong_root_cause / len(valid), 3) if valid else None
+    # fixture_ready False => fixture failure; excluded from quality denominators.
+    fixture_ok = [r for r in rows if r.get("fixture_ready")]
+    fixture_failed = [r for r in rows if not r.get("fixture_ready")]
+    answerable = [r for r in fixture_ok if not r.get("abstention_expected")]
+    abstention = [r for r in fixture_ok if r.get("abstention_expected")]
 
-    abstention_cases = [r for r in rows if r["abstention_correct"] is not None]
-    abstention_accuracy = round(
-        sum(1 for r in abstention_cases if r["abstention_correct"]) / len(abstention_cases), 3
-    ) if abstention_cases else None
+    # Latency/token metrics only over rows with a scored outcome.
+    scored = [r for r in fixture_ok if r["verdict"] in (VERDICT_CORRECT, VERDICT_INCORRECT)]
 
-    schema_valid = sum(1 for r in rows if r["verdict"] in (VERDICT_CORRECT, VERDICT_INCORRECT))
-    schema_valid_rate = round(schema_valid / total, 3) if total else None
+    correct = sum(1 for r in fixture_ok if r["verdict"] == VERDICT_CORRECT)
+    root_cause_correct = sum(1 for r in answerable if r.get("root_cause_correct"))
+    wrong_root_cause = sum(1 for r in fixture_ok if r.get("wrong_root_cause"))
+    explicit = sum(1 for r in fixture_ok if r.get("explicit_root_cause"))
+    abstention_correct = sum(1 for r in abstention if r.get("abstention_correct"))
+    answerable_covered = sum(1 for r in answerable if r.get("explicit_root_cause"))
 
-    durations = [r["duration_ms"] for r in valid if r["duration_ms"] is not None]
-    tool_calls = [r["tool_calls"] for r in valid]
-    llm_calls = [r["llm_calls"] for r in valid]
-    tokens = [r["token_usage"] for r in valid]
+    durations = [r["duration_ms"] for r in scored if r["duration_ms"] is not None]
+    tool_calls = [r["tool_calls"] for r in scored]
+    llm_calls = [r["llm_calls"] for r in scored]
+    # Token usage is only aggregated over rows that actually reported it; a
+    # missing trace must not be presented as zero consumption.
+    tokens = [r["token_usage"] for r in scored if r.get("token_usage") is not None]
+    llm_durations = [r["llm_duration_ms"] for r in scored if r.get("llm_duration_ms") is not None]
+    tool_durations = [r["tool_duration_ms"] for r in scored if r.get("tool_duration_ms") is not None]
+    ev_total = sum(int(r.get("evidence_total_entries") or 0) for r in scored)
+    ev_extra = sum(int(r.get("evidence_extra_entries") or 0) for r in scored)
+    ev_unsupported = sum(int(r.get("evidence_unsupported_entries") or 0) for r in scored)
 
     return {
+        "scorer_version": SCORER_VERSION,
         "total_runs": total,
-        "valid_runs": len(valid),
+        "valid_runs": len(scored),
         "verdict_counts": dict(counts),
-        "root_cause_accuracy": root_cause_accuracy,
-        "wrong_root_cause_rate": wrong_root_cause_rate,
-        "abstention_accuracy": abstention_accuracy,
-        "schema_valid_rate": schema_valid_rate,
-        "evidence_recall_avg": _mean([r["evidence_recall"] for r in valid]),
-        "evidence_precision_avg": _mean([r["evidence_precision"] for r in valid]),
+        # --- denominators (handoff §3.1) ---
+        "fixture_failed_count": len(fixture_failed),
+        "fixture_failed_rate": _rate(len(fixture_failed), total),
+        "fixture_ok_count": len(fixture_ok),
+        "system_failed_rate": _rate(counts.get(VERDICT_SYSTEM_FAILED, 0), len(fixture_ok)),
+        "schema_failed_rate": _rate(counts.get(VERDICT_SCHEMA_FAILED, 0), len(fixture_ok)),
+        "schema_failed_with_root_cause_count": sum(
+            1 for r in rows if r["verdict"] == VERDICT_SCHEMA_FAILED and r.get("explicit_root_cause")
+        ),
+        "conflicting_abstention_count": sum(1 for r in rows if r.get("conflicting_abstention")),
+        # --- quality metrics, each with numerator / denominator ---
+        "end_to_end_correct_rate": _rate(correct, len(fixture_ok)),
+        "end_to_end_correct": {"numerator": correct, "denominator": len(fixture_ok)},
+        "root_cause_accuracy": _rate(root_cause_correct, len(answerable)),
+        "root_cause_accuracy_counts": {"numerator": root_cause_correct, "denominator": len(answerable)},
+        "wrong_root_cause_rate": _rate(wrong_root_cause, len(fixture_ok)),
+        "wrong_root_cause_counts": {"numerator": wrong_root_cause, "denominator": len(fixture_ok)},
+        "conditional_wrong_root_cause_rate": _rate(wrong_root_cause, explicit),
+        "conditional_wrong_root_cause_counts": {"numerator": wrong_root_cause, "denominator": explicit},
+        "abstention_recall": _rate(abstention_correct, len(abstention)),
+        "abstention_recall_counts": {"numerator": abstention_correct, "denominator": len(abstention)},
+        "answerable_coverage": _rate(answerable_covered, len(answerable)),
+        "answerable_coverage_counts": {"numerator": answerable_covered, "denominator": len(answerable)},
+        # --- compatibility keys (same definition as before) ---
+        "abstention_accuracy": _rate(abstention_correct, len(abstention)),
+        "schema_valid_rate": _rate(len(scored), total),
+        # --- evidence ---
+        "evidence_recall_avg": _mean([r.get("evidence_recall") for r in scored]),
+        "required_evidence_match_ratio_avg": _mean(
+            [r.get("required_evidence_match_ratio") for r in scored]
+        ),
+        "evidence_extra_rate": _rate(ev_extra, ev_total),
+        "evidence_extra_counts": {"numerator": ev_extra, "denominator": ev_total},
+        "evidence_unsupported_rate": _rate(ev_unsupported, ev_total),
+        "evidence_unsupported_counts": {"numerator": ev_unsupported, "denominator": ev_total},
+        # --- cost / effort ---
         "diagnosis_duration_ms": {
             "mean": _mean(durations),
             "p50": _percentile(durations, 50),
@@ -96,8 +152,20 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "p50": _percentile(tokens, 50),
             "p95": _percentile(tokens, 95),
         },
-        "duplicate_tool_calls_total": sum(r["duplicate_tool_calls"] for r in valid),
-        "truncated_logs_runs": sum(1 for r in valid if r["truncated_logs"]),
+        "token_usage_known_runs": len(tokens),
+        "token_usage_missing_runs": len(scored) - len(tokens),
+        "llm_duration_ms": {
+            "mean": _mean(llm_durations),
+            "p50": _percentile(llm_durations, 50),
+            "p95": _percentile(llm_durations, 95),
+        },
+        "tool_duration_ms": {
+            "mean": _mean(tool_durations),
+            "p50": _percentile(tool_durations, 50),
+            "p95": _percentile(tool_durations, 95),
+        },
+        "duplicate_tool_calls_total": sum(r["duplicate_tool_calls"] for r in scored),
+        "truncated_logs_runs": sum(1 for r in scored if r["truncated_logs"]),
     }
 
 
@@ -117,6 +185,7 @@ def render_markdown(run_meta: dict[str, Any], report: dict[str, Any],
     lines: list[str] = []
     lines.append(f"# Eval Report — {run_meta.get('run_id', 'unknown')}")
     lines.append("")
+    lines.append(f"- scorer_version: {report.get('scorer_version')}")
     lines.append(f"- profile: {run_meta.get('profile')}")
     lines.append(f"- suite: {run_meta.get('suite')}")
     lines.append(f"- model: {run_meta.get('model')}")
@@ -128,15 +197,23 @@ def render_markdown(run_meta: dict[str, Any], report: dict[str, Any],
 
     lines.append("## Aggregate")
     lines.append("")
-    lines.append("| metric | value |")
-    lines.append("|---|---|")
-    for key in ("root_cause_accuracy", "wrong_root_cause_rate", "abstention_accuracy",
-                "schema_valid_rate", "evidence_recall_avg", "evidence_precision_avg"):
-        lines.append(f"| {key} | {report.get(key)} |")
-    lines.append(f"| verdict_counts | {report.get('verdict_counts')} |")
-    lines.append(f"| duration_ms p50/p95 | {report['diagnosis_duration_ms'].get('p50')} / {report['diagnosis_duration_ms'].get('p95')} |")
-    lines.append(f"| tool_calls p50/p95 | {report['tool_calls'].get('p50')} / {report['tool_calls'].get('p95')} |")
-    lines.append(f"| token_usage p50/p95 | {report['token_usage'].get('p50')} / {report['token_usage'].get('p95')} |")
+    lines.append("| metric | value | numerator/denominator |")
+    lines.append("|---|---|---|")
+    for key in ("end_to_end_correct_rate", "root_cause_accuracy", "wrong_root_cause_rate",
+                "conditional_wrong_root_cause_rate", "abstention_recall", "answerable_coverage",
+                "evidence_recall_avg", "required_evidence_match_ratio_avg",
+                "evidence_extra_rate", "evidence_unsupported_rate",
+                "schema_valid_rate", "fixture_failed_rate", "system_failed_rate",
+                "schema_failed_rate"):
+        counts_key = f"{key}_counts"
+        denom = report.get(counts_key)
+        lines.append(f"| {key} | {_pct(report.get(key))} | {denom if denom else ''} |")
+    lines.append(f"| verdict_counts | {report.get('verdict_counts')} | |")
+    lines.append(f"| schema_failed_with_root_cause_count | {report.get('schema_failed_with_root_cause_count')} | |")
+    lines.append(f"| duration_ms p50/p95 | {report['diagnosis_duration_ms'].get('p50')} / {report['diagnosis_duration_ms'].get('p95')} | |")
+    lines.append(f"| tool_calls p50/p95 | {report['tool_calls'].get('p50')} / {report['tool_calls'].get('p95')} | |")
+    lines.append(f"| llm_duration_ms p50/p95 | {report['llm_duration_ms'].get('p50')} / {report['llm_duration_ms'].get('p95')} | |")
+    lines.append(f"| token_usage p50/p95 | {report['token_usage'].get('p50')} / {report['token_usage'].get('p95')} | |")
     lines.append("")
 
     lines.append("## Per case")
@@ -146,8 +223,8 @@ def render_markdown(run_meta: dict[str, Any], report: dict[str, Any],
         lines.append(f"### {case_id} (n={c['n']})")
         lines.append("")
         lines.append(f"- verdict_counts: {c['verdict_counts']}")
-        lines.append(f"- root_cause_accuracy: {c['root_cause_accuracy']}")
-        lines.append(f"- evidence_recall_avg: {c['evidence_recall_avg']}")
-        lines.append(f"- wrong_root_cause_rate: {c['wrong_root_cause_rate']}")
+        lines.append(f"- root_cause_accuracy: {_pct(c['root_cause_accuracy'])} {c['root_cause_accuracy_counts']}")
+        lines.append(f"- evidence_recall_avg: {_pct(c['evidence_recall_avg'])}")
+        lines.append(f"- wrong_root_cause_rate: {_pct(c['wrong_root_cause_rate'])} {c['wrong_root_cause_counts']}")
         lines.append("")
     return "\n".join(lines)

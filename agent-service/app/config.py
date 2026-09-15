@@ -51,3 +51,24 @@ class Config:
         # Phase 4 knowledge & experience: SQLite file path; empty disables
         # the retrieval module (agent then runs Phase 3-only).
         self.knowledge_db_path: str = _env("KNOWLEDGE_DB", "").strip()
+
+        # Model profiles (handoff §4). The YAML file path is resolved relative
+        # to the agent-service root when not absolute; empty keeps the legacy
+        # LLM_* environment mapping as the `default` profile.
+        self.llm_profiles_file: str = _resolve_agent_path(_env("LLM_PROFILES_FILE", "").strip())
+        # Explicit per-request profile selection is off by default and turned on
+        # by evaluation/service deployments that need it (handoff §5).
+        self.enable_model_profile_selection: bool = _env(
+            "ENABLE_MODEL_PROFILE_SELECTION", "false"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+
+# agent-service package root (parent of app/); profile paths are relative to it.
+_AGENT_SERVICE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _resolve_agent_path(value: str) -> str:
+    if not value:
+        return ""
+    path = Path(value)
+    return str(path if path.is_absolute() else _AGENT_SERVICE_ROOT / path)

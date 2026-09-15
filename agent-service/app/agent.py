@@ -20,6 +20,7 @@ logger = logging.getLogger("k8spilot.agent")
 
 from .config import Config
 from .connector import ConnectorClient, ConnectorError, ToolError
+from .llm import ExecutionContext, LLMError, OpenAILLM
 from .models import DIAGNOSABLE_KINDS, DiagnosisRequest, DiagnosisResult, Evidence, ResourceRef
 from .prompts import SYSTEM_PROMPT, user_message
 from .root_causes import is_valid_root_cause_code
@@ -37,43 +38,8 @@ from .trace import (
 )
 
 
-class LLMError(Exception):
-    """Raised when the LLM endpoint fails after retries."""
-
-
 class UIDMismatchError(Exception):
     """Raised when the target resource was recreated (UID differs)."""
-
-
-class OpenAILLM:
-    """OpenAI-compatible chat completions client with bounded retries."""
-
-    def __init__(self, cfg: Config) -> None:
-        from openai import OpenAI
-
-        self._client = OpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key or "sk-not-needed")
-        self._model = cfg.llm_model
-        self._timeout = cfg.llm_timeout
-        self._max_retries = cfg.llm_max_retries
-        self._max_tokens = cfg.llm_max_tokens
-
-    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], tool_choice: Any):
-        last_exc: Optional[Exception] = None
-        for attempt in range(self._max_retries + 1):
-            try:
-                return self._client.chat.completions.create(
-                    model=self._model,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    timeout=self._timeout,
-                    max_tokens=self._max_tokens,
-                )
-            except Exception as exc:  # noqa: BLE001 - surface any provider failure
-                last_exc = exc
-                if attempt == self._max_retries:
-                    break
-        raise LLMError(f"LLM request failed after {self._max_retries + 1} attempts: {last_exc}")
 
 
 _STEP_LABELS = {
@@ -92,13 +58,15 @@ class Agent:
         self.llm = llm
         self.knowledge = knowledge  # Optional KnowledgeService (Phase 4)
 
-    def run(self, req: DiagnosisRequest, store: SessionStore, diagnosis_id: str) -> None:
+    def run(self, req: DiagnosisRequest, store: SessionStore, diagnosis_id: str,
+            execution: Optional[ExecutionContext] = None) -> None:
+        llm = execution.llm if execution is not None else self.llm
         store.update(diagnosis_id, status="investigating")
         steps: list[str] = []
         retrieved: dict[str, Any] = {}
-        trace = self._new_trace(req, diagnosis_id)
+        trace = self._new_trace(req, diagnosis_id, execution)
         try:
-            self._run_inner(req, store, diagnosis_id, steps, trace, retrieved)
+            self._run_inner(req, store, diagnosis_id, steps, trace, retrieved, llm, execution)
         except UIDMismatchError as exc:
             self._fail(store, diagnosis_id, str(exc), steps, trace, KUBERNETES_API)
         except ConnectorError as exc:
@@ -116,7 +84,8 @@ class Agent:
                 trace.finish(d.status if d else "unknown",
                              error=d.error if d else None, failure_layer=layer)
 
-    def _new_trace(self, req: DiagnosisRequest, diagnosis_id: str) -> Optional[DiagnosisTrace]:
+    def _new_trace(self, req: DiagnosisRequest, diagnosis_id: str,
+                   execution: Optional[ExecutionContext] = None) -> Optional[DiagnosisTrace]:
         if not self.cfg.trace_dir:
             return None
         recorder = TraceRecorder(self.cfg.trace_dir)
@@ -126,6 +95,8 @@ class Agent:
             case_version=req.case_version,
             attempt_index=req.attempt_index,
         )
+        if execution is not None:
+            ctx.update(execution.metadata)
         return DiagnosisTrace(recorder, diagnosis_id, ctx)
 
     def _fetch_capabilities(self) -> dict[str, Any]:
@@ -211,7 +182,10 @@ class Agent:
 
     def _run_inner(self, req: DiagnosisRequest, store: SessionStore, diagnosis_id: str,
                    steps: list[str], trace: Optional[DiagnosisTrace],
-                   retrieved: Optional[dict[str, Any]] = None) -> None:
+                   retrieved: Optional[dict[str, Any]] = None,
+                   llm: Any = None,
+                   execution: Optional[ExecutionContext] = None) -> None:
+        llm = llm if llm is not None else self.llm
         if req.resource.kind not in DIAGNOSABLE_KINDS:
             raise Exception(f"Phase 3 仅支持诊断 {', '.join(DIAGNOSABLE_KINDS)}，收到 {req.resource.kind}")
         retrieved = retrieved if retrieved is not None else {}
@@ -232,19 +206,28 @@ class Agent:
 
             t0 = time.time()
             try:
-                resp = self.llm.chat(messages, tools, tool_choice)
-            except LLMError:
+                resp = llm.chat(messages, tools, tool_choice)
+            except LLMError as exc:
                 if trace is not None:
+                    failure_attempts = getattr(exc, "attempts", None)
+                    if failure_attempts is None:
+                        failure_attempts = int(
+                            getattr(llm, "max_retries", self.cfg.llm_max_retries)) + 1
                     trace.llm_call(duration_ms=(time.time() - t0) * 1000.0,
-                                   retries=self.cfg.llm_max_retries, error="LLM request failed")
+                                   retries=max(0, failure_attempts - 1),
+                                   attempts=failure_attempts,
+                                   error="LLM request failed")
                 raise
             if trace is not None:
+                attempts = int(getattr(llm, "last_attempt_count", 1) or 1)
                 usage = getattr(resp, "usage", None)
                 pt = getattr(usage, "prompt_tokens", None) if usage else None
                 ct = getattr(usage, "completion_tokens", None) if usage else None
                 fr = getattr(resp.choices[0], "finish_reason", None) if resp.choices else None
-                trace.llm_call(duration_ms=(time.time() - t0) * 1000.0, retries=0,
-                               finish_reason=fr, prompt_tokens=pt, completion_tokens=ct)
+                trace.llm_call(duration_ms=(time.time() - t0) * 1000.0,
+                               retries=max(0, attempts - 1), attempts=attempts,
+                               finish_reason=fr, prompt_tokens=pt, completion_tokens=ct,
+                               response_model=getattr(resp, "model", None))
             msg = resp.choices[0].message
             tool_calls = getattr(msg, "tool_calls", None) or []
 

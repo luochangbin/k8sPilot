@@ -59,6 +59,25 @@ def main(argv=None) -> int:
                        help="Phase 4 knowledge retrieval gate: off = not exposed (group A/C)")
     run_p.add_argument("--enable-incidents", choices=("auto", "on", "off"), default="auto",
                        help="Phase 4 incident retrieval gate: off = not exposed (group A/B)")
+    run_p.add_argument("--model-profile", default=None,
+                       help="server-side model profile for this run (selection must be enabled)")
+
+    bench_p = sub.add_parser("benchmark", help="multi-model benchmark (handoff §6)")
+    bench_p.add_argument("--suite", required=True)
+    bench_p.add_argument("--models", required=True,
+                         help="comma-separated model profile names, e.g. profile-a,profile-b")
+    bench_p.add_argument("--runs", type=int, default=1)
+    bench_p.add_argument("--seed", type=int, default=42)
+    bench_p.add_argument("--agent-url", default="http://localhost:8000")
+    bench_p.add_argument("--trace-dir", default=None)
+    bench_p.add_argument("--kubeconfig", default=None)
+    bench_p.add_argument("--reports-dir", default="reports")
+    bench_p.add_argument("--max-diagnoses", type=int, default=None)
+    bench_p.add_argument("--time-limit-seconds", type=float, default=None)
+    bench_p.add_argument("--model", default="", help="declared label only; not proof of model")
+    bench_p.add_argument("--case", action="append", default=None)
+    bench_p.add_argument("--enable-knowledge", choices=("auto", "on", "off"), default="auto")
+    bench_p.add_argument("--enable-incidents", choices=("auto", "on", "off"), default="auto")
 
     cmp_p = sub.add_parser("compare", help="paired baseline/candidate report")
     cmp_p.add_argument("--baseline", required=True, help="run id or path")
@@ -79,9 +98,30 @@ def main(argv=None) -> int:
                 suite_path, case_ids, args.runs, args.profile,
                 enable_knowledge=_tri_state(args.enable_knowledge),
                 enable_incidents=_tri_state(args.enable_incidents),
+                model_profile=args.model_profile,
             )
             print(f"run {run_id} finished: {run_dir}")
             print(f"report: {(run_dir / 'report.md')}")
+            return 0
+
+        if args.cmd == "benchmark":
+            from .benchmark import run_benchmark
+            suite_path = _resolve_suite(args.suite)
+            case_ids = _load_case_ids(suite_path, args.case)
+            models = [m.strip() for m in args.models.split(",") if m.strip()]
+            if not models:
+                raise CaseError("--models must list at least one model profile")
+            benchmark_id, run_dir = run_benchmark(
+                suite_path=suite_path, case_ids=case_ids, models=models,
+                runs_per_case=args.runs, seed=args.seed, agent_url=args.agent_url,
+                trace_dir=args.trace_dir, reports_dir=args.reports_dir,
+                kubeconfig=args.kubeconfig, max_diagnoses=args.max_diagnoses,
+                time_limit_seconds=args.time_limit_seconds, model_label=args.model,
+                enable_knowledge=_tri_state(args.enable_knowledge),
+                enable_incidents=_tri_state(args.enable_incidents),
+            )
+            print(f"benchmark {benchmark_id} finished: {run_dir}")
+            print(f"report: {(run_dir / 'model-benchmark.md')}")
             return 0
 
         if args.cmd == "compare":

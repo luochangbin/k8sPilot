@@ -57,6 +57,12 @@ class DiagnosisRequest(BaseModel):
     enable_knowledge: Optional[bool] = None
     enable_incidents: Optional[bool] = None
 
+    # --- Phase 5 / model benchmark (optional) ---
+    # Server-side preconfigured model profile name. None = default profile.
+    # Rejected (403) unless ENABLE_MODEL_PROFILE_SELECTION is on; unknown
+    # profiles are rejected (422) before a session is created.
+    model_profile: Optional[str] = None
+
 
 class Evidence(BaseModel):
     """Evidence item. Structured fields (resource_uid/path/operator/value) are

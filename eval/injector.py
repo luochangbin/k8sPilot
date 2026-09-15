@@ -11,6 +11,11 @@ class InjectorError(Exception):
     pass
 
 
+# Bounded but generous timeout for the foreground namespace delete during
+# cleanup (see Injector.cleanup).
+CLEANUP_TIMEOUT_SECONDS = 180
+
+
 class Injector:
     def __init__(self, kubeconfig: Optional[str] = None) -> None:
         self._kubeconfig = kubeconfig
@@ -62,11 +67,16 @@ class Injector:
         return got == expected
 
     def cleanup(self, case: Case) -> None:
-        """Idempotent cleanup; delete errors that are not 'not found' are fatal."""
+        """Idempotent cleanup; delete errors that are not 'not found' are fatal.
+
+        Namespace deletion is a foreground wait and can legitimately take longer
+        than the default kubectl timeout on a busy/slow API server, so cleanup
+        uses a larger, still-bounded timeout (it must confirm deletion to keep
+        the "cleanup failure stops further injection" guarantee)."""
         for manifest in case.setup_manifests:
             try:
                 run_kubectl(["delete", "-f", str(manifest), "--ignore-not-found=true"],
-                            kubeconfig=self._kubeconfig)
+                            kubeconfig=self._kubeconfig, timeout=CLEANUP_TIMEOUT_SECONDS)
             except KubectlError as exc:
                 raise InjectorError(f"cleanup failed for {case.id}: {exc}") from exc
 

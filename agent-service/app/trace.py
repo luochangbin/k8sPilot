@@ -97,17 +97,24 @@ class DiagnosisTrace:
         self.emit(f"tool.{name}", "tool_call", attrs, error=error, failure_layer=failure_layer)
 
     def llm_call(self, *, duration_ms: float, retries: int,
+                 attempts: Optional[int] = None,
                  finish_reason: Optional[str] = None,
                  prompt_tokens: Optional[int] = None,
                  completion_tokens: Optional[int] = None,
+                 response_model: Optional[str] = None,
                  error: Optional[str] = None) -> None:
         attrs: dict[str, Any] = {"duration_ms": round(duration_ms, 1), "retries": retries}
+        if attempts is None:
+            attempts = retries + 1
+        attrs["attempts"] = attempts
         if finish_reason is not None:
             attrs["finish_reason"] = finish_reason
         if prompt_tokens is not None:
             attrs["prompt_tokens"] = prompt_tokens
         if completion_tokens is not None:
             attrs["completion_tokens"] = completion_tokens
+        if response_model is not None:
+            attrs["response_model_id"] = response_model
         layer = LLM_TRANSPORT if error else None
         self.emit("llm.call", "llm_call", attrs, error=error, failure_layer=layer)
 
