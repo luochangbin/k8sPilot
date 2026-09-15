@@ -8,7 +8,7 @@
 ![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
 ![Status](https://img.shields.io/badge/status-active_development-F59E0B)
 
-[诊断效果](#诊断效果) · [核心能力](#核心能力) · [工作方式](#工作方式) · [快速开始](#快速开始) · [Agent 评测](#可重复的-agent-评测) · [路线图](#路线图) · [项目文档](#项目文档)
+[诊断效果](#诊断效果) · [核心能力](#核心能力) · [工作方式](#工作方式) · [快速开始](#快速开始) · [Agent 评测](#可重复的-agent-评测) · [模型对比](#模型对比2026-09-15) · [路线图](#路线图) · [项目文档](#项目文档)
 
 k8sPilot 是一个面向单集群 Kubernetes 的 **Headlamp 智能诊断插件**。运维人员可以直接在 Pod、Deployment、Node 或 PVC 详情页点击「智能诊断」，由 LLM Agent 按需查询资源状态、关联关系、Events、日志与指标，最终返回结构化的症状、调查过程、Root Cause、Evidence、置信度和修复建议。
 
@@ -276,6 +276,8 @@ npm run build
 ## 模型对比（2026-09-15）
 
 运行条件：CommandCode Provider API（OpenAI-compatible `/chat/completions`）；phase1 全部 **12 个 Case × 8 个模型 × 1 次**（seed=42，共 96 次尝试）；同一 Agent/工具/Prompt/预算；`scorer_version=3`；隔离命名空间逐次注入→就绪→诊断→清理。原始报告：`reports/benchmark-20260915T134254-a3bdbb/`（`model-benchmark.json` / `attempts.jsonl` / `model-benchmark.md`；含全部 9 模型的原始件 `model-benchmark.all-models.*`）。
+
+> 当前 token 额度有限，仅跑一次；后续额度充裕再测多轮。
 
 > **已排除模型**：`MiniMaxAI/MiniMax-M2.7` —— 在本 key 下经 `/chat/completions` 返回 `400 No available providers match the 'only' filter…`，12/12 失败且无响应身份，不具备可比性，已从对比与下述指标中移除。排除后本批 `comparable=true`。仍存在的单次失败（`Kimi-K2.5` 4×404、若干 180s 诊断超时、1×connector 抖动）按评分口径计入 `system_failed`，不计入根因准确率分母。
 
