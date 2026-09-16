@@ -133,6 +133,25 @@ python -m eval benchmark --suite phase1 --models reference,candidate-a,candidate
 
 **重要**：先前的 3 模型闭环报告 `reports/benchmark-20260915T083937-7d68d9` 产生于上述修正之前（且为 `scorer_version=2`），其可比性、重试计数与 Token 聚合口径已过时，**不得用于正式模型选型**；正式比较需用修正后的代码重新执行并统一为 `scorer_version=3`。
 
+### 可比性修正（2026-09-16，第 3 轮）
+
+针对报告可比性的 3 个 P1 问题已核实并修复（均属实）：
+
+1. **部分身份未知仍参与比较**：改为**逐条校验**——任何真正调用过模型（`llm_request_attempts>0` 或已有评分结论）但身份未验证的尝试都会写入 `incomparable_reason`；不再用 `any(identity_ok)` 以一条已验证记录替整个模型背书。
+2. **无共同 Case 仍称可比 / 比较范围不一致**：覆盖集合按**已执行尝试**定义（超时/失败也算跑过）。共同 Case 为空 → `no_common_cases`；各模型 Case 集合不一致 → `case_sets_differ`；有结果的模型少于两个 → `insufficient_models_with_results`。**聚合只在共同 Case 集合上进行**（新增 `compared_attempt_count`），单模型的额外 Case 不再稀释或垫高比较。
+3. **同 profile 配置漂移未检测**：同一 profile 内出现多个 `config_fingerprint` 或不同 `effective_parameters` 时标记 `config_fingerprint_varies` / `parameters_vary`，不静默合并。
+
+### 可比性边界修正（2026-09-16，第 4 轮）
+
+再核实 2 个 P2 边界问题（均属实）并修复：
+
+1. **部分模型无结果仍称可比**：若请求比较的模型中有的**完全没有尝试**（无任何执行记录），记为 `model_missing_results:<names>` 使整批 `comparable=false`，并在报告中输出 `models_requested` / `models_compared` / `models_missing`（不再静默只比较有结果的子集）。
+2. **失败尝试的配置漂移未检查**：配置一致性检查从“仅已评分且身份已验证”扩展为“**所有有执行身份的尝试（含 system_failed 等失败）**”，因为失败次数同样进入质量统计分母；同一 profile 内成功与失败使用不同指纹/参数时标记漂移。
+
+按新规则重算：8 模型真实报告仍 `comparable=true`（`models_missing=[]`、共同 Case=12），指标不变。测试：`eval` **39 passed**。
+
+按新规则重算：8 模型真实报告仍为 `comparable=true`（共同 Case=12，各模型 `compared_attempt_count=12`），README 中的质量指标不变；单模型批次现因 `insufficient_models_with_results` 标为不可比（无对照对象，属预期，故上条 `benchmark-20260915T102053-762ada` 的 `comparable=true` 按新规则已过时）。测试：`eval` **37 passed**。
+
 ### 8 模型全量对比（2026-09-15）
 
 - 条件：phase1 全 12 Case × 8 模型 × 1 次（seed=42，`scorer_version=3`），96 次尝试；报告 `reports/benchmark-20260915T134254-a3bdbb/`（`model-benchmark.json` / `attempts.jsonl` / `model-benchmark.md`；9 模型原始件保留为 `model-benchmark.all-models.*`）。模型：`deepseek/deepseek-v4.1-flash`（参考）、`MiniMaxAI/MiniMax-M2.5`、`moonshotai/Kimi-K2.5`、`moonshotai/Kimi-K2.6`、`zai-org/GLM-5.1`、`zai-org/GLM-5.2`、`Qwen/Qwen3.6-Plus`、`Qwen/Qwen3.7-Plus`。

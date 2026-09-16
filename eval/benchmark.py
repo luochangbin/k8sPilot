@@ -242,42 +242,57 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
 def build_benchmark_report(benchmark_id: str, meta: dict[str, Any],
                            rows: list[dict[str, Any]], stop_reason: Optional[str]) -> dict[str, Any]:
     models = list(meta["models"])
-    case_sets: dict[str, set[str]] = {}
-    per_model: dict[str, Any] = {}
-    for model in models:
-        model_rows = [r for r in rows if r.get("model_profile") == model]
-        case_sets[model] = {r["case_id"] for r in model_rows}
-        per_model[model] = {
-            "report": build_report(model_rows) if model_rows else None,
-            "attempt_count": len(model_rows),
-            "usage_complete_rate": _usage_complete_rate(model_rows),
-            "resolved_profiles": sorted({r.get("resolved_profile") for r in model_rows
-                                         if r.get("resolved_profile")}),
-            "identity_verified_attempts": sum(1 for r in model_rows if r.get("identity_ok")),
-            "identity_unknown_attempts": sum(1 for r in model_rows
-                                             if r.get("identity_ok") is None),
-        }
-    common_cases = set.intersection(*case_sets.values()) if case_sets else set()
-    per_case: dict[str, Any] = {}
-    for case_id in sorted(common_cases):
-        per_case[case_id] = {
-            model: _case_summary([r for r in rows
-                                  if r.get("model_profile") == model and r["case_id"] == case_id])
-            for model in models
-        }
-
-    # Comparability: only claim it when execution identity and conditions are
-    # actually evidenced, not merely assumed from request labels (handoff §7).
-    issues: list[str] = []
-    for r in rows:
-        if r.get("identity_ok") is False:
-            issues.append(f"{r.get('attempt_id')}:{r.get('identity_error')}")
     scored_verdicts = ("diagnosis_correct", "diagnosis_incorrect", "schema_failed")
+
+    def model_rows_of(model: str) -> list[dict[str, Any]]:
+        return [r for r in rows if r.get("model_profile") == model]
+
+    def scored_rows_of(model: str) -> list[dict[str, Any]]:
+        return [r for r in model_rows_of(model) if r.get("verdict") in scored_verdicts]
+
+    # ---- comparability evidence (handoff §7) ----
+    issues: list[str] = []
+    # 1. Every attempt that actually called the provider must have verified
+    #    identity; a single verified row does not vouch for the others.
+    for r in rows:
+        if r.get("identity_ok") is True:
+            continue
+        called = bool(int(r.get("llm_request_attempts") or 0) > 0
+                      or r.get("verdict") in scored_verdicts)
+        if r.get("identity_ok") is False or called:
+            reason = r.get("identity_error") or "identity_unknown"
+            issues.append(f"{r.get('attempt_id')}:{reason}")
+    # 2. Only identical, non-empty case coverage can be compared. Coverage is
+    #    the set of cases actually executed (a timeout/failure still ran it),
+    #    not only the successfully scored ones.
+    model_cases = {m: {r["case_id"] for r in model_rows_of(m)} for m in models}
+    covered = {m: cs for m, cs in model_cases.items() if cs}
+    missing_models = [m for m in models if not covered.get(m)]
+    if missing_models:
+        # A partly-empty batch is incomplete: record it instead of silently
+        # comparing only the models that happened to produce results.
+        issues.append("model_missing_results:" + ",".join(missing_models))
+    if len(covered) < 2:
+        issues.append("insufficient_models_with_results")
+        common_cases: set[str] = set()
+    else:
+        common_cases = set.intersection(*covered.values())
+        if not common_cases:
+            issues.append("no_common_cases")
+        elif any(cs != common_cases for cs in covered.values()):
+            issues.append("case_sets_differ")
+    # 3. Configuration drift within a profile. Failures with execution identity
+    #    also enter the quality denominators, so they must be consistent too.
     for model in models:
-        model_rows = [r for r in rows if r.get("model_profile") == model]
-        scored = [r for r in model_rows if r.get("verdict") in scored_verdicts]
-        if scored and not any(r.get("identity_ok") for r in scored):
-            issues.append(f"{model}:no_verified_identity")
+        attempted = [r for r in model_rows_of(model)
+                     if r.get("identity_ok") or int(r.get("llm_request_attempts") or 0) > 0]
+        fingerprints = {r.get("config_fingerprint") for r in attempted
+                        if r.get("config_fingerprint")}
+        if len(fingerprints) > 1:
+            issues.append(f"{model}:config_fingerprint_varies")
+        params = {json.dumps(r.get("effective_parameters"), sort_keys=True) for r in attempted}
+        if len(params) > 1:
+            issues.append(f"{model}:parameters_vary")
     conditions = {(r.get("provider"), r.get("protocol")) for r in rows if r.get("identity_ok")}
     if len(conditions) > 1:
         issues.append("provider_protocol_varies")
@@ -285,6 +300,30 @@ def build_benchmark_report(benchmark_id: str, meta: dict[str, Any],
     if len(knowledge_flags) > 1:
         issues.append("knowledge_flags_vary_across_attempts")
     comparable = not issues
+
+    # Aggregates are computed over the common case set only, so a model that
+    # ran extra cases cannot pad or dilute the comparison.
+    per_model: dict[str, Any] = {}
+    for model in models:
+        all_model_rows = model_rows_of(model)
+        compared = [r for r in all_model_rows if r["case_id"] in common_cases]
+        per_model[model] = {
+            "report": build_report(compared) if compared else None,
+            "attempt_count": len(all_model_rows),
+            "compared_attempt_count": len(compared),
+            "usage_complete_rate": _usage_complete_rate(compared),
+            "resolved_profiles": sorted({r.get("resolved_profile") for r in all_model_rows
+                                         if r.get("resolved_profile")}),
+            "identity_verified_attempts": sum(1 for r in all_model_rows if r.get("identity_ok")),
+            "identity_unknown_attempts": sum(1 for r in all_model_rows
+                                             if r.get("identity_ok") is None),
+        }
+    per_case: dict[str, Any] = {}
+    for case_id in sorted(common_cases):
+        per_case[case_id] = {
+            model: _case_summary([r for r in model_rows_of(model) if r["case_id"] == case_id])
+            for model in models
+        }
 
     return {
         "benchmark_id": benchmark_id,
@@ -294,6 +333,9 @@ def build_benchmark_report(benchmark_id: str, meta: dict[str, Any],
         "per_model": per_model,
         "per_case_common": per_case,
         "common_case_count": len(common_cases),
+        "models_requested": models,
+        "models_compared": [m for m in models if covered.get(m)],
+        "models_missing": missing_models,
         "comparable": comparable,
         "incomparable_reason": None if comparable else "; ".join(issues),
         "caveats": [

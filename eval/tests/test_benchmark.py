@@ -163,3 +163,95 @@ def test_benchmark_records_failed_attempts(tmp_path):
     assert report["attempts"] == 8
     lines = (run_dir / "attempts.jsonl").read_text(encoding="utf-8").splitlines()
     assert any(json.loads(l)["failure_category"] == "system_failed" for l in lines)
+
+
+# ---- comparability evidence (review round 2) ----
+
+def _bench_row(case_id, model, *, identity_ok=True, fingerprint="fp1", params=None,
+               verdict="diagnosis_correct", attempts=1, error=None):
+    row = {
+        "case_id": case_id, "case_version": "1", "model_profile": model,
+        "attempt_id": f"{case_id}__{model}", "verdict": verdict,
+        "fixture_ready": True, "abstention_expected": False, "explicit_root_cause": True,
+        "valid_abstention": False, "conflicting_abstention": False, "invalid_output": False,
+        "root_cause_correct": verdict == "diagnosis_correct", "wrong_root_cause": False,
+        "abstention_correct": None, "evidence_recall": 1.0,
+        "required_evidence_match_ratio": 1.0, "evidence_returned": 1, "required_evidence": 1,
+        "tool_calls": 1, "duplicate_tool_calls": 0, "llm_calls": 1, "token_usage": 10,
+        "duration_ms": 1.0, "trace_failure_layer": None, "truncated_logs": False,
+        "identity_ok": identity_ok, "identity_error": error,
+        "config_fingerprint": fingerprint, "effective_parameters": params or {"max_tokens": 2048},
+        "llm_request_attempts": attempts, "provider": "commandcode",
+        "protocol": "openai_chat_completions", "resolved_profile": model,
+        "effective_knowledge_flags": {"knowledge": None, "incidents": None},
+    }
+    return row
+
+
+def _meta(models):
+    return {"models": models, "runs_per_case": 1, "seed": 1, "suite": "t",
+            "scorer_version": "3", "planned_total": 4, "effective_total": 4,
+            "declared_model_label": None}
+
+
+def _build(rows, models):
+    from eval.benchmark import build_benchmark_report
+    return build_benchmark_report("b1", _meta(models), rows, None)
+
+
+def test_partial_unknown_identity_is_incomparable():
+    rows = [_bench_row("c1", "m1"), _bench_row("c1", "m2"),
+            _bench_row("c2", "m1", identity_ok=None, attempts=0, fingerprint=None,
+                       params=None, error=None)]
+    rep = _build(rows, ["m1", "m2"])
+    assert rep["comparable"] is False
+    assert "c2__m1" in rep["incomparable_reason"]
+
+
+def test_different_case_sets_are_incomparable_and_only_common_compared():
+    rows = [_bench_row("c1", "m1"), _bench_row("c2", "m1"), _bench_row("c1", "m2")]
+    rep = _build(rows, ["m1", "m2"])
+    assert rep["comparable"] is False
+    assert "case_sets_differ" in rep["incomparable_reason"]
+    assert rep["common_case_count"] == 1
+    assert rep["per_model"]["m1"]["compared_attempt_count"] == 1
+    assert rep["per_model"]["m1"]["attempt_count"] == 2
+
+
+def test_no_common_cases_are_incomparable():
+    rows = [_bench_row("c1", "m1"), _bench_row("c2", "m2")]
+    rep = _build(rows, ["m1", "m2"])
+    assert rep["comparable"] is False
+    assert "no_common_cases" in rep["incomparable_reason"]
+    assert rep["common_case_count"] == 0
+    assert rep["per_model"]["m1"]["report"] is None
+
+
+def test_config_drift_within_profile_is_incomparable():
+    rows = [_bench_row("c1", "m1", fingerprint="fpA"),
+            _bench_row("c1", "m1", fingerprint="fpB"), _bench_row("c1", "m2")]
+    rep = _build(rows, ["m1", "m2"])
+    assert rep["comparable"] is False
+    assert "m1:config_fingerprint_varies" in rep["incomparable_reason"]
+
+
+def test_missing_model_marks_batch_incomplete():
+    rows = [_bench_row("c1", "m1"), _bench_row("c1", "m2")]
+    rep = _build(rows, ["m1", "m2", "m3"])
+    assert rep["comparable"] is False
+    assert "model_missing_results:m3" in rep["incomparable_reason"]
+    assert rep["models_missing"] == ["m3"]
+    assert rep["models_compared"] == ["m1", "m2"]
+    assert rep["per_model"]["m3"]["report"] is None
+
+
+def test_failed_attempt_config_drift_is_detected():
+    rows = [
+        _bench_row("c1", "m1", fingerprint="fpA"),
+        _bench_row("c1", "m1", fingerprint="fpB", verdict="system_failed",
+                   identity_ok=True, attempts=1),
+        _bench_row("c1", "m2", fingerprint="fpA"),
+    ]
+    rep = _build(rows, ["m1", "m2"])
+    assert rep["comparable"] is False
+    assert "m1:config_fingerprint_varies" in rep["incomparable_reason"]
