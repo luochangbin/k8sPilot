@@ -32,6 +32,30 @@ class ResourceRef(BaseModel):
     uid: Optional[str] = None
 
 
+class AlertStatus(str, Enum):
+    firing = "firing"
+    resolved = "resolved"
+
+
+class AlertContext(BaseModel):
+    """Normalized Alertmanager alert (Phase 5).
+
+    Carried by the connector's alert webhook adapter; `snapshot` is the
+    connector's lightweight fact snapshot, never a full data crawl.
+    """
+
+    fingerprint: str
+    status: AlertStatus = AlertStatus.firing
+    alertname: Optional[str] = None
+    starts_at: Optional[str] = None
+    group_key: Optional[str] = None
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    snapshot: Optional[dict] = None
+    # True when the connector could not map the alert to a unique resource.
+    unresolved_target: bool = False
+
+
 class DiagnosisRequest(BaseModel):
     """Unified diagnosis request (manual and alert triggers share this shape).
 
@@ -40,7 +64,11 @@ class DiagnosisRequest(BaseModel):
     """
 
     trigger: Trigger = Trigger.manual
-    resource: ResourceRef
+    # Optional only for alert triggers whose target is unresolved; manual and
+    # resolved-target alerts still require a resource (validated in the API).
+    resource: Optional[ResourceRef] = None
+    # Phase 5: normalized Alertmanager context (present when trigger=alert).
+    alert: Optional[AlertContext] = None
     # Phase 4 reserves an `alert` field; not used in Phase 1.
 
     # --- Phase 2 eval fields (optional, backward-compatible) ---

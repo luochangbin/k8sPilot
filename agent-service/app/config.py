@@ -62,6 +62,14 @@ class Config:
             "ENABLE_MODEL_PROFILE_SELECTION", "false"
         ).strip().lower() in ("1", "true", "yes", "on")
 
+        # Phase 5 alert storm protection: max alert-triggered requests accepted
+        # per rolling minute (0 disables the limiter).
+        self.alert_rate_limit_per_minute: int = int(_env("ALERT_RATE_LIMIT_PER_MINUTE", "30"))
+
+        # How long a claimed-but-not-yet-started alert lifecycle may block
+        # retries before another delivery may take it over (seconds).
+        self.alert_claim_stale_seconds: int = int(_env("ALERT_CLAIM_STALE_SECONDS", "300"))
+
 
 # agent-service package root (parent of app/); profile paths are relative to it.
 _AGENT_SERVICE_ROOT = Path(__file__).resolve().parents[1]

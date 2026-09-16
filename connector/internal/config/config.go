@@ -22,6 +22,14 @@ type Config struct {
 	LokiURL       string
 	DataSourceTimeout time.Duration
 	MetricsMaxSeries int
+
+	// Phase 5 alert webhook adapter (Alertmanager -> connector -> Agent Service).
+	AgentURL             string
+	AlertForwardTimeout  time.Duration
+	AlertSnapshotEventLimit int
+	// Shared bearer token required on POST /alerts ("" disables auth, e.g. local dev).
+	AlertWebhookToken string
+	AlertMaxBatch     int
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -39,6 +47,12 @@ func Load() *Config {
 		LokiURL:           os.Getenv("LOKI_URL"),
 		DataSourceTimeout: time.Duration(getInt("DATASOURCE_TIMEOUT_SECONDS", 10)) * time.Second,
 		MetricsMaxSeries:  getInt("METRICS_MAX_SERIES", 5),
+
+		AgentURL:                getStr("AGENT_URL", "http://localhost:8000"),
+		AlertForwardTimeout:     time.Duration(getInt("ALERT_FORWARD_TIMEOUT_SECONDS", 10)) * time.Second,
+		AlertSnapshotEventLimit: getInt("ALERT_SNAPSHOT_EVENT_LIMIT", 10),
+		AlertWebhookToken:       os.Getenv("ALERT_WEBHOOK_TOKEN"),
+		AlertMaxBatch:           getInt("ALERT_MAX_BATCH", 100),
 	}
 }
 
@@ -52,6 +66,13 @@ func getInt(name string, def int) int {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
+	}
+	return def
+}
+
+func getStr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
 	}
 	return def
 }

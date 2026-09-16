@@ -1,26 +1,34 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 
+	"k8spilot/connector/internal/alerts"
 	"k8spilot/connector/internal/config"
 	"k8spilot/connector/internal/tools"
 )
 
 // Server exposes the connector's read-only tools over HTTP.
 type Server struct {
-	cfg   *config.Config
-	tools *tools.Tools
+	cfg    *config.Config
+	tools  *tools.Tools
+	alerts *alerts.Forwarder
 }
 
 // New builds a Server.
 func New(cfg *config.Config, t *tools.Tools) *Server {
-	return &Server{cfg: cfg, tools: t}
+	return &Server{
+		cfg:    cfg,
+		tools:  t,
+		alerts: alerts.NewForwarder(cfg.AgentURL, cfg.AlertForwardTimeout, t, cfg.AlertSnapshotEventLimit),
+	}
 }
 
 // Handler returns the HTTP router.
@@ -34,6 +42,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /tools/logs", s.handleLogs)
 	mux.HandleFunc("POST /tools/query_metrics", s.handleQueryMetrics)
 	mux.HandleFunc("POST /tools/query_logs", s.handleQueryLogs)
+	mux.HandleFunc("POST /alerts", s.handleAlerts)
 	return mux
 }
 
@@ -200,6 +209,37 @@ func (s *Server) handleQueryLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
+	if token := s.cfg.AlertWebhookToken; token != "" {
+		want := "Bearer " + token
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(want)) != 1 {
+			writeJSON(w, http.StatusUnauthorized,
+				toolError{Code: "unauthorized", Error: "invalid alert webhook token"})
+			return
+		}
+	}
+	var wh alerts.Webhook
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&wh); err != nil {
+		writeJSON(w, http.StatusBadRequest, toolError{Code: "invalid_request", Error: err.Error()})
+		return
+	}
+	if len(wh.Alerts) == 0 {
+		writeJSON(w, http.StatusBadRequest,
+			toolError{Code: "invalid_request", Error: "webhook contains no alerts"})
+		return
+	}
+	if max := s.cfg.AlertMaxBatch; max > 0 && len(wh.Alerts) > max {
+		writeJSON(w, http.StatusRequestEntityTooLarge, toolError{
+			Code:  "too_many_alerts",
+			Error: fmt.Sprintf("webhook carries %d alerts, limit is %d", len(wh.Alerts), max),
+		})
+		return
+	}
+	summary := s.alerts.Handle(r.Context(), wh)
+	// Keep Alertmanager retrying: any agent failure yields a non-2xx status.
+	writeJSON(w, summary.RetryableStatus(), summary)
 }
 
 func (s *Server) decode(w http.ResponseWriter, r *http.Request) (*toolRequest, bool) {

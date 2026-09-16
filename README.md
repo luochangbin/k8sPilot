@@ -230,7 +230,7 @@ python -m eval compare --baseline <baseline-run> --candidate <candidate-run> --r
 | Phase 2 | Agent 评测、基线与回归闭环 | ✅ 已完成 |
 | Phase 3 | Prometheus/Loki、持久化历史、多资源入口 | ✅ 已实现 |
 | Phase 4 | Runbook RAG 与历史 Incident 检索 | ⏸️ 暂不实现（缺乏知识库） |
-| Phase 5 | Alertmanager 告警自动诊断 | 🚧 实现中 |
+| Phase 5 | Alertmanager 告警自动诊断 | ✅ 已实现（Alertmanager 部署待接入） |
 | Phase 6 | 只读修复计划与人工审批 | 🗺️ 规划中 |
 | Phase 7 | Policy + Executor 受控执行与审计 | 🗺️ 规划中 |
 
@@ -273,6 +273,7 @@ npm run build
 | [Phase 2 Eval](docs/phase2-eval.md) | Case、Runner、评分、基线与候选版本对照 |
 | [Phase 3 Deploy](docs/phase3-deploy.md) | Prometheus、Loki、持久化历史与降级验证 |
 | [Phase 4 Knowledge](docs/phase4-knowledge.md) | 知识摄取、历史 Incident、引用约束与消融实验（**暂不实现：缺乏知识库**） |
+| [Phase 5 Alerts](docs/phase5-alerts.md) | 告警 Webhook、fingerprint 去重与生命周期、自动诊断 |
 | [Model Benchmark](docs/model-benchmark.md) | 评分口径 v3、模型 Profile、多模型评测与报告 |
 
 ## 模型对比（2026-09-15）

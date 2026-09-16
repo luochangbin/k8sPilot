@@ -1,0 +1,32 @@
+# Phase 5 alert webhook ingress restriction (optional, not applied by default).
+#
+# POST /alerts can trigger paid LLM diagnoses, so restrict who may reach it.
+# IMPORTANT: the same port also serves the Agent Service tool calls, so a policy
+# that only allows Alertmanager would break diagnosis. Adjust the two `from`
+# entries below to your environment before applying:
+#   1. your Alertmanager namespace/labels
+#   2. the Agent Service source (host/node IP, or the agent's namespace if it
+#      runs in-cluster)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-agent-connector-alerts
+  namespace: k8spilot
+spec:
+  podSelector:
+    matchLabels:
+      app: ai-agent-connector
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Alertmanager (adjust namespace labels).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+        # Agent Service source (adjust to the host/node or agent namespace).
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 8080

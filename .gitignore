@@ -19,6 +19,7 @@ dist/
 
 # Go
 connector/connector.exe
+connector/connector-*
 
 # Embedded upstream checkout
 headlamp/

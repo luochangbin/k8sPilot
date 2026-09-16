@@ -76,7 +76,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: connector
-          image: ai-agent-connector:phase3
+          image: connector:phase5
           imagePullPolicy: IfNotPresent
           env:
             # Phase 3 optional data sources (observability namespace). Empty
@@ -85,6 +85,24 @@ spec:
               value: http://prometheus.observability.svc.cluster.local:9090
             - name: LOKI_URL
               value: http://loki.observability.svc.cluster.local:3100
+            # Phase 5 alert webhook: the Agent Service address reachable from
+            # this pod (this deployment: the Windows host on the VMnet8 bridge).
+            - name: AGENT_URL
+              value: http://192.168.81.1:8000
+            - name: ALERT_FORWARD_TIMEOUT_SECONDS
+              value: "10"
+            - name: ALERT_SNAPSHOT_EVENT_LIMIT
+              value: "10"
+            - name: ALERT_MAX_BATCH
+              value: "100"
+            # Shared bearer token required on POST /alerts (Secret is optional;
+            # auth is disabled when the key is absent).
+            - name: ALERT_WEBHOOK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ai-agent-connector-alerts
+                  key: webhook-token
+                  optional: true
           ports:
             - name: http
               containerPort: 8080

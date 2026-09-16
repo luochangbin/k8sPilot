@@ -1,0 +1,101 @@
+# Alertmanager for the Phase 5 eval stack (observability namespace).
+#
+# Routes alerts to the connector's alert webhook with a shared bearer token.
+# The token Secret must exist in this namespace (it cannot be mounted across
+# namespaces); create it from the same value used by the connector:
+#   kubectl -n observability create secret generic ai-agent-connector-alerts \
+#     --from-literal=webhook-token=<token>
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: observability
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 1m
+    route:
+      receiver: ai-agent-connector
+      group_by: [alertname, namespace, pod]
+      group_wait: 5s
+      group_interval: 30s
+      repeat_interval: 1m
+    receivers:
+      - name: ai-agent-connector
+        webhook_configs:
+          - url: http://ai-agent-connector.k8spilot.svc.cluster.local:8080/alerts
+            send_resolved: true
+            http_config:
+              authorization:
+                type: Bearer
+                credentials_file: /etc/alertmanager/token/webhook-token
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: observability
+  labels:
+    app: alertmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      securityContext:
+        runAsUser: 65534
+        runAsNonRoot: true
+        fsGroup: 65534
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports:
+            - name: http
+              containerPort: 9093
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9093
+            initialDelaySeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager
+            - name: token
+              mountPath: /etc/alertmanager/token
+              readOnly: true
+            - name: storage
+              mountPath: /alertmanager
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config
+        - name: token
+          secret:
+            secretName: ai-agent-connector-alerts
+            defaultMode: 0444
+        - name: storage
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: observability
+  labels:
+    app: alertmanager
+spec:
+  selector:
+    app: alertmanager
+  ports:
+    - name: http
+      port: 9093
+      targetPort: 9093
