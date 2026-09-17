@@ -1,0 +1,14 @@
+# Persistent storage for the Agent Service: diagnosis sessions, read receipts
+# and (when TRACE_DIR points here) the JSONL traces must survive Pod restarts.
+# Uses the cluster default StorageClass; override storageClassName if needed.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-service-data
+  namespace: k8spilot
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi

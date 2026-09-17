@@ -22,6 +22,11 @@ k8sPilot 是一个面向单集群 Kubernetes 的 **Headlamp 智能诊断插件**
 |:---:|:---:|:---:|
 | [![ConfigMap 缺失诊断结果](docs/images/pod-missing-configmap-diagnosis.png)](docs/images/pod-missing-configmap-diagnosis.png) | [![CPU 请求过高诊断结果](docs/images/pod-insufficient-cpu-diagnosis.png)](docs/images/pod-insufficient-cpu-diagnosis.png) | [![CrashLoopBackOff 诊断结果](docs/images/pod-crashloop-diagnosis.png)](docs/images/pod-crashloop-diagnosis.png) |
 
+### 演示
+<p align="left">
+  <img src="docs/images/demo.gif" alt="TodoWidget 使用演示">
+</p>
+
 ## 核心能力
 
 - **Headlamp 原生入口**：无需切换到独立控制台，在资源详情页发起诊断并查看结果。
@@ -274,6 +279,7 @@ npm run build
 | [Phase 3 Deploy](docs/phase3-deploy.md) | Prometheus、Loki、持久化历史与降级验证 |
 | [Phase 4 Knowledge](docs/phase4-knowledge.md) | 知识摄取、历史 Incident、引用约束与消融实验（**暂不实现：缺乏知识库**） |
 | [Phase 5 Alerts](docs/phase5-alerts.md) | 告警 Webhook、fingerprint 去重与生命周期、自动诊断 |
+| [Diagnosis Center](docs/diagnosis-center.md) | 诊断中心：会话列表、未读、Timeline、未解析告警 |
 | [Model Benchmark](docs/model-benchmark.md) | 评分口径 v3、模型 Profile、多模型评测与报告 |
 
 ## 模型对比（2026-09-15）

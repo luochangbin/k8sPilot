@@ -64,6 +64,24 @@ CREATE INDEX IF NOT EXISTS idx_alert_lifecycle_fp_state
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_alert_lifecycle_active
     ON alert_lifecycles (fingerprint)
     WHERE state IN ('open', 'unresolved_target');
+
+-- Diagnosis Center: per-viewer read receipts (not authentication).
+CREATE TABLE IF NOT EXISTS diagnosis_read_receipts (
+    viewer_id     TEXT NOT NULL,
+    diagnosis_id  TEXT NOT NULL,
+    read_at       TEXT NOT NULL,
+    PRIMARY KEY (viewer_id, diagnosis_id),
+    FOREIGN KEY (diagnosis_id) REFERENCES diagnoses(diagnosis_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_read_receipts_diagnosis
+    ON diagnosis_read_receipts (diagnosis_id);
+
+CREATE INDEX IF NOT EXISTS idx_diagnoses_created
+    ON diagnoses (created_at DESC, diagnosis_id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_alert_lifecycle_diagnosis
+    ON alert_lifecycles (diagnosis_id, id DESC);
 """
 
 
@@ -82,6 +100,7 @@ class SessionStore:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
+            self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.executescript(_SCHEMA)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.commit()
@@ -297,6 +316,196 @@ class SessionStore:
             updated = self._conn.execute(
                 "SELECT * FROM alert_lifecycles WHERE id = ?", (row["id"],)).fetchone()
             return dict(updated)
+
+    # ---- Diagnosis Center (list/notifications/unresolved/read) ----
+
+    def get_alert_projection(self, diagnosis_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fingerprint, alertname, state, starts_at, latest_alert_at, resolved_at "
+                "FROM alert_lifecycles WHERE diagnosis_id = ? ORDER BY id DESC LIMIT 1",
+                (diagnosis_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_sessions(self, *, limit: int, status: Optional[str] = None,
+                      trigger: Optional[str] = None, resource_kind: Optional[str] = None,
+                      namespace: Optional[str] = None, name: Optional[str] = None,
+                      uid: Optional[str] = None, since: Optional[str] = None,
+                      until: Optional[str] = None,
+                      after: Optional[tuple[str, str]] = None,
+                      viewer_id: Optional[str] = None
+                      ) -> tuple[list[dict[str, Any]], Optional[tuple[str, str]]]:
+        """Keyset page over (created_at, diagnosis_id) DESC with filters."""
+        where: list[str] = []
+        params: list[Any] = []
+        if status:
+            where.append("d.status = ?")
+            params.append(status)
+        if trigger:
+            where.append("d.trigger = ?")
+            params.append(trigger)
+        if resource_kind:
+            where.append("json_extract(d.resource, '$.kind') = ?")
+            params.append(resource_kind)
+        if namespace:
+            where.append("json_extract(d.resource, '$.namespace') = ?")
+            params.append(namespace)
+        if name:
+            # Fuzzy match on the resource name; escape LIKE wildcards.
+            escaped = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where.append("json_extract(d.resource, '$.name') LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        if uid:
+            where.append("json_extract(d.resource, '$.uid') = ?")
+            params.append(uid)
+        if since:
+            where.append("d.created_at >= ?")
+            params.append(since)
+        if until:
+            where.append("d.created_at <= ?")
+            params.append(until)
+        if after:
+            where.append("(d.created_at < ? OR (d.created_at = ? AND d.diagnosis_id < ?))")
+            params.extend([after[0], after[0], after[1]])
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        join = ""
+        unread_expr = "NULL"
+        if viewer_id:
+            join = (" LEFT JOIN diagnosis_read_receipts r "
+                    "ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ?")
+            # Unread applies to auto-diagnoses only (same scope as notifications),
+            # so manual/eval rows are never reported as unread.
+            unread_expr = (
+                "CASE WHEN d.trigger = 'alert' AND d.status IN ('completed', 'failed') "
+                "AND d.eval_run_id IS NULL AND r.read_at IS NULL THEN 1 ELSE 0 END"
+            )
+            params = [viewer_id, *params]
+        sql = (f"SELECT d.diagnosis_id, d.trigger, d.status, d.resource, d.result, "
+               f"d.created_at, d.updated_at, {unread_expr} AS unread "
+               f"FROM diagnoses d{join}{clause} "
+               f"ORDER BY d.created_at DESC, d.diagnosis_id DESC LIMIT ?")
+        with self._lock:
+            rows = self._conn.execute(sql, [*params, limit + 1]).fetchall()
+        out = [dict(r) for r in rows[:limit]]
+        next_cursor = None
+        if len(rows) > limit and out:
+            next_cursor = (out[-1]["created_at"], out[-1]["diagnosis_id"])
+        return out, next_cursor
+
+    def count_unread_notifications(self, viewer_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM diagnoses d "
+                "LEFT JOIN diagnosis_read_receipts r "
+                "  ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ? "
+                "WHERE d.trigger = 'alert' AND d.status IN ('completed', 'failed') "
+                "  AND d.eval_run_id IS NULL AND r.read_at IS NULL",
+                (viewer_id,),
+            ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def mark_all_notifications_read(self, viewer_id: str) -> int:
+        """Mark every currently-unread auto-diagnosis as read for this viewer.
+
+        The candidate ids are snapshotted under the same lock as the inserts, so
+        diagnoses that reach a terminal state while the request is in flight stay
+        unread (they were not part of this snapshot).
+        """
+        now = _now()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT d.diagnosis_id FROM diagnoses d "
+                "LEFT JOIN diagnosis_read_receipts r "
+                "  ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ? "
+                "WHERE d.trigger = 'alert' AND d.status IN ('completed', 'failed') "
+                "  AND d.eval_run_id IS NULL AND r.read_at IS NULL",
+                (viewer_id,),
+            ).fetchall()
+            ids = [r["diagnosis_id"] for r in rows]
+            for diagnosis_id in ids:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO diagnosis_read_receipts "
+                    "(viewer_id, diagnosis_id, read_at) VALUES (?,?,?)",
+                    (viewer_id, diagnosis_id, now),
+                )
+            self._conn.commit()
+        return len(ids)
+
+    def list_namespaces(self) -> list[str]:
+        """Distinct namespaces for the filter dropdown.
+
+        Eval runs create one isolated namespace per case (e.g.
+        `eval-pod-oomkilled-001`); those fixtures are excluded so the dropdown
+        only shows namespaces from real (manual/alert) diagnoses.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT json_extract(resource, '$.namespace') AS ns FROM diagnoses "
+                "WHERE eval_run_id IS NULL "
+                "  AND json_extract(resource, '$.namespace') IS NOT NULL "
+                "  AND json_extract(resource, '$.namespace') != '' ORDER BY ns"
+            ).fetchall()
+        return [r["ns"] for r in rows if r["ns"]]
+
+    def list_notifications(self, *, viewer_id: str, limit: int,
+                           after: Optional[tuple[str, str]] = None
+                           ) -> tuple[list[dict[str, Any]], Optional[tuple[str, str]]]:
+        where = ["d.trigger = 'alert'", "d.status IN ('completed', 'failed')",
+                 "d.eval_run_id IS NULL", "r.read_at IS NULL"]
+        params: list[Any] = [viewer_id]
+        if after:
+            where.append("(d.created_at < ? OR (d.created_at = ? AND d.diagnosis_id < ?))")
+            params.extend([after[0], after[0], after[1]])
+        sql = ("SELECT d.diagnosis_id, d.status, d.created_at FROM diagnoses d "
+               "LEFT JOIN diagnosis_read_receipts r "
+               "  ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ? "
+               "WHERE " + " AND ".join(where) +
+               " ORDER BY d.created_at DESC, d.diagnosis_id DESC LIMIT ?")
+        with self._lock:
+            rows = self._conn.execute(sql, [*params, limit + 1]).fetchall()
+        out = [dict(r) for r in rows[:limit]]
+        next_cursor = None
+        if len(rows) > limit and out:
+            next_cursor = (out[-1]["created_at"], out[-1]["diagnosis_id"])
+        return out, next_cursor
+
+    def list_unresolved_alerts(self, *, limit: int,
+                               after: Optional[tuple[str, int]] = None
+                               ) -> tuple[list[dict[str, Any]], Optional[tuple[str, int]]]:
+        where = ["state = ?", "diagnosis_id IS NULL"]
+        params: list[Any] = [ALERT_UNRESOLVED]
+        if after:
+            where.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            params.extend([after[0], after[0], after[1]])
+        sql = ("SELECT id, alertname, starts_at, latest_alert_at, state, target, created_at "
+               "FROM alert_lifecycles WHERE " + " AND ".join(where) +
+               " ORDER BY created_at DESC, id DESC LIMIT ?")
+        with self._lock:
+            rows = self._conn.execute(sql, [*params, limit + 1]).fetchall()
+        out = [dict(r) for r in rows[:limit]]
+        next_cursor = None
+        if len(rows) > limit and out:
+            next_cursor = (out[-1]["created_at"], out[-1]["id"])
+        return out, next_cursor
+
+    def mark_diagnosis_read(self, viewer_id: str, diagnosis_id: str) -> str:
+        """Idempotently record a read receipt. Returns ok|not_found|running."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM diagnoses WHERE diagnosis_id = ?", (diagnosis_id,)
+            ).fetchone()
+            if row is None:
+                return "not_found"
+            if row["status"] not in ("completed", "failed"):
+                return "running"
+            self._conn.execute(
+                "INSERT OR REPLACE INTO diagnosis_read_receipts "
+                "(viewer_id, diagnosis_id, read_at) VALUES (?,?,?)",
+                (viewer_id, diagnosis_id, _now()),
+            )
+            self._conn.commit()
+        return "ok"
 
     # ---- helpers ----
 

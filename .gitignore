@@ -4,11 +4,13 @@ __pycache__/
 .venv/
 *.egg-info/
 .pytest_cache/
+.pytest-basetemp-*/
 .coverage
 htmlcov/
 
 # Secrets / local config
 .env
+*handoff.md
 # Local model profile instances; the *.example.yaml template stays tracked.
 agent-service/llm-profiles.yaml
 

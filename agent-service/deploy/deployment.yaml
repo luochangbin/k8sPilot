@@ -33,6 +33,9 @@ spec:
                   key: LLM_API_KEY
             - name: DIAGNOSIS_DB
               value: /data/diagnoses.db
+            # Same persistent volume: traces must survive restarts too.
+            - name: TRACE_DIR
+              value: /data/trace
           volumeMounts:
             - name: data
               mountPath: /data
@@ -57,4 +60,5 @@ spec:
             periodSeconds: 15
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: agent-service-data

@@ -136,6 +136,9 @@ class Diagnosis(BaseModel):
     status: str  # queued | investigating | completed | failed
     result: Optional[DiagnosisResult] = None
     error: Optional[str] = None
+    # Phase 5 / Diagnosis Center: nullable alert lifecycle projection (None when
+    # the diagnosis is manual or predates alert tracking).
+    alert: Optional[dict] = None
     # Phase 2 eval correlation fields (optional; present for eval runs).
     eval_run_id: Optional[str] = None
     case_id: Optional[str] = None

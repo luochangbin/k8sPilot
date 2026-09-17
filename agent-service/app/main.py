@@ -1,10 +1,12 @@
 """FastAPI entrypoint for the agent service."""
 
+import json
 import logging
 import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -13,6 +15,17 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 from .agent import Agent
+from .center import (
+    CursorError,
+    VALID_STATUSES,
+    VALID_TRIGGERS,
+    decode_cursor,
+    encode_cursor,
+    filter_fingerprint,
+    parse_iso,
+    validate_enum,
+    validate_viewer_id,
+)
 from .config import Config
 from .connector import ConnectorClient
 from .llm import (
@@ -24,6 +37,7 @@ from .llm import (
 )
 from .models import DIAGNOSABLE_KINDS, AlertStatus, DiagnosisRequest
 from .store import ALERT_CLOSED, ALERT_OPEN, ALERT_UNRESOLVED, SessionStore
+from .timeline import TimelineRangeError, read_timeline
 
 
 class _AlertRateLimiter:
@@ -244,7 +258,184 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
         d = store.get(diagnosis_id)
         if d is None:
             raise HTTPException(status_code=404, detail="diagnosis not found")
-        return d
+        # Legacy detail: only adds a nullable alert projection.
+        return {**d.model_dump(mode="json"),
+                "alert": store.get_alert_projection(diagnosis_id)}
+
+    # ---- Diagnosis Center (design §3) ----
+
+    def _parse_center_filters(limit: int, status: Optional[str], trigger: Optional[str],
+                              resource_kind: Optional[str], namespace: Optional[str],
+                              name: Optional[str], uid: Optional[str],
+                              since: Optional[str], until: Optional[str]) -> dict[str, Any]:
+        if limit < 1 or limit > 100:
+            raise HTTPException(status_code=422, detail="limit must be 1..100")
+        try:
+            filters = {
+                "status": validate_enum(status, VALID_STATUSES, "status"),
+                "trigger": validate_enum(trigger, VALID_TRIGGERS, "trigger"),
+                "resource_kind": resource_kind,
+                "namespace": namespace,
+                "name": name,
+                "uid": uid,
+                "since": parse_iso(since) if since else None,
+                "until": parse_iso(until) if until else None,
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        return filters
+
+    def _session_item(row: dict[str, Any]) -> dict[str, Any]:
+        resource = json.loads(row["resource"]) if row["resource"] else {}
+        result = json.loads(row["result"]) if row["result"] else None
+        summary = None
+        if result:
+            summary = {k: result.get(k) for k in
+                       ("symptom", "root_cause", "root_cause_code", "confidence",
+                        "insufficient_evidence")}
+        unread = None if row.get("unread") is None else bool(row["unread"])
+        return {
+            "diagnosis_id": row["diagnosis_id"],
+            "trigger": row["trigger"],
+            "status": row["status"],
+            "resource": {k: resource.get(k) for k in ("kind", "namespace", "name", "uid")},
+            "alert": store.get_alert_projection(row["diagnosis_id"]),
+            "summary": summary,
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "unread": unread,
+        }
+
+    @app.get("/api/v1/diagnosis-center/sessions")
+    def center_sessions(limit: int = 50, after: Optional[str] = None,
+                        status: Optional[str] = None, trigger: Optional[str] = None,
+                        resource_kind: Optional[str] = None, namespace: Optional[str] = None,
+                        name: Optional[str] = None, uid: Optional[str] = None,
+                        since: Optional[str] = None, until: Optional[str] = None,
+                        viewer_id: Optional[str] = None) -> dict[str, Any]:
+        filters = _parse_center_filters(limit, status, trigger, resource_kind, namespace,
+                                        name, uid, since, until)
+        fingerprint = filter_fingerprint(filters)
+        after_keys = None
+        if after:
+            try:
+                data = decode_cursor(after, fingerprint)
+                after_keys = (data["ca"], data["id"])
+            except (CursorError, KeyError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        if viewer_id is not None:
+            try:
+                validate_viewer_id(viewer_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        rows, next_keys = store.list_sessions(
+            limit=limit, status=filters["status"], trigger=filters["trigger"],
+            resource_kind=filters["resource_kind"], namespace=filters["namespace"],
+            name=filters["name"], uid=filters["uid"], since=filters["since"],
+            until=filters["until"], after=after_keys, viewer_id=viewer_id)
+        next_cursor = (encode_cursor(fingerprint, ca=next_keys[0], id=next_keys[1])
+                       if next_keys else None)
+        return {"items": [_session_item(r) for r in rows], "next_cursor": next_cursor}
+
+    @app.get("/api/v1/diagnosis-center/notifications")
+    def center_notifications(viewer_id: str, limit: int = 50,
+                             after: Optional[str] = None) -> dict[str, Any]:
+        if limit < 1 or limit > 100:
+            raise HTTPException(status_code=422, detail="limit must be 1..100")
+        try:
+            validate_viewer_id(viewer_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        fingerprint = filter_fingerprint({"viewer_id": viewer_id})
+        after_keys = None
+        if after:
+            try:
+                data = decode_cursor(after, fingerprint)
+                after_keys = (data["ca"], data["id"])
+            except (CursorError, KeyError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        rows, next_keys = store.list_notifications(
+            viewer_id=viewer_id, limit=limit, after=after_keys)
+        next_cursor = (encode_cursor(fingerprint, ca=next_keys[0], id=next_keys[1])
+                       if next_keys else None)
+        return {
+            "unread_count": store.count_unread_notifications(viewer_id),
+            "items": [{"diagnosis_id": r["diagnosis_id"], "status": r["status"],
+                       "unread": True} for r in rows],
+            "next_cursor": next_cursor,
+        }
+
+    @app.post("/api/v1/diagnosis-center/sessions/{diagnosis_id}/read")
+    def center_mark_read(diagnosis_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        viewer_id = str(payload.get("viewer_id") or "")
+        try:
+            validate_viewer_id(viewer_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        outcome = store.mark_diagnosis_read(viewer_id, diagnosis_id)
+        if outcome == "not_found":
+            raise HTTPException(status_code=404, detail="diagnosis not found")
+        if outcome == "running":
+            raise HTTPException(status_code=409, detail="diagnosis is not in a terminal state")
+        return {"id": diagnosis_id, "read": True}
+
+    @app.get("/api/v1/diagnosis-center/unresolved-alerts")
+    def center_unresolved_alerts(limit: int = 50,
+                                 after: Optional[str] = None) -> dict[str, Any]:
+        if limit < 1 or limit > 100:
+            raise HTTPException(status_code=422, detail="limit must be 1..100")
+        fingerprint = filter_fingerprint({"area": "unresolved"})
+        after_keys = None
+        if after:
+            try:
+                data = decode_cursor(after, fingerprint)
+                after_keys = (data["ca"], int(data["id"]))
+            except (CursorError, KeyError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        rows, next_keys = store.list_unresolved_alerts(limit=limit, after=after_keys)
+        next_cursor = (encode_cursor(fingerprint, ca=next_keys[0], id=next_keys[1])
+                       if next_keys else None)
+        return {
+            "items": [{
+                "id": r["id"], "alertname": r["alertname"], "starts_at": r["starts_at"],
+                "latest_alert_at": r["latest_alert_at"], "state": r["state"],
+                "target": json.loads(r["target"]) if r["target"] else None,
+            } for r in rows],
+            "next_cursor": next_cursor,
+        }
+
+    @app.post("/api/v1/diagnosis-center/notifications/read-all")
+    def center_mark_all_read(payload: dict[str, Any]) -> dict[str, Any]:
+        """Mark all currently-unread auto-diagnoses as read for this viewer."""
+        viewer_id = str(payload.get("viewer_id") or "")
+        try:
+            validate_viewer_id(viewer_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        return {"read": store.mark_all_notifications_read(viewer_id)}
+
+    @app.get("/api/v1/diagnosis-center/namespaces")
+    def center_namespaces() -> dict[str, Any]:
+        """Distinct namespaces for the filter dropdown."""
+        return {"items": store.list_namespaces()}
+
+    @app.get("/api/v1/diagnoses/{diagnosis_id}/timeline")
+    def diagnosis_timeline(diagnosis_id: str, after: int = 0, limit: int = 100
+                           ) -> dict[str, Any]:
+        if store.get(diagnosis_id) is None:
+            raise HTTPException(status_code=404, detail="diagnosis not found")
+        if not cfg.trace_dir:
+            return {"items": [], "next_after": after, "has_more": False,
+                    "available": "unavailable", "gap": False}
+        path = Path(cfg.trace_dir) / f"{diagnosis_id}.jsonl"
+        if not path.is_file():
+            return {"items": [], "next_after": after, "has_more": False,
+                    "available": "pending", "gap": False}
+        try:
+            return read_timeline(str(path), diagnosis_id=diagnosis_id,
+                                 after=after, limit=limit)
+        except TimelineRangeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
 
     return app
 

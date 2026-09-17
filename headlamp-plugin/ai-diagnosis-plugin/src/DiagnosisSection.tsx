@@ -6,14 +6,17 @@ import {
   Chip,
   CircularProgress,
   Divider,
+  Link as MuiLink,
   List,
   ListItem,
-  ListItemIcon,
   ListItemText,
   Stack,
   Typography,
 } from '@mui/material';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
+import InvestigationSteps from './InvestigationSteps';
+import { centerUrl } from './routes';
 
 /**
  * Agent Service base URL.
@@ -220,40 +223,22 @@ export default function DiagnosisSection({ resource }: { resource: ResourceLike 
       {!running && diagnosis?.status === 'failed' && (
         <Alert severity="error">诊断失败：{diagnosis.error ?? '未知错误'}</Alert>
       )}
+
+      {name && (
+        <Box sx={{ mt: 2 }}>
+          <MuiLink
+            component={Link}
+            to={centerUrl(
+              resource.metadata?.uid
+                ? `uid=${encodeURIComponent(resource.metadata.uid)}`
+                : undefined
+            )}
+          >
+            查看完整诊断
+          </MuiLink>
+        </Box>
+      )}
     </SectionBox>
-  );
-}
-
-function StepCheckIcon() {
-  return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M5 12l5 5 9-10" />
-    </svg>
-  );
-}
-
-function InvestigationSteps({ steps }: { steps: string[] }) {
-  return (
-    <List dense>
-      {steps.map(step => (
-        <ListItem key={step} disableGutters>
-          <ListItemIcon sx={{ minWidth: 28, color: 'success.main' }}>
-            <StepCheckIcon />
-          </ListItemIcon>
-          <ListItemText primary={step} />
-        </ListItem>
-      ))}
-    </List>
   );
 }
 
