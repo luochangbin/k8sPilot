@@ -17,13 +17,21 @@ const MAX_BACKOFF_MS = 30000;
 
 interface State {
   unreadCount: number;
+  pendingAlertCount: number;
   items: NotificationItem[];
   error: string | null;
   ready: boolean;
   liveMessage: string;
 }
 
-let state: State = { unreadCount: 0, items: [], error: null, ready: false, liveMessage: '' };
+let state: State = {
+  unreadCount: 0,
+  pendingAlertCount: 0,
+  items: [],
+  error: null,
+  ready: false,
+  liveMessage: '',
+};
 const listeners = new Set<() => void>();
 let timer: ReturnType<typeof setTimeout> | null = null;
 let delay = POLL_MS;
@@ -39,8 +47,12 @@ function setState(patch: Partial<State>): void {
   emit();
 }
 
-function liveMessageFor(count: number): string {
-  return count > 0 ? `${count} 条未读的自动诊断或未解析告警` : '没有未读的自动诊断或未解析告警';
+function liveMessageFor(unreadDiagnoses: number, pendingAlerts: number): string {
+  if (unreadDiagnoses === 0 && pendingAlerts === 0) return '没有未读诊断或待处理告警';
+  const parts: string[] = [];
+  if (unreadDiagnoses > 0) parts.push(`${unreadDiagnoses} 条未读诊断`);
+  if (pendingAlerts > 0) parts.push(`${pendingAlerts} 条待处理告警`);
+  return parts.join('，');
 }
 
 function schedule(): void {
@@ -55,15 +67,23 @@ async function refresh(): Promise<void> {
   try {
     const page = await listNotifications(getViewerId(), 50);
     if (gen !== generation) return;
-    const changed = page.unread_count !== state.unreadCount;
+    // Unread diagnoses and pending alerts are independent counts: only the
+    // former drives the badge/mark-all-read affordance.
+    const unreadDiagnoses = page.unread_diagnosis_count ?? page.unread_count;
+    const pendingAlerts = page.pending_alert_count ?? 0;
+    const changed =
+      unreadDiagnoses !== state.unreadCount || pendingAlerts !== state.pendingAlertCount;
     delay = POLL_MS;
     setState({
-      unreadCount: page.unread_count,
+      unreadCount: unreadDiagnoses,
+      pendingAlertCount: pendingAlerts,
       items: page.items,
       error: null,
       ready: true,
       liveMessage:
-        changed || !state.liveMessage ? liveMessageFor(page.unread_count) : state.liveMessage,
+        changed || !state.liveMessage
+          ? liveMessageFor(unreadDiagnoses, pendingAlerts)
+          : state.liveMessage,
     });
   } catch (err) {
     if (gen !== generation) return;

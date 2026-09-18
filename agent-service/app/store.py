@@ -435,14 +435,14 @@ class SessionStore:
             # keeps pre-existing history out of "new".
             unread_expr = (
                 "CASE WHEN d.trigger = 'alert' AND d.status IN ('completed', 'failed') "
-                "AND d.eval_run_id IS NULL AND r.read_at IS NULL AND d.created_at > ? "
+                "AND d.eval_run_id IS NULL AND r.read_at IS NULL AND d.updated_at > ? "
                 "THEN 1 ELSE 0 END"
             )
             params = [baseline, viewer_id, *params]
             if unread_only:
                 where.extend([
                     "d.trigger = 'alert'", "d.status IN ('completed', 'failed')",
-                    "d.eval_run_id IS NULL", "r.read_at IS NULL", "d.created_at > ?",
+                    "d.eval_run_id IS NULL", "r.read_at IS NULL", "d.updated_at > ?",
                 ])
                 params.append(baseline)
         clause = (" WHERE " + " AND ".join(where)) if where else ""
@@ -477,33 +477,41 @@ class SessionStore:
             ).fetchone()
         return row["first_seen_at"] if row else now
 
-    def count_unread_notifications(self, viewer_id: str) -> int:
+    def count_unread_diagnoses(self, viewer_id: str) -> int:
+        """Unread auto-diagnoses for a viewer.
+
+        Unread is determined by the **terminal/update time** (`updated_at`), not
+        by creation time: a diagnosis created before the viewer's baseline but
+        finishing after it is genuinely new and must be counted.
+        """
         baseline = self.ensure_viewer(viewer_id)
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT ("
-                "  SELECT COUNT(*) FROM diagnoses d "
-                "  LEFT JOIN diagnosis_read_receipts r "
-                "    ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ? "
-                "  WHERE d.trigger = 'alert' AND d.status IN ('completed', 'failed') "
-                "    AND d.eval_run_id IS NULL AND r.read_at IS NULL AND d.created_at > ?"
-                ") + ("
-                "  SELECT COUNT(*) FROM alert_lifecycles "
-                "  WHERE state = ? AND diagnosis_id IS NULL AND created_at > ?"
-                ") AS c",
-                (viewer_id, baseline, ALERT_UNRESOLVED, baseline),
-            ).fetchone()
-        return int(row["c"]) if row else 0
         with self._lock:
             row = self._conn.execute(
                 "SELECT COUNT(*) AS c FROM diagnoses d "
                 "LEFT JOIN diagnosis_read_receipts r "
                 "  ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ? "
                 "WHERE d.trigger = 'alert' AND d.status IN ('completed', 'failed') "
-                "  AND d.eval_run_id IS NULL AND r.read_at IS NULL",
-                (viewer_id,),
+                "  AND d.eval_run_id IS NULL AND r.read_at IS NULL AND d.updated_at > ?",
+                (viewer_id, baseline),
             ).fetchone()
         return int(row["c"]) if row else 0
+
+    def count_pending_alerts(self) -> int:
+        """Unresolved alerts are **pending work**, not unread notifications.
+
+        They are global (not per-viewer) and never affected by read receipts.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM alert_lifecycles "
+                "WHERE state = ? AND diagnosis_id IS NULL",
+                (ALERT_UNRESOLVED,),
+            ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def count_unread_notifications(self, viewer_id: str) -> int:
+        """Backward-compatible alias: unread notifications are unread diagnoses."""
+        return self.count_unread_diagnoses(viewer_id)
 
     def mark_all_notifications_read(self, viewer_id: str) -> int:
         """Mark every currently-unread auto-diagnosis as read for this viewer.
@@ -551,41 +559,30 @@ class SessionStore:
     def list_notifications(self, *, viewer_id: str, limit: int,
                            after: Optional[tuple[str, str]] = None
                            ) -> tuple[list[dict[str, Any]], Optional[tuple[str, str]]]:
-        """Unread items: finished auto-diagnoses plus unstarted unresolved alerts.
+        """Unread auto-diagnoses (pending/unresolved alerts are NOT unread).
 
-        Unresolved alerts never create a diagnosis but still need attention, so
-        they are part of the same notification feed (kind=unresolved_target).
+        Ordering and the baseline both use `updated_at` (terminal time), so a
+        diagnosis created before the baseline but completed after it shows up.
         """
         baseline = self.ensure_viewer(viewer_id)
-        diag_where = ["d.trigger = 'alert'", "d.status IN ('completed', 'failed')",
-                      "d.eval_run_id IS NULL", "r.read_at IS NULL", "d.created_at > ?"]
-        unres_where = ["state = ?", "diagnosis_id IS NULL", "created_at > ?"]
-        params_diag: list[Any] = [viewer_id, baseline]
-        params_unres: list[Any] = [ALERT_UNRESOLVED, baseline]
+        where = ["d.trigger = 'alert'", "d.status IN ('completed', 'failed')",
+                 "d.eval_run_id IS NULL", "r.read_at IS NULL", "d.updated_at > ?"]
+        params: list[Any] = [viewer_id, baseline]
         if after:
-            diag_where.append("(d.created_at < ? OR (d.created_at = ? AND d.diagnosis_id < ?))")
-            params_diag.extend([after[0], after[0], after[1]])
-            unres_where.append("(created_at < ? OR (created_at = ? AND ref < ?))")
-            params_unres.extend([after[0], after[0], after[1]])
-        sql = (
-            "SELECT * FROM ("
-            "  SELECT d.diagnosis_id AS ref, 'diagnosis' AS kind, d.status AS status, "
-            "         d.created_at AS created_at, 1 AS unread FROM diagnoses d "
-            "  LEFT JOIN diagnosis_read_receipts r "
-            "    ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ? "
-            "  WHERE " + " AND ".join(diag_where) +
-            "  UNION ALL "
-            "  SELECT 'unresolved:' || id AS ref, ? AS kind, ? AS status, created_at, 1 AS unread "
-            "  FROM alert_lifecycles WHERE " + " AND ".join(unres_where) +
-            ") ORDER BY created_at DESC, ref DESC LIMIT ?"
-        )
-        params = [*params_diag, ALERT_UNRESOLVED, ALERT_UNRESOLVED, *params_unres, limit + 1]
+            where.append("(d.updated_at < ? OR (d.updated_at = ? AND d.diagnosis_id < ?))")
+            params.extend([after[0], after[0], after[1]])
+        sql = ("SELECT d.diagnosis_id AS ref, 'diagnosis' AS kind, d.status AS status, "
+               "d.updated_at AS updated_at FROM diagnoses d "
+               "LEFT JOIN diagnosis_read_receipts r "
+               "  ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ? "
+               "WHERE " + " AND ".join(where) +
+               " ORDER BY d.updated_at DESC, d.diagnosis_id DESC LIMIT ?")
         with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+            rows = self._conn.execute(sql, [*params, limit + 1]).fetchall()
         out = [dict(r) for r in rows[:limit]]
         next_cursor = None
         if len(rows) > limit and out:
-            next_cursor = (out[-1]["created_at"], out[-1]["ref"])
+            next_cursor = (out[-1]["updated_at"], out[-1]["ref"])
         return out, next_cursor
 
     def list_unresolved_alerts(self, *, limit: int,

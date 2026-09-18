@@ -436,23 +436,27 @@ def test_new_viewer_does_not_inherit_history_as_unread(tmp_path):
         f"/api/v1/diagnosis-center/notifications?viewer_id={fresh}").json()["unread_count"] == 1
 
 
-def test_unresolved_alerts_are_notifications_and_clear_on_resolve(tmp_path):
-    """An unresolved alert starts no diagnosis, but still needs attention."""
+def test_unresolved_alerts_are_pending_not_unread(tmp_path):
+    """Unresolved alerts are pending work: counted separately, absent from the
+    unread feed, and cleared when the alert resolves."""
     client, store, _ = make_center(tmp_path)
     _prime(store, VIEWER)
     store.claim_active_alert_lifecycle(
         fingerprint="fp-note", state=ALERT_UNRESOLVED, alertname="Mystery")
 
     notes = client.get(f"/api/v1/diagnosis-center/notifications?viewer_id={VIEWER}").json()
-    assert notes["unread_count"] == 1
-    item = notes["items"][0]
-    assert item["kind"] == "unresolved_target"
-    assert item["diagnosis_id"] is None
-    assert item["id"] == "unresolved:" + str(store.latest_alert_lifecycle("fp-note")["id"])
+    assert notes["unread_diagnosis_count"] == 0
+    assert notes["pending_alert_count"] == 1
+    assert notes["items"] == []
+
+    # Still visible in its own section list.
+    unresolved = client.get("/api/v1/diagnosis-center/unresolved-alerts").json()
+    assert len(unresolved["items"]) == 1
+    assert unresolved["items"][0]["alertname"] == "Mystery"
 
     store.close_alert_lifecycle("fp-note")
-    assert client.get(
-        f"/api/v1/diagnosis-center/notifications?viewer_id={VIEWER}").json()["unread_count"] == 0
+    after = client.get(f"/api/v1/diagnosis-center/notifications?viewer_id={VIEWER}").json()
+    assert after["pending_alert_count"] == 0
 
 
 def test_sessions_unread_filter_returns_only_unread(tmp_path):
@@ -502,3 +506,79 @@ def test_unread_view_orders_by_completion_not_creation(tmp_path):
         "/api/v1/diagnosis-center/sessions"
         f"?viewer_id={VIEWER}&limit=1&after={first['next_cursor']}")
     assert cross.status_code == 422
+
+
+def test_completed_after_baseline_is_unread_even_if_created_before(tmp_path):
+    """A queued diagnosis created before the viewer baseline but finishing after
+    it is genuinely new: all three query paths must agree (terminal time)."""
+    client, store, _ = make_center(tmp_path)
+    queued = _seed_diagnosis(store, trigger=Trigger.alert, status="queued", result=None,
+                             name="queued", uid="u1")
+    _prime(store, VIEWER)  # baseline established AFTER creation
+    store.update(queued.diagnosis_id, status="completed", result=_result())
+
+    notes = client.get(f"/api/v1/diagnosis-center/notifications?viewer_id={VIEWER}").json()
+    assert notes["unread_diagnosis_count"] == 1
+    assert notes["unread_count"] == 1
+    assert [i["diagnosis_id"] for i in notes["items"]] == [queued.diagnosis_id]
+
+    sessions = client.get(
+        f"/api/v1/diagnosis-center/sessions?viewer_id={VIEWER}&unread=true").json()
+    assert [i["diagnosis_id"] for i in sessions["items"]] == [queued.diagnosis_id]
+
+    plain = client.get(f"/api/v1/diagnosis-center/sessions?viewer_id={VIEWER}").json()
+    assert {i["diagnosis_id"]: i["unread"] for i in plain["items"]}[queued.diagnosis_id] is True
+
+
+def test_unread_diagnoses_and_pending_alerts_are_independent(tmp_path):
+    """Pending (unresolved) alerts are not unread, are not in the notification
+    feed, and are unaffected by read receipts."""
+    client, store, _ = make_center(tmp_path)
+    _prime(store, VIEWER)
+    alert_ok = _seed_diagnosis(store, trigger=Trigger.alert, result=_result())
+    store.claim_active_alert_lifecycle(
+        fingerprint="fp-pending", state=ALERT_UNRESOLVED, alertname="Mystery")
+
+    notes = client.get(f"/api/v1/diagnosis-center/notifications?viewer_id={VIEWER}").json()
+    assert notes["unread_diagnosis_count"] == 1
+    assert notes["pending_alert_count"] == 1
+    # The feed only carries diagnoses now.
+    assert [i["kind"] for i in notes["items"]] == ["diagnosis"]
+
+    read = client.post("/api/v1/diagnosis-center/notifications/read-all",
+                       json={"viewer_id": VIEWER}).json()
+    assert read["read"] == 1
+
+    after = client.get(f"/api/v1/diagnosis-center/notifications?viewer_id={VIEWER}").json()
+    assert after["unread_diagnosis_count"] == 0
+    assert after["pending_alert_count"] == 1  # read receipts never touch pending alerts
+    pending, _ = store.list_unresolved_alerts(limit=10)
+    assert len(pending) == 1
+
+
+def test_unread_cursor_is_bound_to_the_viewer(tmp_path):
+    client, store, _ = make_center(tmp_path)
+    other = str(uuid.uuid4())
+    _prime(store, VIEWER, other)
+    _seed_diagnosis(store, trigger=Trigger.alert, result=_result(), name="a", uid="u1")
+    _seed_diagnosis(store, trigger=Trigger.alert, result=_result(), name="b", uid="u2")
+
+    page1 = client.get(
+        f"/api/v1/diagnosis-center/sessions?viewer_id={VIEWER}&unread=true&limit=1").json()
+    cursor = page1["next_cursor"]
+    assert cursor
+
+    # Same viewer: fine. Different viewer: rejected (their unread set differs).
+    assert client.get(
+        "/api/v1/diagnosis-center/sessions"
+        f"?viewer_id={VIEWER}&unread=true&limit=1&after={cursor}").status_code == 200
+    assert client.get(
+        "/api/v1/diagnosis-center/sessions"
+        f"?viewer_id={other}&unread=true&limit=1&after={cursor}").status_code == 422
+
+    # Non-unread cursors stay viewer-independent.
+    plain = client.get("/api/v1/diagnosis-center/sessions?limit=1").json()
+    plain_cursor = plain["next_cursor"]
+    assert client.get(
+        "/api/v1/diagnosis-center/sessions"
+        f"?viewer_id={VIEWER}&limit=1&after={plain_cursor}").status_code == 200

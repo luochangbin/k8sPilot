@@ -351,57 +351,89 @@ func TestBadAlertAnchorsAreRejectedWithoutQuerying(t *testing.T) {
 	}
 }
 
-func TestOutOfReachAlertWindowIsRejectedWithoutQuerying(t *testing.T) {
-	// Defect 1 regression: the anchor looks recent (29m) but the actual start
-	// (anchor - 30m = 59m back) leaves the lookback. Must degrade before any
-	// datasource call.
-	anchor := time.Now().UTC().Add(-29 * time.Minute).Truncate(time.Second)
+func TestAgedAlertWindowIsNarrowedToTheLookback(t *testing.T) {
+	// A 29m30s-old anchor with a requested 30m window narrows to the ~30s that
+	// fits the hard 30m lookback, and that narrowed interval is what the
+	// datasource actually receives (bounded by now-30m..anchor).
+	anchor := time.Now().UTC().Add(-29*time.Minute - 30*time.Second).Truncate(time.Second)
 	stamp := anchor.Format(time.RFC3339)
 
-	for _, tc := range []struct {
-		name string
-		call func(*Tools) (bool, string)
-	}{
-		{"metrics", func(tt *Tools) (bool, string) {
-			resp, err := tt.QueryMetrics(context.Background(),
-				Target{Kind: "Pod", Namespace: "ns", Name: "p"},
-				MetricsParams{Metric: "memory", RangeMinutes: 30, AlertTime: stamp, AlertExpected: true})
-			if err != nil {
-				t.Fatalf("metrics err: %v", err)
-			}
-			return resp.Available, resp.DegradedReason
-		}},
-		{"logs", func(tt *Tools) (bool, string) {
-			resp, err := tt.QueryLogs(context.Background(),
-				Target{Kind: "Pod", Namespace: "ns", Name: "p"},
-				LokiLogsParams{RangeMinutes: 30, AlertTime: stamp, AlertExpected: true})
-			if err != nil {
-				t.Fatalf("logs err: %v", err)
-			}
-			return resp.Available, resp.DegradedReason
-		}},
-	} {
-		promCap, lokiCap := &windowCapture{}, &windowCapture{}
-		promSrv := captureServer(t, matrixBody, promCap)
-		lokiSrv := captureServer(t, streamsBody, lokiCap)
-		tools := metricsTools(
-			&datasource.PrometheusClient{BaseURL: promSrv.URL, HTTP: promSrv.Client()},
-			&datasource.LokiClient{BaseURL: lokiSrv.URL, HTTP: lokiSrv.Client()})
+	promCap, lokiCap := &windowCapture{}, &windowCapture{}
+	promSrv := captureServer(t, matrixBody, promCap)
+	defer promSrv.Close()
+	lokiSrv := captureServer(t, streamsBody, lokiCap)
+	defer lokiSrv.Close()
+	tools := metricsTools(
+		&datasource.PrometheusClient{BaseURL: promSrv.URL, HTTP: promSrv.Client()},
+		&datasource.LokiClient{BaseURL: lokiSrv.URL, HTTP: lokiSrv.Client()})
 
-		available, reason := tc.call(tools)
-		promSrv.Close()
-		lokiSrv.Close()
+	mResp, err := tools.QueryMetrics(context.Background(),
+		Target{Kind: "Pod", Namespace: "ns", Name: "p"},
+		MetricsParams{Metric: "memory", RangeMinutes: 30, AlertTime: stamp, AlertExpected: true})
+	if err != nil {
+		t.Fatalf("metrics err: %v", err)
+	}
+	lResp, err := tools.QueryLogs(context.Background(),
+		Target{Kind: "Pod", Namespace: "ns", Name: "p"},
+		LokiLogsParams{RangeMinutes: 30, AlertTime: stamp, AlertExpected: true})
+	if err != nil {
+		t.Fatalf("logs err: %v", err)
+	}
+	if !mResp.Available || !lResp.Available {
+		t.Fatalf("narrowed windows must be queryable: %s / %s",
+			mResp.DegradedReason, lResp.DegradedReason)
+	}
+	promStart := mustUnix(t, promCap.startsNano[0])
+	promEnd := mustUnix(t, promCap.endsNano[0])
+	if promEnd != anchor.Unix() {
+		t.Fatalf("prometheus end = %d, want anchor %d", promEnd, anchor.Unix())
+	}
+	if span := promEnd - promStart; span <= 0 || span > int64(MaxRangeMinutes*60) {
+		t.Fatalf("prometheus span = %ds, want a positive window within 30m", span)
+	}
+	if mResp.WindowStart == "" || mResp.WindowSeconds != int(promEnd-promStart) {
+		t.Fatalf("reported window %ds does not match the queried span %ds",
+			mResp.WindowSeconds, promEnd-promStart)
+	}
+	if lResp.WindowSeconds != mResp.WindowSeconds {
+		t.Fatalf("metrics/logs window drift: %d vs %d", mResp.WindowSeconds, lResp.WindowSeconds)
+	}
+}
 
-		if available {
-			t.Fatalf("%s: out-of-reach window must not be available", tc.name)
-		}
-		if !strings.Contains(reason, "unverifiable") {
-			t.Fatalf("%s: expected unverifiable, got %q", tc.name, reason)
-		}
-		if promCap.calls != 0 || lokiCap.calls != 0 {
-			t.Fatalf("%s: expected zero datasource calls, prom=%d loki=%d",
-				tc.name, promCap.calls, lokiCap.calls)
-		}
+func TestAlertAnchorBeyondTheLookbackFailsClosed(t *testing.T) {
+	anchor := time.Now().UTC().Add(-31 * time.Minute).Truncate(time.Second)
+	stamp := anchor.Format(time.RFC3339)
+
+	promCap, lokiCap := &windowCapture{}, &windowCapture{}
+	promSrv := captureServer(t, matrixBody, promCap)
+	defer promSrv.Close()
+	lokiSrv := captureServer(t, streamsBody, lokiCap)
+	defer lokiSrv.Close()
+	tools := metricsTools(
+		&datasource.PrometheusClient{BaseURL: promSrv.URL, HTTP: promSrv.Client()},
+		&datasource.LokiClient{BaseURL: lokiSrv.URL, HTTP: lokiSrv.Client()})
+
+	mResp, err := tools.QueryMetrics(context.Background(),
+		Target{Kind: "Pod", Namespace: "ns", Name: "p"},
+		MetricsParams{Metric: "memory", RangeMinutes: 30, AlertTime: stamp, AlertExpected: true})
+	if err != nil {
+		t.Fatalf("metrics err: %v", err)
+	}
+	lResp, err := tools.QueryLogs(context.Background(),
+		Target{Kind: "Pod", Namespace: "ns", Name: "p"},
+		LokiLogsParams{RangeMinutes: 30, AlertTime: stamp, AlertExpected: true})
+	if err != nil {
+		t.Fatalf("logs err: %v", err)
+	}
+	if mResp.Available || lResp.Available {
+		t.Fatal("an anchor beyond the 30m lookback must not be available")
+	}
+	if !strings.Contains(mResp.DegradedReason, "unverifiable") ||
+		!strings.Contains(lResp.DegradedReason, "unverifiable") {
+		t.Fatalf("expected unverifiable: %q / %q", mResp.DegradedReason, lResp.DegradedReason)
+	}
+	if promCap.calls != 0 || lokiCap.calls != 0 {
+		t.Fatalf("expected zero datasource calls, prom=%d loki=%d", promCap.calls, lokiCap.calls)
 	}
 }
 

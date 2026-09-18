@@ -122,12 +122,157 @@ function deferred<T>() {
 beforeEach(() => {
   currentId = 'diag_A';
   vi.useFakeTimers();
+  // The poll cycle only runs in a visible tab; make that explicit for jsdom.
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true,
+    get: () => 'visible',
+  });
   vi.mocked(markRead).mockResolvedValue({ id: 'diag_A', read: true });
 });
 
 afterEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
+});
+
+function emptyTimeline() {
+  return { items: [], next_after: 0, has_more: false, available: 'available' as const, gap: false };
+}
+
+describe('DiagnosisDetail polling cycle', () => {
+  it('does not start a new poll cycle until status and timeline settle', async () => {
+    let hold = true;
+    const gates: Array<() => void> = [];
+    let statusCalls = 0;
+    let timelineCalls = 0;
+    vi.mocked(getDiagnosis).mockImplementation((async () => {
+      statusCalls += 1;
+      if (hold) await new Promise<void>(resolve => gates.push(resolve));
+      return runningDiagnosis();
+    }) as never);
+    vi.mocked(getTimeline).mockImplementation((async () => {
+      timelineCalls += 1;
+      if (hold) await new Promise<void>(resolve => gates.push(resolve));
+      return emptyTimeline();
+    }) as never);
+
+    render(<DiagnosisDetail />);
+    await waitFor(() => expect(statusCalls).toBe(1));
+    await waitFor(() => expect(timelineCalls).toBe(1));
+
+    // Poll cycle #1 fires, but its requests never settle (the timeline call is
+    // coalesced into the in-flight one, so only status is re-requested).
+    await vi.advanceTimersByTimeAsync(2000);
+    await waitFor(() => expect(statusCalls).toBe(2));
+    expect(timelineCalls).toBe(1);
+
+    // While cycle #1 is unsettled, further timer ticks must not stack cycle #2.
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(statusCalls).toBe(2);
+    expect(timelineCalls).toBe(1);
+
+    // Release: the next cycle is scheduled only once the current one settles.
+    hold = false;
+    gates.forEach(resolve => resolve());
+    await vi.advanceTimersByTimeAsync(2100);
+    await waitFor(() => expect(statusCalls).toBeGreaterThan(2));
+    expect(timelineCalls).toBeGreaterThan(1);
+  });
+
+  it('coalesces onto the in-flight timeline read and does not queue a rerun', async () => {
+    let held = true;
+    let releaseTimeline!: () => void;
+    let statusCalls = 0;
+    let timelineCalls = 0;
+    vi.mocked(getDiagnosis).mockImplementation((async () => {
+      statusCalls += 1;
+      return runningDiagnosis();
+    }) as never);
+    vi.mocked(getTimeline).mockImplementation((async () => {
+      timelineCalls += 1;
+      if (held) {
+        await new Promise<void>(resolve => {
+          releaseTimeline = resolve;
+        });
+      }
+      return emptyTimeline();
+    }) as never);
+
+    render(<DiagnosisDetail />);
+    await waitFor(() => expect(timelineCalls).toBe(1));
+    await waitFor(() => expect(statusCalls).toBeGreaterThan(0));
+
+    // Cycle #1 fires while the initial timeline read is still open: it must
+    // await that real promise (no new request, no resolved no-op).
+    await vi.advanceTimersByTimeAsync(2000);
+    const statusAfterCycle = statusCalls;
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(statusCalls).toBe(statusAfterCycle); // no stacked cycle
+    expect(timelineCalls).toBe(1); // coalesced: no redundant concurrent read
+
+    // Release the real read. The cycle then settles and the *next scheduled*
+    // poll fetches once — a queued rerun would add an extra, detached call.
+    held = false;
+    releaseTimeline();
+    await vi.advanceTimersByTimeAsync(2100);
+    await waitFor(() => expect(timelineCalls).toBe(2));
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(timelineCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  it('timeline failure increases the delay of the next cycle', async () => {
+    let timelineCalls = 0;
+    vi.mocked(getDiagnosis).mockResolvedValue(runningDiagnosis() as never);
+    vi.mocked(getTimeline).mockImplementation((async () => {
+      timelineCalls += 1;
+      if (timelineCalls === 2) throw new Error('timeline boom');
+      return emptyTimeline();
+    }) as never);
+
+    render(<DiagnosisDetail />);
+    await waitFor(() => expect(timelineCalls).toBe(1));
+
+    await vi.advanceTimersByTimeAsync(2000); // cycle #1: timeline read fails
+    await waitFor(() => expect(timelineCalls).toBe(2));
+
+    await vi.advanceTimersByTimeAsync(2100); // 2.1s after the failure: too early
+    expect(timelineCalls).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(2100); // now past the doubled 4s delay
+    await waitFor(() => expect(timelineCalls).toBe(3));
+  });
+
+  it('uses the current cycle backoff for the next schedule', async () => {
+    let statusCalls = 0;
+    vi.mocked(getDiagnosis).mockImplementation((async () => {
+      statusCalls += 1;
+      if (statusCalls === 2) throw new Error('boom');
+      return runningDiagnosis();
+    }) as never);
+    vi.mocked(getTimeline).mockResolvedValue(emptyTimeline() as never);
+
+    render(<DiagnosisDetail />);
+    await waitFor(() => expect(statusCalls).toBe(1));
+
+    await vi.advanceTimersByTimeAsync(2000); // cycle #1 fails -> delay 2s -> 4s
+    await waitFor(() => expect(statusCalls).toBe(2));
+    await vi.advanceTimersByTimeAsync(2100); // 2.1s since the failure: too early
+    expect(statusCalls).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(2100); // now past 4s
+    await waitFor(() => expect(statusCalls).toBe(3));
+  });
+
+  it('clears the poll timer on unmount', async () => {
+    vi.mocked(getDiagnosis).mockResolvedValue(runningDiagnosis() as never);
+    vi.mocked(getTimeline).mockResolvedValue(emptyTimeline() as never);
+    const { unmount } = render(<DiagnosisDetail />);
+    await waitFor(() => expect(vi.mocked(getDiagnosis).mock.calls.length).toBeGreaterThan(0));
+    const before = vi.mocked(getDiagnosis).mock.calls.length;
+    unmount();
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(vi.mocked(getDiagnosis).mock.calls.length).toBe(before);
+  });
 });
 
 describe('DiagnosisDetail lifecycle', () => {

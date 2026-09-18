@@ -33,8 +33,8 @@ func TestResolveWindowAlertAnchoredAndCapped(t *testing.T) {
 	if degraded != "" {
 		t.Fatalf("unexpected degrade: %q", degraded)
 	}
-	if w.Minutes != MaxRangeMinutes {
-		t.Fatalf("minutes = %d, want %d", w.Minutes, MaxRangeMinutes)
+	if w.Minutes != MaxRangeMinutes || w.Seconds != MaxRangeMinutes*60 {
+		t.Fatalf("window = %ds/%dm, want %dm", w.Seconds, w.Minutes, MaxRangeMinutes)
 	}
 	if !w.End.Equal(anchor) {
 		t.Fatalf("alert end = %v, want anchor %v", w.End, anchor)
@@ -100,60 +100,56 @@ func TestResolveWindowRejectsFutureAnchor(t *testing.T) {
 	}
 }
 
-func TestResolveWindowStartBeyondLookbackIsExplicitlyUnverifiable(t *testing.T) {
+func TestResolveWindowNarrowsToTheHardLookback(t *testing.T) {
 	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
 	if MaxAlertLookback != 30*time.Minute {
 		t.Fatalf("MaxAlertLookback = %v, want exactly 30m", MaxAlertLookback)
 	}
-	// A one-minute-old anchor with the default 30m window starts 31m back.
-	old := now.Add(-time.Minute).Format(time.RFC3339)
-	_, degraded := resolveWindow(old, 30, now, true)
-	if !strings.Contains(degraded, "unverifiable") {
-		t.Fatalf("expected unverifiable, got %q", degraded)
-	}
-	if strings.Contains(degraded, "invalid") {
-		t.Fatalf("a too-old window is not a parse error: %q", degraded)
-	}
-	// Right at the boundary (start == now - 30m) it is accepted.
-	edge := now.Format(time.RFC3339)
-	w, d := resolveWindow(edge, MaxRangeMinutes, now, true)
-	if d != "" {
-		t.Fatalf("boundary window must be accepted, got %q", d)
+
+	// A fresh anchor with the default 30m window: exactly the boundary.
+	w, d := resolveWindow(now.Format(time.RFC3339), 30, now, true)
+	if d != "" || w.Seconds != 1800 || w.Minutes != 30 {
+		t.Fatalf("boundary window = %+v (%q)", w, d)
 	}
 	if now.Sub(w.Start) != MaxAlertLookback {
-		t.Fatalf("expected start at the boundary, got %v", now.Sub(w.Start))
-	}
-}
-
-func TestResolveWindowChecksActualStartAgainstLookback(t *testing.T) {
-	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
-
-	// Defect regression: a 29m-old anchor with a 30m window reaches 59m back,
-	// far beyond MaxAlertLookback — it must be rejected even though the anchor
-	// itself looks "recent".
-	oldAnchor := now.Add(-29 * time.Minute)
-	if _, degraded := resolveWindow(oldAnchor.Format(time.RFC3339), 30, now, true); degraded == "" {
-		t.Fatal("expected rejection when the window start leaves the lookback")
-	} else if !strings.Contains(degraded, "unverifiable") {
-		t.Fatalf("expected unverifiable, got %q", degraded)
+		t.Fatalf("start must sit on the boundary, got %v back", now.Sub(w.Start))
 	}
 
-	// Strict policy: there is no dispatch grace, so even a 10s-old anchor with
-	// the default 30m window starts just past the 30m boundary and is rejected.
+	// A 10s dispatch delay keeps the window queryable (start clamped to now-30m).
 	lagged := now.Add(-10 * time.Second)
-	if _, d := resolveWindow(lagged.Format(time.RFC3339), 30, now, true); d == "" {
-		t.Fatal("expected rejection: 30m window + any lag leaves the 30m lookback")
+	w, d = resolveWindow(lagged.Format(time.RFC3339), 30, now, true)
+	if d != "" {
+		t.Fatalf("a 10s-old anchor must stay queryable, got %q", d)
 	}
-	// A boundary window (start == now-30m) passes.
-	if w, d := resolveWindow(now.Format(time.RFC3339), 30, now, true); d != "" {
-		t.Fatalf("boundary window must be valid, got %q", d)
-	} else if w.End.Sub(w.Start) != 30*time.Minute {
-		t.Fatalf("unexpected span %v", w.End.Sub(w.Start))
+	if w.Seconds != 1790 || w.Minutes != 29 {
+		t.Fatalf("effective window = %ds/%dm, want 1790s/29m", w.Seconds, w.Minutes)
 	}
-	// An older anchor with a correspondingly smaller window also passes.
-	older := now.Add(-29 * time.Minute)
-	if _, d := resolveWindow(older.Format(time.RFC3339), 1, now, true); d != "" {
-		t.Fatalf("older anchor with a 1m window must be valid, got %q", d)
+	if now.Sub(w.Start) != MaxAlertLookback || !w.End.Equal(lagged) {
+		t.Fatalf("unexpected bounds: [%v,%v]", w.Start, w.End)
+	}
+
+	// A 29m-old anchor narrows to a 1m window instead of being rejected.
+	aged := now.Add(-29 * time.Minute)
+	if w, d := resolveWindow(aged.Format(time.RFC3339), 30, now, true); d != "" {
+		t.Fatalf("29m-old anchor must narrow, not fail: %q", d)
+	} else if w.Seconds != 60 || w.Minutes != 1 || now.Sub(w.Start) != MaxAlertLookback {
+		t.Fatalf("expected a 1m narrowed window on the boundary, got %+v", w)
+	}
+
+	// Sub-minute remainder stays usable and is reported exactly.
+	almost := now.Add(-29*time.Minute - 30*time.Second)
+	if w, d := resolveWindow(almost.Format(time.RFC3339), 30, now, true); d != "" {
+		t.Fatalf("30s remainder must stay queryable, got %q", d)
+	} else if w.Seconds != 30 || w.Minutes != 0 || now.Sub(w.Start) != MaxAlertLookback {
+		t.Fatalf("expected a 30s window, got %+v", w)
+	}
+
+	// No usable interval remains -> fail closed.
+	for _, age := range []time.Duration{MaxAlertLookback, 31 * time.Minute} {
+		stamp := now.Add(-age).Format(time.RFC3339)
+		if _, d := resolveWindow(stamp, 30, now, true); !strings.Contains(d, "unverifiable") {
+			t.Fatalf("age %v must fail closed, got %q", age, d)
+		}
 	}
 }
 

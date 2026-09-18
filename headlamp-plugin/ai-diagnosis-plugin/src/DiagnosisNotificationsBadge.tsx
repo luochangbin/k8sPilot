@@ -9,13 +9,17 @@ import { centerUrl } from './routes';
 import { useDiagnosisNotifications } from './useDiagnosisNotifications';
 
 export default function DiagnosisNotificationsBadge() {
-  const { unreadCount, liveMessage, ready } = useDiagnosisNotifications();
+  const { unreadCount, pendingAlertCount, liveMessage, ready } = useDiagnosisNotifications();
   // The center route is cluster-scoped: on the home page (no cluster selected)
   // navigating would 404, so the action is disabled until a cluster is chosen.
   const cluster = Utils.getCluster();
   // Unread is a filter, not a separate page: the badge lands on the unread view
-  // so the user can find the fresh items directly.
+  // so the user can find the fresh items directly. Only unread *diagnoses* are
+  // badged; unresolved alerts are pending work, shown separately.
   const href = centerUrl(unreadCount > 0 ? 'unread=true' : undefined);
+  const title = cluster
+    ? `智能诊断中心（未读诊断 ${unreadCount}，待处理告警 ${pendingAlertCount}）`
+    : '请先选择集群';
   const badge = (
     <Badge color="error" badgeContent={unreadCount || undefined} max={99}>
       <Icon icon="mdi:stethoscope" />
@@ -23,7 +27,7 @@ export default function DiagnosisNotificationsBadge() {
   );
   return (
     <Box sx={{ display: 'flex', alignItems: 'center' }}>
-      <Tooltip title={cluster ? '智能诊断中心' : '请先选择集群'}>
+      <Tooltip title={title}>
         <span>
           {cluster ? (
             <IconButton

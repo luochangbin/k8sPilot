@@ -18,14 +18,16 @@ import (
 //
 //	The alert anchor is the Alertmanager starts_at injected by the Agent from the
 //	trusted alert context (never from the model). It must be an RFC3339
-//	timestamp with an explicit offset, must not be in the future, and the whole
-//	requested window must fit inside the connector's reach:
+//	timestamp with an explicit offset, must not be in the future, and the
+//	effective window is narrowed to the part that fits the connector's reach:
 //
-//		start >= now - MaxAlertLookback          (MaxAlertLookback == 30m)
+//		effective_start = max(anchor - requested_span, now - MaxAlertLookback)
+//		effective_end   = anchor
 //
-//	The check is on the *actual start* (anchor - W), not just the anchor age:
-//	an anchor 29m old with a 30m window reaches 59m back and is rejected; a fresh
-//	anchor with the default 30m window sits exactly on the boundary and passes.
+//	MaxAlertLookback (30m) is never exceeded and never extended. A 10s dispatch
+//	delay therefore still yields a queryable window (~29m), an anchor 29m old
+//	yields a 1m window, and an anchor at/beyond the 30m boundary (or an empty
+//	interval) fails closed.
 const (
 	// DefaultRangeMinutes is the existing default window length.
 	DefaultRangeMinutes = 30
@@ -33,12 +35,11 @@ const (
 	// (doing so would widen what the connector is allowed to query).
 	MaxRangeMinutes = 30
 	// MaxAlertLookback bounds how far in the past the *query start* may be.
-	// There is no extra grace for dispatch lag: the whole requested window must
-	// fit inside this bound. The connector cannot read Prometheus/Loki retention,
-	// so we deliberately reuse the existing 30-minute window cap instead of
-	// inventing a retention number; anything older is reported as explicitly
-	// unverifiable, never silently clamped to "now" and never queried as an
-	// unbounded range.
+	// It is a hard bound: the effective window is narrowed to fit it, never
+	// extended. The connector cannot read Prometheus/Loki retention, so we
+	// deliberately reuse the existing 30-minute window cap instead of inventing
+	// a retention number; anything older is reported as explicitly unverifiable,
+	// never silently clamped to "now" and never queried as an unbounded range.
 	MaxAlertLookback = 30 * time.Minute
 	// maxClockSkew tolerates small clock differences between Alertmanager and
 	// the connector when rejecting "future" anchors.
@@ -47,9 +48,14 @@ const (
 
 // TimeWindow is a resolved, bounded query range.
 type TimeWindow struct {
-	Start   time.Time
-	End     time.Time
+	Start time.Time
+	End   time.Time
+	// Minutes is the effective window length floored to whole minutes (kept for
+	// the legacy `range_minutes` field); Seconds is the exact length. When the
+	// alert anchor is close to the 30m boundary the effective window can be
+	// shorter than a minute (Minutes == 0) while still being queryable.
 	Minutes int
+	Seconds int
 	// Anchor is the alert timestamp (RFC3339) when the window is alert-anchored.
 	Anchor string
 }
@@ -72,7 +78,10 @@ func resolveWindow(alertTime string, rangeMinutes int, now time.Time,
 	}
 	span := time.Duration(minutes) * time.Minute
 
-	now = now.UTC()
+	// Second granularity: both data sources are queried with second-level
+	// instants (Prometheus seconds, Loki nanoseconds of the same instant), so the
+	// reported window_seconds matches the queried bounds exactly.
+	now = now.UTC().Truncate(time.Second)
 	if alertTime == "" {
 		if alertExpected {
 			// Alert run without a usable starts_at: fail closed. Falling back to
@@ -81,7 +90,8 @@ func resolveWindow(alertTime string, rangeMinutes int, now time.Time,
 				"(the alert context must carry a timestamp); refusing to query a now-relative window"
 		}
 		// Manual diagnosis: unchanged now-relative semantics.
-		return TimeWindow{Start: now.Add(-span), End: now, Minutes: minutes}, ""
+		return TimeWindow{Start: now.Add(-span), End: now, Minutes: minutes,
+			Seconds: int(span / time.Second)}, ""
 	}
 
 	anchor, err := time.Parse(time.RFC3339, alertTime)
@@ -89,17 +99,27 @@ func resolveWindow(alertTime string, rangeMinutes int, now time.Time,
 		return TimeWindow{}, fmt.Sprintf(
 			"invalid alert_time %q: expected an RFC3339 timestamp with a timezone offset", alertTime)
 	}
-	anchor = anchor.UTC()
+	anchor = anchor.UTC().Truncate(time.Second)
 	if anchor.After(now.Add(maxClockSkew)) {
 		return TimeWindow{}, fmt.Sprintf(
 			"invalid alert_time %q: timestamp is in the future", alertTime)
 	}
+	// Clamp the window start to the hard bound instead of extending it:
+	//   start = max(anchor - requested_span, now - MaxAlertLookback)
+	// The boundary is exact (no rounding), so the lookback is never exceeded.
+	boundary := now.Add(-MaxAlertLookback)
 	start := anchor.Add(-span)
-	if now.Sub(start) > MaxAlertLookback {
-		return TimeWindow{}, fmt.Sprintf(
-			"unverifiable alert window: start %s is %s before now, outside the connector's "+
-				"%s maximum lookback (no data-source retention is configured on the connector)",
-			start.Format(time.RFC3339), now.Sub(start).Round(time.Second), MaxAlertLookback)
+	if start.Before(boundary) {
+		start = boundary
 	}
-	return TimeWindow{Start: start, End: anchor, Minutes: minutes, Anchor: alertTime}, ""
+	effective := anchor.Sub(start)
+	if effective <= 0 {
+		return TimeWindow{}, fmt.Sprintf(
+			"unverifiable alert window: starts_at %s leaves no usable interval inside the "+
+				"connector's %s maximum lookback (no data-source retention is configured on the connector)",
+			anchor.Format(time.RFC3339), MaxAlertLookback)
+	}
+	return TimeWindow{Start: start, End: anchor,
+		Minutes: int(effective / time.Minute), Seconds: int(effective / time.Second),
+		Anchor: alertTime}, ""
 }

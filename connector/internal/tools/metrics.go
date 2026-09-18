@@ -35,6 +35,7 @@ type MetricsResponse struct {
 	Metric         string                  `json:"metric"`
 	RangeMinutes   int                     `json:"range_minutes"`
 	WindowStart    string                  `json:"window_start,omitempty"`
+	WindowSeconds  int                     `json:"window_seconds"`
 	WindowEnd      string                  `json:"window_end,omitempty"`
 	WindowAnchor   string                  `json:"window_anchor,omitempty"`
 	Summary        map[string]any          `json:"summary"`
@@ -70,6 +71,7 @@ func (t *Tools) QueryMetrics(ctx context.Context, target Target, params MetricsP
 		return resp, nil
 	}
 	resp.RangeMinutes = window.Minutes
+	resp.WindowSeconds = window.Seconds
 	resp.WindowStart = window.Start.Format(time.RFC3339)
 	resp.WindowEnd = window.End.Format(time.RFC3339)
 	resp.WindowAnchor = window.Anchor
@@ -90,7 +92,7 @@ func (t *Tools) QueryMetrics(ctx context.Context, target Target, params MetricsP
 	}
 
 	start, end := window.Start, window.End
-	step := time.Duration(window.Minutes) * time.Minute / 60
+	step := end.Sub(start) / 60
 	if step < 15*time.Second {
 		step = 15 * time.Second
 	}

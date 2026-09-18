@@ -332,10 +332,15 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
             raise HTTPException(status_code=422, detail="unread=true requires viewer_id")
         filters = _parse_center_filters(limit, status, trigger, resource_kind, namespace,
                                         name, uid, since, until)
-        # `unread` changes both the row set and the sort key, so it must be part
-        # of the cursor fingerprint: a cursor from the unread view must never be
-        # accepted by the default list (or vice versa).
-        fingerprint = filter_fingerprint({**filters, "unread": unread})
+        # `unread` changes both the row set (per-viewer receipts) and the sort
+        # key, so the fingerprint covers it. When unread=true it also covers the
+        # viewer identity: a cursor minted for one viewer must not be reusable by
+        # another (their unread sets differ). Non-unread cursors stay
+        # viewer-independent.
+        fingerprint = filter_fingerprint({
+            **filters, "unread": unread,
+            "viewer_id": viewer_id if unread else None,
+        })
         after_keys = None
         if after:
             try:
@@ -379,12 +384,17 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
             viewer_id=viewer_id, limit=limit, after=after_keys)
         next_cursor = (encode_cursor(fingerprint, ca=next_keys[0], id=next_keys[1])
                        if next_keys else None)
+        unread_diagnoses = store.count_unread_diagnoses(viewer_id)
         return {
-            "unread_count": store.count_unread_notifications(viewer_id),
+            # `unread_count` is kept for compatibility and is now explicitly the
+            # unread *diagnosis* count; pending alerts are reported separately.
+            "unread_count": unread_diagnoses,
+            "unread_diagnosis_count": unread_diagnoses,
+            "pending_alert_count": store.count_pending_alerts(),
             "items": [{
                 "kind": r["kind"],
                 "id": r["ref"],
-                "diagnosis_id": r["ref"] if r["kind"] == "diagnosis" else None,
+                "diagnosis_id": r["ref"],
                 "status": r["status"],
                 "unread": True,
             } for r in rows],

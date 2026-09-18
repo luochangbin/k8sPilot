@@ -53,7 +53,7 @@ export default function DiagnosisDetail() {
   const offsetRef = useRef(0);
   const seenIdsRef = useRef<Set<string>>(new Set());
   const timelineInFlightRef = useRef(false);
-  const timelineRerunRef = useRef(false);
+  const timelineInFlightPromiseRef = useRef<Promise<void> | null>(null);
   const finalEventSeenRef = useRef(false);
   const terminalDeadlineRef = useRef<number | null>(null);
   const statusRef = useRef<string | undefined>(undefined);
@@ -61,6 +61,13 @@ export default function DiagnosisDetail() {
   const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const readAttemptedRef = useRef(false);
   const delayRef = useRef(STATUS_POLL_MS);
+  // Set by refreshStatus/refreshTimeline when a request in the current polling
+  // cycle fails. They swallow their own errors, so allSettled alone cannot tell
+  // a failed cycle from a successful one.
+  const cycleFailedRef = useRef(false);
+  // A polling cycle is exclusive: a tick that fires while another cycle is still
+  // awaiting its requests defers instead of starting a second cycle.
+  const cycleInFlightRef = useRef(false);
   const refreshTimelineRef = useRef<() => void>(() => {});
 
   const refreshStatus = useCallback(async () => {
@@ -82,6 +89,7 @@ export default function DiagnosisDetail() {
       }
     } catch (err) {
       if (run !== runRef.current) return;
+      cycleFailedRef.current = true;
       delayRef.current = Math.min(delayRef.current * 2, MAX_BACKOFF_MS);
       setError((err as Error).message);
     }
@@ -102,11 +110,23 @@ export default function DiagnosisDetail() {
 
   const refreshTimeline = useCallback(async () => {
     const run = runRef.current;
-    // Serialize timeline reads: concurrent triggers coalesce into one rerun.
-    if (timelineInFlightRef.current) {
-      timelineRerunRef.current = true;
+    // Serialize timeline reads. Concurrent callers coalesce onto the *same*
+    // real in-flight promise: they must await it so a polling cycle cannot
+    // settle while the read is outstanding. No rerun is queued — the next
+    // scheduled poll fetches anything appended since, so a queued rerun can
+    // never outlive the cycle that triggered it.
+    const pendingRead = timelineInFlightRef.current
+      ? timelineInFlightPromiseRef.current
+      : null;
+    if (pendingRead) {
+      await pendingRead;
       return;
     }
+    let release!: () => void;
+    const inFlight = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    timelineInFlightPromiseRef.current = inFlight;
     timelineInFlightRef.current = true;
     try {
       for (let pages = 0; pages < MAX_PAGES_PER_DRAIN; pages += 1) {
@@ -138,15 +158,20 @@ export default function DiagnosisDetail() {
       }
     } catch (err) {
       if (run !== runRef.current) return;
+      // A timeline failure slows this polling cycle's backoff, so the next
+      // scheduled cycle already uses the increased delay.
+      cycleFailedRef.current = true;
+      delayRef.current = Math.min(delayRef.current * 2, MAX_BACKOFF_MS);
       setError((err as Error).message);
       setTimelineState('unavailable');
     } finally {
       timelineInFlightRef.current = false;
-      if (timelineRerunRef.current) {
-        timelineRerunRef.current = false;
-        if (run === runRef.current) refreshTimelineRef.current();
-      }
+      timelineInFlightPromiseRef.current = null;
+      // Release coalesced waiters only after the real read completed; nothing is
+      // queued behind this promise.
+      release();
     }
+    await inFlight;
   }, [diagnosisId, schedulePendingRetry]);
 
   useEffect(() => {
@@ -161,7 +186,6 @@ export default function DiagnosisDetail() {
     offsetRef.current = 0;
     seenIdsRef.current = new Set();
     timelineInFlightRef.current = false;
-    timelineRerunRef.current = false;
     finalEventSeenRef.current = false;
     terminalDeadlineRef.current = null;
     statusRef.current = undefined;
@@ -200,30 +224,53 @@ export default function DiagnosisDetail() {
     const schedule = () => {
       if (stopped) return;
       if (timer) clearTimeout(timer);
-      timer = setTimeout(tick, Math.min(delayRef.current, MAX_BACKOFF_MS));
+      timer = setTimeout(() => {
+        void tick();
+      }, Math.min(delayRef.current, MAX_BACKOFF_MS));
     };
-    const tick = () => {
+    const tick = async () => {
+      if (stopped) return;
+      if (cycleInFlightRef.current) {
+        // Another cycle is still awaiting its requests: never start a second.
+        schedule();
+        return;
+      }
       if (document.visibilityState !== 'visible') {
         schedule();
         return;
       }
-      const status = statusRef.current ?? diagnosis?.status;
-      if (!isTerminal(status)) {
-        void refreshStatus();
-        void refreshTimeline();
-        schedule();
-        return;
-      }
-      const waitingForFinal =
-        !finalEventSeenRef.current &&
-        terminalDeadlineRef.current !== null &&
-        Date.now() < terminalDeadlineRef.current;
-      if (waitingForFinal) {
-        void refreshTimeline();
-      } else if (!finalEventSeenRef.current && terminalDeadlineRef.current !== null) {
-        // Bounded wait expired without the completion event: keep what we have
-        // and tell the user the timeline may be incomplete.
-        setTimelineIncomplete(true);
+      cycleInFlightRef.current = true;
+      try {
+        const status = statusRef.current ?? diagnosis?.status;
+        if (!isTerminal(status)) {
+          // Await BOTH refreshes before scheduling the next cycle: a slow request
+          // must not overlap with the next poll. The cycle's outcome (not the
+          // individual request order) decides the next delay, so a timeline
+          // failure cannot be masked by a successful status call.
+          const baseDelay = delayRef.current;
+          cycleFailedRef.current = false;
+          await Promise.allSettled([refreshStatus(), refreshTimeline()]);
+          if (cycleFailedRef.current) {
+            // Any failure in the cycle (status or timeline) backs off the next one.
+            delayRef.current = Math.min(baseDelay * 2, MAX_BACKOFF_MS);
+          } else {
+            delayRef.current = STATUS_POLL_MS;
+          }
+        } else {
+          const waitingForFinal =
+            !finalEventSeenRef.current &&
+            terminalDeadlineRef.current !== null &&
+            Date.now() < terminalDeadlineRef.current;
+          if (waitingForFinal) {
+            await refreshTimeline();
+          } else if (!finalEventSeenRef.current && terminalDeadlineRef.current !== null) {
+            // Bounded wait expired without the completion event: keep what we have
+            // and tell the user the timeline may be incomplete.
+            setTimelineIncomplete(true);
+          }
+        }
+      } finally {
+        cycleInFlightRef.current = false;
       }
       schedule();
     };

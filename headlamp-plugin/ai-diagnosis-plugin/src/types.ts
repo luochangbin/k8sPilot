@@ -109,7 +109,11 @@ export interface NotificationItem {
 }
 
 export interface NotificationsPage {
+  /** Unread *diagnoses* (compatibility alias of unread_diagnosis_count). */
   unread_count: number;
+  unread_diagnosis_count: number;
+  /** Unresolved alerts: pending work, deliberately NOT part of the unread feed. */
+  pending_alert_count: number;
   items: NotificationItem[];
   next_cursor: string | null;
 }

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -254,7 +255,55 @@ func TestQueryMetricsHandlerRejectsAlertRunWithoutAnchor(t *testing.T) {
 	}
 }
 
-func TestQueryMetricsHandlerRejectsOutOfReachAlertWindow(t *testing.T) {
+func TestQueryMetricsHandlerNarrowsAgedAlertWindow(t *testing.T) {
+	var starts, ends []string
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		starts = append(starts, r.URL.Query().Get("start"))
+		ends = append(ends, r.URL.Query().Get("end"))
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[
+			{"metric":{"namespace":"ns","pod":"p"},"values":[[1700000000,"1.0"]]}]}}`))
+	}))
+	defer prom.Close()
+	s := testServerWithDataSources(prom.URL, "")
+	defer s.Close()
+
+	// 25m-old anchor with the requested 30m window: narrowed to ~5m, still queried.
+	anchor := time.Now().UTC().Add(-25 * time.Minute).Truncate(time.Second)
+	resp := do(t, s, "POST", "/tools/query_metrics", map[string]any{
+		"target":         map[string]any{"kind": "Pod", "namespace": "ns", "name": "p"},
+		"metric":         "memory",
+		"range_minutes":  30,
+		"alert_time":     anchor.Format(time.RFC3339),
+		"alert_expected": true,
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var out struct {
+		Available    bool `json:"available"`
+		RangeMinutes int  `json:"range_minutes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Available || out.RangeMinutes < 1 || out.RangeMinutes > tools.MaxRangeMinutes {
+		t.Fatalf("expected a narrowed, positive window, got %+v", out)
+	}
+	if len(starts) != 1 || len(ends) != 1 {
+		t.Fatalf("expected one prometheus call, got start=%v end=%v", starts, ends)
+	}
+	end, _ := strconv.ParseInt(ends[0], 10, 64)
+	start, _ := strconv.ParseInt(starts[0], 10, 64)
+	if end != anchor.Unix() {
+		t.Fatalf("prometheus end = %d, want anchor %d", end, anchor.Unix())
+	}
+	if span := end - start; span <= 0 || span > int64(tools.MaxRangeMinutes*60) {
+		t.Fatalf("prometheus span = %ds, want a positive window within 30m", span)
+	}
+}
+
+func TestQueryMetricsHandlerRejectsBeyondLookbackAnchor(t *testing.T) {
 	calls := 0
 	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -265,8 +314,7 @@ func TestQueryMetricsHandlerRejectsOutOfReachAlertWindow(t *testing.T) {
 	s := testServerWithDataSources(prom.URL, "")
 	defer s.Close()
 
-	// A 29m-old anchor with the 30m default window reaches 59m back.
-	anchor := time.Now().UTC().Add(-29 * time.Minute).Truncate(time.Second)
+	anchor := time.Now().UTC().Add(-31 * time.Minute).Truncate(time.Second)
 	resp := do(t, s, "POST", "/tools/query_metrics", map[string]any{
 		"target":         map[string]any{"kind": "Pod", "namespace": "ns", "name": "p"},
 		"metric":         "memory",
@@ -284,8 +332,8 @@ func TestQueryMetricsHandlerRejectsOutOfReachAlertWindow(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if out.Available || out.DegradedReason == "" {
-		t.Fatalf("expected explicit degradation, got %+v", out)
+	if out.Available || !strings.Contains(out.DegradedReason, "unverifiable") {
+		t.Fatalf("expected unverifiable, got %+v", out)
 	}
 	if calls != 0 {
 		t.Fatalf("must not query prometheus, calls=%d", calls)
@@ -327,4 +375,86 @@ func TestQueryMetricsHandlerAcceptsInRangeAlertWindow(t *testing.T) {
 	if len(ends) != 1 || ends[0] != strconv.FormatInt(anchor.Unix(), 10) {
 		t.Fatalf("unexpected prometheus end: %v (anchor %d)", ends, anchor.Unix())
 	}
+}
+
+func assertSnakeCaseWindowSeconds(t *testing.T, body map[string]any) {
+	t.Helper()
+	raw, ok := body["window_seconds"]
+	if !ok {
+		t.Fatalf("response is missing window_seconds: %v", body)
+	}
+	if _, camel := body["WindowSeconds"]; camel {
+		t.Fatalf("response must not emit Go-style WindowSeconds: %v", body)
+	}
+	seconds, ok := raw.(float64)
+	if !ok {
+		t.Fatalf("window_seconds is not a number: %T", raw)
+	}
+	start, err := time.Parse(time.RFC3339, body["window_start"].(string))
+	if err != nil {
+		t.Fatalf("bad window_start: %v", err)
+	}
+	end, err := time.Parse(time.RFC3339, body["window_end"].(string))
+	if err != nil {
+		t.Fatalf("bad window_end: %v", err)
+	}
+	// The reported value is the actual effective interval.
+	if int(seconds) != int(end.Sub(start)/time.Second) || int(seconds) <= 0 {
+		t.Fatalf("window_seconds=%v does not match [%v,%v]", seconds, start, end)
+	}
+}
+
+func TestQueryMetricsResponseSerializesSnakeCaseWindowSeconds(t *testing.T) {
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[
+			{"metric":{"namespace":"ns","pod":"p"},"values":[[1700000000,"1.0"]]}]}}`))
+	}))
+	defer prom.Close()
+	s := testServerWithDataSources(prom.URL, "")
+	defer s.Close()
+
+	anchor := time.Now().UTC().Add(-10 * time.Second).Truncate(time.Second)
+	resp := do(t, s, "POST", "/tools/query_metrics", map[string]any{
+		"target":         map[string]any{"kind": "Pod", "namespace": "ns", "name": "p"},
+		"metric":         "memory",
+		"range_minutes":  30,
+		"alert_time":     anchor.Format(time.RFC3339),
+		"alert_expected": true,
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	assertSnakeCaseWindowSeconds(t, body)
+}
+
+func TestQueryLogsResponseSerializesSnakeCaseWindowSeconds(t *testing.T) {
+	loki := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"streams","result":[
+			{"stream":{"namespace":"ns","pod":"p"},"values":[["1700000000000000001","line"]]}]}}`))
+	}))
+	defer loki.Close()
+	s := testServerWithDataSources("", loki.URL)
+	defer s.Close()
+
+	anchor := time.Now().UTC().Add(-10 * time.Second).Truncate(time.Second)
+	resp := do(t, s, "POST", "/tools/query_logs", map[string]any{
+		"target":         map[string]any{"kind": "Pod", "namespace": "ns", "name": "p"},
+		"range_minutes":  30,
+		"alert_time":     anchor.Format(time.RFC3339),
+		"alert_expected": true,
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	assertSnakeCaseWindowSeconds(t, body)
 }

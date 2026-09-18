@@ -23,9 +23,10 @@ vi.mock('./useDiagnosisNotifications', () => ({
 import DiagnosisNotificationsBadge from './DiagnosisNotificationsBadge';
 import { useDiagnosisNotifications } from './useDiagnosisNotifications';
 
-function mockNotifications(unreadCount: number, liveMessage: string) {
+function mockNotifications(unreadCount: number, liveMessage: string, pendingAlertCount = 0) {
   vi.mocked(useDiagnosisNotifications).mockReturnValue({
     unreadCount,
+    pendingAlertCount,
     liveMessage,
     ready: true,
     error: null,
@@ -52,7 +53,7 @@ describe('DiagnosisNotificationsBadge', () => {
   });
 
   it('stays navigable with zero unread', () => {
-    mockNotifications(0, '没有未读的自动诊断或未解析告警');
+    mockNotifications(0, '没有未读诊断或待处理告警', 2);
     render(<DiagnosisNotificationsBadge />);
 
     const link = screen.getByTestId('diagnosis-center-link');

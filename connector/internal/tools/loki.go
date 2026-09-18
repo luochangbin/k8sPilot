@@ -31,6 +31,7 @@ type LokiLogsResponse struct {
 	DegradedReason string         `json:"degraded_reason,omitempty"`
 	RangeMinutes   int            `json:"range_minutes"`
 	WindowStart    string         `json:"window_start,omitempty"`
+	WindowSeconds  int            `json:"window_seconds"`
 	WindowEnd      string         `json:"window_end,omitempty"`
 	WindowAnchor   string         `json:"window_anchor,omitempty"`
 	Summary        map[string]any `json:"summary"`
@@ -73,6 +74,7 @@ func (t *Tools) QueryLogs(ctx context.Context, target Target, params LokiLogsPar
 		return resp, nil
 	}
 	resp.RangeMinutes = window.Minutes
+	resp.WindowSeconds = window.Seconds
 	resp.WindowStart = window.Start.Format(time.RFC3339)
 	resp.WindowEnd = window.End.Format(time.RFC3339)
 	resp.WindowAnchor = window.Anchor

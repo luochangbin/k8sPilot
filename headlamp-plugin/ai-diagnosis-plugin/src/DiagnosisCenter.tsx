@@ -345,7 +345,7 @@ export default function DiagnosisCenter() {
 
   const headerActions = [
     <Stack key="unread-actions" direction="row" spacing={1} alignItems="center">
-      <Tooltip title="只显示尚未读过的自动诊断；已读/人工/评测诊断会被隐藏。">
+      <Tooltip title="只显示尚未读过的自动诊断；已读/人工/评测诊断会被隐藏。待处理告警在下方独立区块。">
         <Chip
           size="small"
           color={filters.unread ? 'primary' : 'default'}
@@ -355,8 +355,14 @@ export default function DiagnosisCenter() {
         />
       </Tooltip>
       <Typography variant="body2" color="text.secondary">
-        {`未读 ${notifications.unreadCount} 条`}
+        {`未读诊断 ${notifications.unreadCount} 条`}
       </Typography>
+      <Chip
+        size="small"
+        variant="outlined"
+        color={notifications.pendingAlertCount > 0 ? 'warning' : 'default'}
+        label={`待处理告警 ${notifications.pendingAlertCount} 条`}
+      />
       <Tooltip
         title="作用于当前浏览器、当前 Agent 的全部未读自动诊断（包含当前筛选与分页之外）；处理期间新完成的诊断保持未读。"
         slotProps={{ tooltip: { sx: { maxWidth: 360, whiteSpace: 'normal' } } }}

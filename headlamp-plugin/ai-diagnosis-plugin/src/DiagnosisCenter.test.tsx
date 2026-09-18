@@ -69,11 +69,12 @@ import { setTablesRowsPerPage } from './tablesRowsPerPage';
 import type { SessionFilters } from './types';
 import { useDiagnosisNotifications } from './useDiagnosisNotifications';
 
-function mockNotifications(unreadCount: number) {
+function mockNotifications(unreadCount: number, pendingAlertCount = 0) {
   const refresh = vi.fn();
   vi.mocked(useDiagnosisNotifications).mockReturnValue({
     unreadCount,
-    liveMessage: `${unreadCount} 个新的自动诊断`,
+    pendingAlertCount,
+    liveMessage: `${unreadCount} 条未读诊断`,
     ready: true,
     error: null,
     items: [],
@@ -114,7 +115,7 @@ describe('DiagnosisCenter', () => {
 
     render(<DiagnosisCenter />);
     await waitFor(() => expect(listSessions).toHaveBeenCalled());
-    expect(screen.getByText(/未读 5 条/)).toBeTruthy();
+    expect(screen.getByText(/未读诊断 5 条/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: '全部标为已读' }));
     await waitFor(() => expect(markAllNotificationsRead).toHaveBeenCalledWith('viewer-1'));
@@ -125,12 +126,14 @@ describe('DiagnosisCenter', () => {
     expect(screen.queryByText(/标记失败/)).toBeNull();
   });
 
-  it('disables the button when there is nothing unread', async () => {
-    mockNotifications(0);
+  it('disables the button when there are no unread diagnoses, even with pending alerts', async () => {
+    mockNotifications(0, 3);
     render(<DiagnosisCenter />);
     await waitFor(() => expect(listSessions).toHaveBeenCalled());
     const button = screen.getByRole('button', { name: '全部标为已读' }) as HTMLButtonElement;
     expect(button.disabled).toBe(true);
+    // Pending alerts are surfaced separately from the unread diagnosis count.
+    expect(screen.getByText('待处理告警 3 条')).toBeTruthy();
   });
 
   it('keeps state and shows a retry hint when marking fails', async () => {

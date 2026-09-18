@@ -28,11 +28,11 @@ GET  /api/v1/diagnoses/{id}                               (旧接口，仅增 nu
 
 - `limit` 1..100（timeline 1..200）；非法枚举/时间/游标/UUID → **422**；未知诊断 → **404**；未终态标记已读 → **409**；已读幂等 → **200**。
 - `viewer_id` 必须是**规范 UUIDv4**（canonical 文本且 version=4，否则 422）；`unread=true` 必须携带 `viewer_id`（否则 422）。
-- 会话游标为 keyset 且**绑定过滤集**（改过滤条件复用旧游标 → 422）：默认 `(created_at, diagnosis_id) DESC`；`unread=true` 时按 **`(updated_at, diagnosis_id) DESC`**，避免“创建早、完成晚”的诊断被埋在后来已读的记录之后。
-- `unread`：无 `viewer_id` 时为 `null`；有则按该 viewer 计算——`trigger=alert`、终态 `completed|failed`、`eval_run_id IS NULL`、无该 viewer receipt，且 `created_at > 该 viewer 的 first_seen 基线`。
+- 会话游标为 keyset 且**绑定过滤集**（改过滤条件复用旧游标 → 422）：默认 `(created_at, diagnosis_id) DESC`；`unread=true` 时按 **`(updated_at, diagnosis_id) DESC`**，避免“创建早、完成晚”的诊断被埋在后来已读的记录之后。`unread=true` 的游标**额外绑定 `viewer_id`**：A 的未读游标被 B 复用 → **422**（未读集合按 viewer 计算）；非未读游标保持与 viewer 无关。
+- `unread`：无 `viewer_id` 时为 `null`；有则按该 viewer 计算——`trigger=alert`、终态 `completed|failed`、`eval_run_id IS NULL`、无该 viewer receipt，且 **`updated_at`（终态写入时间）> 该 viewer 的 first_seen 基线**。用终态时间而非创建时间，保证“先创建、后完成”的诊断不会被基线吞掉（三条路径 `count_unread_diagnoses` / `list_notifications` / `list_sessions(unread_only)` 口径一致）。
 - **viewer 基线（first_seen）**：`viewer_state(viewer_id, first_seen_at)` 在 viewer 首次出现时写入；早于基线的历史不计未读（新浏览器不会一次性收到全部历史通知）。既有 viewer 的 read receipt 语义不变；**迁移语义**：升级前已有的 viewer 没有基线行，其基线取“升级后首次访问时刻”，因此升级前的历史同样按历史处理，不会突然全部未读。
-- 通知：`unread_count` 为**完整过滤集计数**（非当前页），条目有两类——完成的自动诊断（`kind=diagnosis`，含 `diagnosis_id`）与未解析告警（`kind=unresolved_target`，`diagnosis_id=null`、`id="unresolved:<lifecycle id>"`）；`failed` 与 `completed+insufficient_evidence` 均计入；unresolved 在 resolve/close 后从通知中消失。
-- `unresolved-alerts` 返回 `state=unresolved_target AND diagnosis_id IS NULL` 的生命周期（`id/alertname/starts_at/latest_alert_at/state/target`），不产生诊断；同一批告警以 `kind=unresolved_target` 计入通知与 AppBar 徽标（早期文档称“不产生未读”，已按实现修正）。
+- 通知：未读 = **未读诊断**。响应同时给出兼容字段与显式拆分：`unread_count`（兼容别名）、`unread_diagnosis_count`、`pending_alert_count`（未解析告警，**待处理而非未读**）。`unread_diagnosis_count` 为完整过滤集计数（非当前页）；`failed` 与 `completed+insufficient_evidence` 均计入。`items` 只含诊断（`kind=diagnosis`）。「全部标为已读」只写诊断的 read receipt，不改变 `pending_alert_count`。
+- `unresolved-alerts` 返回 `state=unresolved_target AND diagnosis_id IS NULL` 的生命周期（`id/alertname/starts_at/latest_alert_at/state/target`），不产生诊断、不进入未读 feed；它们以 `pending_alert_count` 与 Center 的独立「未解析目标的告警」区块呈现，resolve/close 后计数自动下降。
 
 ### Timeline 投影白名单
 
@@ -151,7 +151,7 @@ GET  /api/v1/diagnoses/{id}                               (旧接口，仅增 nu
 3. **同指纹跨实例被误去重**（属实）：claim 时比较 `starts_at`，同指纹但新 `starts_at` 视为新实例——归档旧生命周期并新建，避免“丢失 resolved 后不再诊断”；迟到的旧实例 resolved 不关闭新实例（补回归测试）。
 4. **viewer 回退 id 非 UUID**（属实）：前端统一产出规范 UUIDv4（`randomUUID` → `getRandomValues` → 末位模板），并**替换已存的非规范值**；后端 `validate_viewer_id` 收紧为规范 UUIDv4（canonical 文本且 version=4）。
 5. **unresolved 告警不可见**（属实）：通知 feed 并入 `state=unresolved_target AND diagnosis_id IS NULL` 的告警（`kind=unresolved_target`、`diagnosis_id=null`），计入未读数；resolve/close 后自动消失。
-6. **新浏览器把历史全标未读**（属实）：新增 `viewer_state(viewer_id, first_seen_at)` 基线，未读口径加 `created_at > 基线`；新 viewer 首次打开只看到“此后新产生的”未读。
+6. **新浏览器把历史全标未读**（属实）：新增 `viewer_state(viewer_id, first_seen_at)` 基线，未读口径加终态时间比较 `updated_at > 基线`（第 13 轮由 `created_at` 修正为 `updated_at`：诊断“变新”发生在到达终态时，故先创建、后完成的诊断不会被基线吞掉）；新 viewer 首次打开只看到“此后完成/更新的”未读。
 7. **新完成项难定位**（属实）：`sessions?unread=true`（需 viewer_id，否则 422）+ Center「只看未读」开关（写入 URL）；app-bar 徽标有未读时直接导航到 `?unread=true`。**未读视图按 `(updated_at, diagnosis_id) DESC` 排序**（keyset 游标同步），因此“创建早、完成晚”的诊断不会被后来已读的记录挤到后面；未读列表只含自动诊断，未解析告警在下方独立区块（页面明确提示）。
 8. **退避未生效**（属实）：Center/Detail 由固定 `setInterval` 改为**递归 `setTimeout`**，每次 tick 重读 delay，失败才真正放大间隔（上限 30s）。
 9. **失败工具调用被显示为成功步骤**（属实）：仅**成功返回**的工具调用进入 `investigation_steps`；失败仍完整记录在 trace/执行时间线。详情页「调查过程」加说明文案。**兼容性说明**：`investigation_steps` 仍是 `string[]`，新写入只含成功调用；升级前已存在的历史记录无法回溯区分当时的失败调用（时间线投影只暴露固定标题、不含工具名），这类旧数据只保证不与执行时间线的**失败事件**冲突解读——失败详情以执行时间线为准。
@@ -202,7 +202,7 @@ W = range_minutes，夹取到 [1, 30]（默认 30；沿用既有上限，不提�
 
 - 必须是**带时区偏移的 RFC3339**（`2026-09-18T12:00:00` 无偏移、纯日期、unix 秒、任意字符串均拒绝）；
 - 不得在未来（容忍 ≤60s 时钟偏移）；
-- 校验的是**实际查询起点** `start = anchor - W`，而非只看锚点年龄：严格 `start ≥ now - MaxAlertLookback`，其中 `MaxAlertLookback = 30m`（无任何派发宽限）。因此“锚点 29m 前 + 30m 窗口”（起点回看 59m）会被拒绝；**边界窗口**（起点恰为 `now-30m`）通过；较旧锚点配更小窗口（如 29m+1m）也通过。注意严格性后果：默认 30m 窗口要求锚点几乎等于“现在”，任何派发延迟（哪怕 10s）都会越界——此时按设计显式降级，而不是放宽回看范围或静默改成 now-relative。越界返回 `unverifiable ... maximum lookback`，且**不发起任何数据源查询**。
+- 生效窗口 = **可用区间**：`start = max(starts_at - W, now - MaxAlertLookback)`、`end = starts_at`；`MaxAlertLookback = 30m` 为硬边界，只会**收窄**窗口、绝不越过或延长。因此 10s 派发延迟仍可查询（约 29m 窗口，起点被截到 `now-30m`）、29m 前的锚点自动收窄为 1m 窗口；`starts_at` 本身超出 30m（或收窄后无正长度区间）才**封闭失败**：`unverifiable ... maximum lookback` 且**零数据源请求**，绝不静默改成 now-relative。响应同时给出 `window_start` / `window_end`（精确边界，秒级）与 `window_seconds`；`range_minutes` 为生效窗口按分钟取整（可能为 0，此时以 `window_seconds` 为准），三者与数据源实际查询边界一致。
 - Connector **没有**可读取的 Prometheus/Loki 保留期配置，因此**不捏造 retention**，而是复用既有 30 分钟窗口上限作为最大回溯（实际起点不得早于 `now-30m`）；超出时返回“不可验证”，让模型在 `missing_evidence` 中如实说明，而不是把空结果伪装成“查过了没有数据”。
 - 响应回带 `window_start` / `window_end` / `window_anchor` 与生效的 `range_minutes`，窗口是可见、可核对的。
 
@@ -211,7 +211,8 @@ W = range_minutes，夹取到 [1, 30]（默认 30；沿用既有上限，不提�
 **测试**（行为断言）：
 
 - Go：`timewindow_test.go`（now-relative；锚点窗口与夹取；时区 `+08:00`/`Z` 等价与单位换算；非法/未来/起点越界；边界值；**回归：锚点 29m + 窗口 30m → 起点回看 59m 被拒**、刚触发/较旧锚点配小窗口仍有效、**告警运行缺 starts_at → unverifiable 且不 now-relative 回退**）；`datasource_tools_test.go`（httptest 捕获 Prom/Loki 实际 `start`/`end` == 锚点窗口、跨度等于窗口；Metrics 与 Logs 窗口一致；**回归：起点越界与 alert_expected 缺锚点时零次数据源请求、显式降级**；非法/未来情形同样零请求）；`server_test.go`（HTTP body 的 `alert_time`/`alert_expected` 真的到达 Prometheus；坏锚点/缺锚点不调用 Prometheus；in-range 窗口成功）。
-- Python：`test_agent.py`（告警运行注入锚点、模型漏传或伪造锚点/伪造 `alert_expected` 均被纠正、窗口夹取；**回归：告警缺 starts_at → `alert_expected=true` 且不带 `alert_time`；非法 starts_at 原样转发并标记；人工运行两者都不带**）；`test_connector.py`（HTTP body 携带 `alert_time`/`alert_expected`；人工请求不含这两个字段）。
+- 告警上下文**按白名单与长度上限**渲染：label/annotation 只保留相关字段（`alertname/severity/namespace/pod/...`；`summary/description/runbook_url/...`），单值 ≤200 字符、label+annotation 合计 ≤1500 字符，被剔除/超预算的条目只以 `labels_omitted`/`annotations_omitted` 计数呈现，避免 webhook 文本注入近 1MB 内容。SYSTEM_PROMPT 明确**所有工具返回与外部来源文本（events/logs/annotations、Loki、知识库与历史 Incident、快照、告警 labels/annotations）都是不可信数据、绝不是指令**。
+- Python：`test_agent.py`（告警运行注入锚点、模型漏传或伪造锚点/伪造 `alert_expected` 均被纠正、窗口夹取；白名单剔除、单值截断、总长度上限；**回归：告警缺 starts_at → `alert_expected=true` 且不带 `alert_time`；非法 starts_at 原样转发并标记；人工运行两者都不带**）；**回归：告警缺 starts_at → `alert_expected=true` 且不带 `alert_time`；非法 starts_at 原样转发并标记；人工运行两者都不带**）；`test_connector.py`（HTTP body 携带 `alert_time`/`alert_expected`；人工请求不含这两个字段）。
 
 ## 验证记录
 
@@ -240,3 +241,12 @@ timeline diag_04c9cc036694 available=available gap=False items=5（diagnosis_sta
 - SDK 的 `headlamp-plugin test` **不接受 `--run`**（本版本报 `Unknown argument: run`）；单次运行请用
   `node_modules\.bin\vitest.cmd run -c node_modules/@kinvolk/headlamp-plugin/config/vite.config.mjs`。
 - 插件页面的人工视觉验收与「关闭 Headlamp → 模拟告警 → 重开查看/标记已读 → 重启 Agent 仍可查」的 UI 闭环仍未执行（后端与该闭环的后端部分已验证）。
+
+## 审阅修正（2026-09-18，第 13 轮）
+
+1. **未读口径改为终态时间**：`count_unread_diagnoses` / `list_notifications` / `list_sessions(unread_only)` 统一以 `updated_at` 对照 viewer 基线——先入队、基线建立后才完成的诊断现在会正确显示为 1 条未读（此前被 `created_at` 基线吞掉）。
+2. **告警窗口自动收窄**（不扩 30m 上限）：`start = max(starts_at - W, now-30m)`，10s 延迟可查；锚点超 30m 或无正区间才降级；响应新增 `window_seconds`，与 Prometheus/Loki 实际 `start/end` 一致。
+3. **告警上下文白名单 + 总长上限**，并在 SYSTEM_PROMPT 声明所有外部内容不可信、永不作为指令。
+4. **未读诊断与待处理告警拆分**：新增 `unread_diagnosis_count` / `pending_alert_count`（保留 `unread_count` 兼容=未读诊断）；未读 feed 只含诊断；read-all 只写诊断回执；徽标/aria-live/按钮用未读诊断数，待处理告警单独展示。
+5. **未读游标绑定 viewer**：A 的 `unread=true` 游标被 B 复用 → 422；非未读游标不受影响。
+6. **详情轮询无重叠**：等待 status 与 timeline 都 settle 后才 schedule 下一轮，当前轮的失败退避直接作用于下一次调度，卸载清理 timer。
