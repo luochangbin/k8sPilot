@@ -6,8 +6,9 @@ mandatory structured output (submit_result). See design §30 (Sherlock-style).
 """
 
 import json
+from typing import Any, Optional
 
-from .models import ResourceRef
+from .models import AlertContext, ResourceRef
 
 SYSTEM_PROMPT = """\
 你是运行在单个 Kubernetes 集群中的 AIOps 诊断 Agent。你的任务是用只读工具对一个故障 Pod 进行自主多步调查，并给出结构化诊断结论。
@@ -43,8 +44,56 @@ submit_result 的可评分契约：
 """
 
 
-def user_message(req_resource: ResourceRef) -> str:
-    """Build the initial user message from the resource identity sent by the platform."""
+_MAX_CONTEXT_CHARS = 4000
+
+
+def _bounded(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False, indent=2)
+    if len(text) > _MAX_CONTEXT_CHARS:
+        return text[:_MAX_CONTEXT_CHARS] + "\n...(已截断)"
+    return text
+
+
+def _alert_block(alert: AlertContext) -> str:
+    """Render the alert context that triggered this investigation.
+
+    The snapshot is what Alertmanager/an adapter already knows at firing time:
+    useful starting context, but it is not tool evidence and must be verified.
+    """
+    lines = [
+        "本次为告警自动触发（Alertmanager）：",
+        json.dumps({
+            "alertname": alert.alertname,
+            "status": alert.status.value,
+            "starts_at": alert.starts_at,
+            "fingerprint": alert.fingerprint,
+            "labels": alert.labels,
+            "annotations": alert.annotations,
+        }, ensure_ascii=False, indent=2),
+    ]
+    if alert.snapshot:
+        lines.append(
+            "触发时快照（仅为初始线索，不是本次调查的工具证据，需用只读工具核实后再作结论）：\n"
+            + _bounded(alert.snapshot)
+        )
+    if alert.starts_at:
+        lines.append(
+            "时间基准：告警 starts_at=" + alert.starts_at
+            + "。需要时间窗口的查询（query_metrics / query_logs）请围绕该时刻构造窗口，"
+            "不要使用与告警无关的默认窗口。"
+        )
+    return "\n\n".join(lines)
+
+
+def user_message(req_resource: ResourceRef,
+                 alert: Optional[AlertContext] = None) -> str:
+    """Build the initial user message from the resource identity sent by the platform.
+
+    When the request carries Alertmanager context (trigger=alert), that context
+    is included so the model does not investigate blind: alertname/labels/
+    annotations explain *what fired*, starts_at anchors time-window queries, and
+    the snapshot seeds the first hypotheses (to be confirmed with tools).
+    """
 
     target = {
         "resource": {
@@ -55,8 +104,10 @@ def user_message(req_resource: ResourceRef) -> str:
             "uid": req_resource.uid,
         },
     }
-    return (
-        "请诊断以下 Kubernetes 资源（人工触发）：\n"
-        + json.dumps(target, ensure_ascii=False, indent=2)
-        + "\n\n请按调查铁律使用工具收集证据，最后调用 submit_result 提交结论。"
-    )
+    trigger = "告警自动触发" if alert is not None else "人工触发"
+    parts = [f"请诊断以下 Kubernetes 资源（{trigger}）：",
+             json.dumps(target, ensure_ascii=False, indent=2)]
+    if alert is not None:
+        parts.append(_alert_block(alert))
+    parts.append("请按调查铁律使用工具收集证据，最后调用 submit_result 提交结论。")
+    return "\n\n".join(parts)

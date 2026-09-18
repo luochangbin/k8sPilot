@@ -52,10 +52,17 @@ def parse_iso(value: str) -> str:
 
 
 def validate_viewer_id(viewer_id: str) -> str:
+    """Viewer ids are opaque to the server but must be canonical UUIDv4 strings.
+
+    Vague ids (non-UUID, non-canonical, wrong version) would make read receipts
+    ambiguous across browsers, so they are rejected up front.
+    """
     try:
-        UUID(viewer_id)
+        parsed = UUID(viewer_id)
     except (ValueError, AttributeError, TypeError) as exc:
         raise ValueError("viewer_id must be a UUID") from exc
+    if parsed.version != 4 or str(parsed) != (viewer_id or "").lower():
+        raise ValueError("viewer_id must be a canonical UUIDv4")
     return viewer_id
 
 

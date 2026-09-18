@@ -82,6 +82,11 @@ CREATE INDEX IF NOT EXISTS idx_diagnoses_created
 
 CREATE INDEX IF NOT EXISTS idx_alert_lifecycle_diagnosis
     ON alert_lifecycles (diagnosis_id, id DESC);
+-- Diagnosis Center: per-viewer notification baseline (first seen).
+CREATE TABLE IF NOT EXISTS viewer_state (
+    viewer_id     TEXT PRIMARY KEY,
+    first_seen_at TEXT NOT NULL
+);
 """
 
 
@@ -108,8 +113,45 @@ class SessionStore:
     # ---- public API used by the agent / api ----
 
     def create(self, req: DiagnosisRequest) -> Diagnosis:
+        d = self._build_diagnosis(req)
+        with self._lock:
+            self._insert(d)
+        return d
+
+    def create_with_alert_link(self, req: DiagnosisRequest, lifecycle_id: int) -> Diagnosis:
+        """Create a queued diagnosis and link it to the lifecycle atomically.
+
+        Without this, a crash between the two writes would leave a diagnosis that
+        no lifecycle points at (invisible to the Center / read receipts).
+        """
+        d = self._build_diagnosis(req)
+        with self._lock:
+            try:
+                with self._conn:
+                    self._conn.execute(
+                        "INSERT INTO diagnoses (diagnosis_id, trigger, resource, status, result, "
+                        "error, eval_run_id, case_id, case_version, attempt_index, created_at, "
+                        "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (d.diagnosis_id, d.trigger, d.resource.model_dump_json(), d.status,
+                         None, None, d.eval_run_id, d.case_id, d.case_version, d.attempt_index,
+                         d.created_at.isoformat(), d.updated_at.isoformat()),
+                    )
+                    cur = self._conn.execute(
+                        "UPDATE alert_lifecycles SET diagnosis_id = ?, updated_at = ? "
+                        "WHERE id = ? AND diagnosis_id IS NULL",
+                        (d.diagnosis_id, _now(), lifecycle_id),
+                    )
+                    if cur.rowcount != 1:
+                        raise RuntimeError(
+                            f"alert lifecycle {lifecycle_id} was already linked")
+            except Exception:
+                # The context manager rolled the transaction back; nothing to clean up.
+                raise
+        return d
+
+    def _build_diagnosis(self, req: DiagnosisRequest) -> Diagnosis:
         now = _now()
-        d = Diagnosis(
+        return Diagnosis(
             diagnosis_id=new_diagnosis_id(),
             trigger=req.trigger.value,
             resource=req.resource,
@@ -123,9 +165,6 @@ class SessionStore:
             created_at=datetime.fromisoformat(now),
             updated_at=datetime.fromisoformat(now),
         )
-        with self._lock:
-            self._insert(d)
-        return d
 
     def get(self, diagnosis_id: str) -> Optional[Diagnosis]:
         with self._lock:
@@ -207,14 +246,24 @@ class SessionStore:
                 (fingerprint, ALERT_OPEN, ALERT_UNRESOLVED),
             ).fetchone()
             if row:
-                self._conn.execute(
-                    "UPDATE alert_lifecycles SET latest_alert_at = ?, updated_at = ? WHERE id = ?",
-                    (now, now, row["id"]),
-                )
-                self._conn.commit()
-                updated = self._conn.execute(
-                    "SELECT * FROM alert_lifecycles WHERE id = ?", (row["id"],)).fetchone()
-                return dict(updated), False
+                if (starts_at and row["starts_at"] and row["starts_at"] != starts_at):
+                    # Same fingerprint but a different alert instance (the previous
+                    # lifecycle never got its resolved): archive it and start a new
+                    # lifecycle instead of deduping onto the old diagnosis.
+                    self._conn.execute(
+                        "UPDATE alert_lifecycles SET state = ?, resolved_at = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (ALERT_CLOSED, now, now, row["id"]),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE alert_lifecycles SET latest_alert_at = ?, updated_at = ? WHERE id = ?",
+                        (now, now, row["id"]),
+                    )
+                    self._conn.commit()
+                    updated = self._conn.execute(
+                        "SELECT * FROM alert_lifecycles WHERE id = ?", (row["id"],)).fetchone()
+                    return dict(updated), False
             cur = self._conn.execute(
                 "INSERT INTO alert_lifecycles (fingerprint, diagnosis_id, state, alertname, "
                 "target, labels, starts_at, latest_alert_at, resolved_at, created_at, updated_at) "
@@ -334,7 +383,8 @@ class SessionStore:
                       uid: Optional[str] = None, since: Optional[str] = None,
                       until: Optional[str] = None,
                       after: Optional[tuple[str, str]] = None,
-                      viewer_id: Optional[str] = None
+                      viewer_id: Optional[str] = None,
+                      unread_only: bool = False
                       ) -> tuple[list[dict[str, Any]], Optional[tuple[str, str]]]:
         """Keyset page over (created_at, diagnosis_id) DESC with filters."""
         where: list[str] = []
@@ -368,19 +418,28 @@ class SessionStore:
         if after:
             where.append("(d.created_at < ? OR (d.created_at = ? AND d.diagnosis_id < ?))")
             params.extend([after[0], after[0], after[1]])
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
         join = ""
         unread_expr = "NULL"
         if viewer_id:
+            baseline = self.ensure_viewer(viewer_id)
             join = (" LEFT JOIN diagnosis_read_receipts r "
                     "ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ?")
             # Unread applies to auto-diagnoses only (same scope as notifications),
-            # so manual/eval rows are never reported as unread.
+            # so manual/eval rows are never reported as unread. The viewer baseline
+            # keeps pre-existing history out of "new".
             unread_expr = (
                 "CASE WHEN d.trigger = 'alert' AND d.status IN ('completed', 'failed') "
-                "AND d.eval_run_id IS NULL AND r.read_at IS NULL THEN 1 ELSE 0 END"
+                "AND d.eval_run_id IS NULL AND r.read_at IS NULL AND d.created_at > ? "
+                "THEN 1 ELSE 0 END"
             )
-            params = [viewer_id, *params]
+            params = [baseline, viewer_id, *params]
+            if unread_only:
+                where.extend([
+                    "d.trigger = 'alert'", "d.status IN ('completed', 'failed')",
+                    "d.eval_run_id IS NULL", "r.read_at IS NULL", "d.created_at > ?",
+                ])
+                params.append(baseline)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
         sql = (f"SELECT d.diagnosis_id, d.trigger, d.status, d.resource, d.result, "
                f"d.created_at, d.updated_at, {unread_expr} AS unread "
                f"FROM diagnoses d{join}{clause} "
@@ -393,7 +452,41 @@ class SessionStore:
             next_cursor = (out[-1]["created_at"], out[-1]["diagnosis_id"])
         return out, next_cursor
 
+    def ensure_viewer(self, viewer_id: str) -> str:
+        """Return the viewer's baseline time, creating it on first sight.
+
+        Everything created before the baseline is treated as history, so a new
+        browser does not see the whole backlog as "new" notifications.
+        """
+        now = _now()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO viewer_state (viewer_id, first_seen_at) VALUES (?,?)",
+                (viewer_id, now),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT first_seen_at FROM viewer_state WHERE viewer_id = ?", (viewer_id,)
+            ).fetchone()
+        return row["first_seen_at"] if row else now
+
     def count_unread_notifications(self, viewer_id: str) -> int:
+        baseline = self.ensure_viewer(viewer_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ("
+                "  SELECT COUNT(*) FROM diagnoses d "
+                "  LEFT JOIN diagnosis_read_receipts r "
+                "    ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ? "
+                "  WHERE d.trigger = 'alert' AND d.status IN ('completed', 'failed') "
+                "    AND d.eval_run_id IS NULL AND r.read_at IS NULL AND d.created_at > ?"
+                ") + ("
+                "  SELECT COUNT(*) FROM alert_lifecycles "
+                "  WHERE state = ? AND diagnosis_id IS NULL AND created_at > ?"
+                ") AS c",
+                (viewer_id, baseline, ALERT_UNRESOLVED, baseline),
+            ).fetchone()
+        return int(row["c"]) if row else 0
         with self._lock:
             row = self._conn.execute(
                 "SELECT COUNT(*) AS c FROM diagnoses d "
@@ -451,23 +544,41 @@ class SessionStore:
     def list_notifications(self, *, viewer_id: str, limit: int,
                            after: Optional[tuple[str, str]] = None
                            ) -> tuple[list[dict[str, Any]], Optional[tuple[str, str]]]:
-        where = ["d.trigger = 'alert'", "d.status IN ('completed', 'failed')",
-                 "d.eval_run_id IS NULL", "r.read_at IS NULL"]
-        params: list[Any] = [viewer_id]
+        """Unread items: finished auto-diagnoses plus unstarted unresolved alerts.
+
+        Unresolved alerts never create a diagnosis but still need attention, so
+        they are part of the same notification feed (kind=unresolved_target).
+        """
+        baseline = self.ensure_viewer(viewer_id)
+        diag_where = ["d.trigger = 'alert'", "d.status IN ('completed', 'failed')",
+                      "d.eval_run_id IS NULL", "r.read_at IS NULL", "d.created_at > ?"]
+        unres_where = ["state = ?", "diagnosis_id IS NULL", "created_at > ?"]
+        params_diag: list[Any] = [viewer_id, baseline]
+        params_unres: list[Any] = [ALERT_UNRESOLVED, baseline]
         if after:
-            where.append("(d.created_at < ? OR (d.created_at = ? AND d.diagnosis_id < ?))")
-            params.extend([after[0], after[0], after[1]])
-        sql = ("SELECT d.diagnosis_id, d.status, d.created_at FROM diagnoses d "
-               "LEFT JOIN diagnosis_read_receipts r "
-               "  ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ? "
-               "WHERE " + " AND ".join(where) +
-               " ORDER BY d.created_at DESC, d.diagnosis_id DESC LIMIT ?")
+            diag_where.append("(d.created_at < ? OR (d.created_at = ? AND d.diagnosis_id < ?))")
+            params_diag.extend([after[0], after[0], after[1]])
+            unres_where.append("(created_at < ? OR (created_at = ? AND ref < ?))")
+            params_unres.extend([after[0], after[0], after[1]])
+        sql = (
+            "SELECT * FROM ("
+            "  SELECT d.diagnosis_id AS ref, 'diagnosis' AS kind, d.status AS status, "
+            "         d.created_at AS created_at, 1 AS unread FROM diagnoses d "
+            "  LEFT JOIN diagnosis_read_receipts r "
+            "    ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ? "
+            "  WHERE " + " AND ".join(diag_where) +
+            "  UNION ALL "
+            "  SELECT 'unresolved:' || id AS ref, ? AS kind, ? AS status, created_at, 1 AS unread "
+            "  FROM alert_lifecycles WHERE " + " AND ".join(unres_where) +
+            ") ORDER BY created_at DESC, ref DESC LIMIT ?"
+        )
+        params = [*params_diag, ALERT_UNRESOLVED, ALERT_UNRESOLVED, *params_unres, limit + 1]
         with self._lock:
-            rows = self._conn.execute(sql, [*params, limit + 1]).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         out = [dict(r) for r in rows[:limit]]
         next_cursor = None
         if len(rows) > limit and out:
-            next_cursor = (out[-1]["created_at"], out[-1]["diagnosis_id"])
+            next_cursor = (out[-1]["created_at"], out[-1]["ref"])
         return out, next_cursor
 
     def list_unresolved_alerts(self, *, limit: int,

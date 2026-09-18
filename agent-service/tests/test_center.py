@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from app.config import Config
 from app.main import create_app
 from app.models import DiagnosisRequest, ResourceRef, Trigger
-from app.store import ALERT_OPEN, SessionStore
+from app.store import ALERT_OPEN, ALERT_UNRESOLVED, SessionStore
 
 from .fakes import ScriptedLLM, StubConnector
 
@@ -51,10 +51,21 @@ def make_center(tmp_path):
     return TestClient(app), store, cfg
 
 
+def _prime(store, *viewers):
+    """Establish the notification baseline before seeding what must count as new.
+
+    A viewer's baseline is the first time the server sees that viewer; anything
+    created earlier is history and is intentionally not "unread" (§ new-viewer).
+    """
+    for viewer in viewers:
+        store.ensure_viewer(viewer)
+
+
 # ---- sessions ----
 
 def test_sessions_order_filters_and_unread(tmp_path):
     client, store, _ = make_center(tmp_path)
+    _prime(store, VIEWER)
     manual = _seed_diagnosis(store, name="manual-pod", uid="uid-m")
     alert_ok = _seed_diagnosis(store, trigger=Trigger.alert, name="alert-pod", uid="uid-a",
                                result=_result())
@@ -87,6 +98,13 @@ def test_sessions_invalid_inputs_are_422(tmp_path):
     assert client.get("/api/v1/diagnosis-center/sessions?limit=0").status_code == 422
     assert client.get("/api/v1/diagnosis-center/sessions?limit=101").status_code == 422
     assert client.get("/api/v1/diagnosis-center/sessions?viewer_id=nope").status_code == 422
+    # Well-formed but not a canonical v4: read receipts would be ambiguous.
+    assert client.get(
+        "/api/v1/diagnosis-center/sessions"
+        "?viewer_id=00000000-0000-0000-0000-000000000001").status_code == 422
+    assert client.get(
+        "/api/v1/diagnosis-center/sessions"
+        "?viewer_id=12345678123456781234567812345678").status_code == 422
 
 
 def test_sessions_cursor_is_filter_bound(tmp_path):
@@ -131,6 +149,8 @@ def test_sessions_include_alert_projection(tmp_path):
 
 def test_read_receipt_and_unread_count(tmp_path):
     client, store, _ = make_center(tmp_path)
+    other = str(uuid.uuid4())
+    _prime(store, VIEWER, other)
     alert_ok = _seed_diagnosis(store, trigger=Trigger.alert, result=_result())
     alert_insufficient = _seed_diagnosis(store, trigger=Trigger.alert,
                                          result=_result(insufficient=True), name="p2", uid="u2")
@@ -164,10 +184,9 @@ def test_read_receipt_and_unread_count(tmp_path):
                                                            "read": True}
     assert client.get(
         f"/api/v1/diagnosis-center/notifications?viewer_id={VIEWER}").json()["unread_count"] == 2
-    # viewer isolation
-    other = client.get(
-        f"/api/v1/diagnosis-center/notifications?viewer_id={uuid.uuid4()}").json()
-    assert other["unread_count"] == 3
+    # viewer isolation: a different viewer with the same baseline sees the same 3
+    assert client.get(
+        f"/api/v1/diagnosis-center/notifications?viewer_id={other}").json()["unread_count"] == 3
 
 
 # ---- unresolved alerts ----
@@ -338,6 +357,8 @@ def test_namespaces_endpoint_lists_real_namespaces_only(tmp_path):
 
 def test_mark_all_read_is_scoped_and_leaves_new_diagnoses_unread(tmp_path):
     client, store, _ = make_center(tmp_path)
+    other = str(uuid.uuid4())
+    _prime(store, VIEWER, other)
     _seed_diagnosis(store, trigger=Trigger.alert, result=_result())
     _seed_diagnosis(store, trigger=Trigger.alert, result=_result(insufficient=True),
                     name="p2", uid="u2")
@@ -361,8 +382,7 @@ def test_mark_all_read_is_scoped_and_leaves_new_diagnoses_unread(tmp_path):
     assert client.get(
         f"/api/v1/diagnosis-center/notifications?viewer_id={VIEWER}").json()["unread_count"] == 1
 
-    # Viewer isolation.
-    other = str(uuid.uuid4())
+    # Viewer isolation (same baseline).
     assert client.get(
         f"/api/v1/diagnosis-center/notifications?viewer_id={other}").json()["unread_count"] == 3
 
@@ -373,6 +393,7 @@ def test_mark_all_read_is_scoped_and_leaves_new_diagnoses_unread(tmp_path):
 
 def test_unread_scope_matches_read_all(tmp_path):
     client, store, _ = make_center(tmp_path)
+    _prime(store, VIEWER)
     manual = _seed_diagnosis(store, name="m", uid="u1")
     alert_old = _seed_diagnosis(store, trigger=Trigger.alert, result=_result(),
                                 name="a1", uid="u2")
@@ -397,3 +418,52 @@ def test_unread_scope_matches_read_all(tmp_path):
                        json={"viewer_id": VIEWER})
     assert resp.json()["read"] == 1
     assert all(value is False for value in unread_map().values())
+
+
+def test_new_viewer_does_not_inherit_history_as_unread(tmp_path):
+    """Opening the Center in a fresh browser must not surface the whole backlog."""
+    client, store, _ = make_center(tmp_path)
+    _seed_diagnosis(store, trigger=Trigger.alert, result=_result())
+    _seed_diagnosis(store, trigger=Trigger.alert, result=_result(), name="p2", uid="u2")
+
+    fresh = str(uuid.uuid4())
+    assert client.get(
+        f"/api/v1/diagnosis-center/notifications?viewer_id={fresh}").json()["unread_count"] == 0
+
+    # Diagnoses finishing after the first sighting are unread for that viewer.
+    _seed_diagnosis(store, trigger=Trigger.alert, result=_result(), name="p3", uid="u3")
+    assert client.get(
+        f"/api/v1/diagnosis-center/notifications?viewer_id={fresh}").json()["unread_count"] == 1
+
+
+def test_unresolved_alerts_are_notifications_and_clear_on_resolve(tmp_path):
+    """An unresolved alert starts no diagnosis, but still needs attention."""
+    client, store, _ = make_center(tmp_path)
+    _prime(store, VIEWER)
+    store.claim_active_alert_lifecycle(
+        fingerprint="fp-note", state=ALERT_UNRESOLVED, alertname="Mystery")
+
+    notes = client.get(f"/api/v1/diagnosis-center/notifications?viewer_id={VIEWER}").json()
+    assert notes["unread_count"] == 1
+    item = notes["items"][0]
+    assert item["kind"] == "unresolved_target"
+    assert item["diagnosis_id"] is None
+    assert item["id"] == "unresolved:" + str(store.latest_alert_lifecycle("fp-note")["id"])
+
+    store.close_alert_lifecycle("fp-note")
+    assert client.get(
+        f"/api/v1/diagnosis-center/notifications?viewer_id={VIEWER}").json()["unread_count"] == 0
+
+
+def test_sessions_unread_filter_returns_only_unread(tmp_path):
+    client, store, _ = make_center(tmp_path)
+    _prime(store, VIEWER)
+    unread = _seed_diagnosis(store, trigger=Trigger.alert, result=_result())
+    seen = _seed_diagnosis(store, trigger=Trigger.alert, result=_result(), name="p2", uid="u2")
+    assert client.post(f"/api/v1/diagnosis-center/sessions/{seen.diagnosis_id}/read",
+                       json={"viewer_id": VIEWER}).status_code == 200
+
+    body = client.get(
+        f"/api/v1/diagnosis-center/sessions?viewer_id={VIEWER}&unread=true").json()
+    assert [item["diagnosis_id"] for item in body["items"]] == [unread.diagnosis_id]
+    assert client.get("/api/v1/diagnosis-center/sessions?unread=true").status_code == 422

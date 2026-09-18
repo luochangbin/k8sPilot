@@ -7,7 +7,12 @@
 # - LLM_* environment variables are cleared so agent-service/.env is used.
 # - Connector discovery is bounded with --request-timeout.
 #
-# Usage:  pwsh -File agent-service\restart-agent.ps1 [-Port 8000]
+# Usage:  pwsh -File agent-service\restart-agent.ps1 [-Port 8000] [-ConnectorBaseUrl http://ip:8080]
+#
+# If the cluster API is unreachable, the connector Pod IP cannot be discovered;
+# pass -ConnectorBaseUrl to start anyway (e.g. the last known Pod IP). Discovery
+# happens *before* the old agent is stopped, so a failed lookup never leaves the
+# service down.
 #
 # IMPORTANT: run this script directly. Do NOT pipe its output
 # (e.g. `| Out-String`): the started process inherits the caller's standard
@@ -16,7 +21,8 @@
 #   pwsh -File restart-agent.ps1 *> restart.log
 
 param(
-    [int]$Port = 8000
+    [int]$Port = 8000,
+    [string]$ConnectorBaseUrl
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,7 +54,21 @@ function Get-ProcessTree([int]$RootPid) {
     return $seen
 }
 
-# 1. Stop old agents (all uvicorn app.main:app processes).
+# 1. Resolve the connector address (bounded) BEFORE stopping anything: a failed
+#    lookup must not take the running service down.
+if (-not $ConnectorBaseUrl) {
+    $podIp = kubectl --request-timeout=10s get pod -n k8spilot -l app=ai-agent-connector `
+        -o jsonpath="{.items[0].status.podIP}" 2>$null
+    if (-not $podIp) {
+        throw 'Cannot resolve ai-agent-connector Pod IP (kubectl failed or no pod); ' +
+              'pass -ConnectorBaseUrl to start with a known address'
+    }
+    $ConnectorBaseUrl = "http://$podIp`:8080"
+}
+$env:CONNECTOR_BASE_URL = $ConnectorBaseUrl
+Remove-Item Env:LLM_API_KEY, Env:LLM_BASE_URL, Env:LLM_MODEL -ErrorAction SilentlyContinue
+
+# 2. Stop old agents (all uvicorn app.main:app processes).
 $old = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
     Where-Object { $_.CommandLine -match 'uvicorn app\.main:app' }
 foreach ($p in $old) {
@@ -56,7 +76,7 @@ foreach ($p in $old) {
     Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
 }
 
-# 2. Wait (bounded) until the port is actually released.
+# 3. Wait (bounded) until the port is actually released.
 for ($i = 0; $i -lt 40; $i++) {
     if (-not (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) {
         break
@@ -67,13 +87,6 @@ $stale = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Silent
 if ($stale) {
     throw "Port $Port is still occupied by pid=$($stale.OwningProcess); refusing to start"
 }
-
-# 3. Resolve the connector address (bounded).
-$podIp = kubectl --request-timeout=10s get pod -n k8spilot -l app=ai-agent-connector `
-    -o jsonpath="{.items[0].status.podIP}" 2>$null
-if (-not $podIp) { throw 'Cannot resolve ai-agent-connector Pod IP (kubectl failed or no pod)' }
-$env:CONNECTOR_BASE_URL = "http://$podIp`:8080"
-Remove-Item Env:LLM_API_KEY, Env:LLM_BASE_URL, Env:LLM_MODEL -ErrorAction SilentlyContinue
 
 # 4. Start the new Agent. Stdin is redirected from an empty file so the child
 #    never inherits (and holds open) the caller's standard handles.
@@ -113,4 +126,4 @@ if ($tree -notcontains [int]$listener.OwningProcess) {
     throw "Wrong process is listening on $Port : expected tree of pid=$($a.Id) $(($tree -join ',')), actual=$($listener.OwningProcess)"
 }
 
-Write-Output "Agent restarted: pid=$($a.Id) listener=$($listener.OwningProcess) connector=$podIp port=$Port"
+Write-Output "Agent restarted: pid=$($a.Id) listener=$($listener.OwningProcess) connector=$ConnectorBaseUrl port=$Port"

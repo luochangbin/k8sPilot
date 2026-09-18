@@ -2,7 +2,9 @@
 concurrency, rate limiting and persistence (design §26)."""
 
 import time
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -185,14 +187,17 @@ def test_alert_lifecycle_persists_across_store_reopen(tmp_path):
 
 
 def test_alert_storm_rate_limited():
+    """The limiter bounds *new investigations*, so distinct firings are capped."""
     cfg = Config()
     cfg.alert_rate_limit_per_minute = 2
-    client = make_client(cfg)
-    ok1 = client.post("/api/v1/diagnoses", json=_alert_body("fp-a", unresolved=True))
-    ok2 = client.post("/api/v1/diagnoses", json=_alert_body("fp-b", unresolved=True))
-    limited = client.post("/api/v1/diagnoses", json=_alert_body("fp-c", unresolved=True))
+    client, store = make_client_with_store(cfg)
+    ok1 = client.post("/api/v1/diagnoses", json=_alert_body("fp-a"))
+    ok2 = client.post("/api/v1/diagnoses", json=_alert_body("fp-b"))
+    limited = client.post("/api/v1/diagnoses", json=_alert_body("fp-c"))
     assert ok1.status_code == 201 and ok2.status_code == 201
     assert limited.status_code == 429
+    # The rejected delivery leaves no claim behind: a later retry can still run.
+    assert store.list_alert_lifecycles("fp-c") == []
 
 
 def test_alert_trigger_requires_alert_context():
@@ -207,14 +212,15 @@ def test_diagnosis_creation_failure_can_retry():
     cfg = Config()
     base_client, store = make_client_with_store(cfg)
     client = TestClient(base_client.app, raise_server_exceptions=False)
-    original_create = store.create
-    store.create = lambda req: (_ for _ in ()).throw(RuntimeError("db down"))
+    original_create = store.create_with_alert_link
+    store.create_with_alert_link = lambda req, lifecycle_id: (
+        _ for _ in ()).throw(RuntimeError("db down"))
     failed = client.post("/api/v1/diagnoses", json=_alert_body("fp-retry"))
     assert failed.status_code == 500
     # The empty claim must be released so a retry can run.
     assert store.list_alert_lifecycles("fp-retry") == []
 
-    store.create = original_create
+    store.create_with_alert_link = original_create
     retried = client.post("/api/v1/diagnoses", json=_alert_body("fp-retry"))
     assert retried.status_code == 201
     body = retried.json()
@@ -310,3 +316,82 @@ def test_concurrent_upgrade_of_unresolved_starts_single_diagnosis():
     lifecycles = store.list_alert_lifecycles("fp-uprace")
     assert len(lifecycles) == 1 and lifecycles[0]["state"] == ALERT_OPEN
     assert lifecycles[0]["diagnosis_id"] == started[0]["diagnosis_id"]
+
+
+def test_duplicate_delivery_does_not_consume_rate_limit():
+    """Dedup runs before the limiter: repeats of one alert cannot exhaust the
+    quota that exists to bound *new* investigations."""
+    cfg = Config()
+    cfg.alert_rate_limit_per_minute = 1
+    client = make_client(cfg)
+    first = client.post("/api/v1/diagnoses", json=_alert_body("fp-quota")).json()
+    _wait(client, first["diagnosis_id"])
+    for _ in range(5):
+        resp = client.post("/api/v1/diagnoses", json=_alert_body("fp-quota"))
+        assert resp.status_code == 201
+        assert resp.json()["deduped"] is True
+    assert client.get("/api/v1/diagnoses").json() != []
+
+
+def test_unresolved_alerts_do_not_consume_rate_limit():
+    cfg = Config()
+    cfg.alert_rate_limit_per_minute = 1
+    client = make_client(cfg)
+    for i in range(5):
+        resp = client.post("/api/v1/diagnoses",
+                           json=_alert_body(f"fp-unres-{i}", unresolved=True))
+        assert resp.status_code == 201
+        assert resp.json()["status"] == ALERT_UNRESOLVED
+
+
+def test_same_fingerprint_new_starts_at_starts_new_lifecycle():
+    """A missed resolved must not hide the next firing of the same alert."""
+    client, store = make_client_with_store()
+    first = client.post("/api/v1/diagnoses", json=_alert_body("fp-inst", starts_at="A")).json()
+    _wait(client, first["diagnosis_id"])
+    retried = client.post("/api/v1/diagnoses", json=_alert_body("fp-inst", starts_at="A")).json()
+    assert retried["deduped"] is True
+    assert retried["diagnosis_id"] == first["diagnosis_id"]
+
+    second = client.post("/api/v1/diagnoses", json=_alert_body("fp-inst", starts_at="B")).json()
+    assert second["deduped"] is False
+    assert second["diagnosis_id"] != first["diagnosis_id"]
+    lifecycles = store.list_alert_lifecycles("fp-inst")
+    assert [item["state"] for item in lifecycles] == [ALERT_CLOSED, ALERT_OPEN]
+    # The old (unresolved) instance stays closed even if its resolved arrives late.
+    late = client.post("/api/v1/diagnoses",
+                       json=_alert_body("fp-inst", status="resolved", starts_at="A")).json()
+    assert late["closed"] is False
+
+
+def test_worker_thread_start_failure_is_visible_not_silently_queued():
+    """If the worker cannot start, the diagnosis must not sit in "queued"
+    forever: it is marked failed and stays linked, so the alert has a visible
+    outcome and a repeat delivery dedups onto it (design §3.2)."""
+    client, store = make_client_with_store()
+    raw = TestClient(client.app, raise_server_exceptions=False)
+
+    class _Boom:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("no threads")
+
+    # Patch only the reference used by app.main; patching threading.Thread
+    # globally would also break the test client's own worker threads.
+    with patch("app.main.threading", SimpleNamespace(Thread=_Boom)):
+        resp = raw.post("/api/v1/diagnoses", json=_alert_body("fp-thread"))
+    assert resp.status_code == 500
+    rows = store.list(10)
+    assert len(rows) == 1 and rows[0].status == "failed"
+    assert "worker thread" in (rows[0].error or "")
+    lifecycles = store.list_alert_lifecycles("fp-thread")
+    assert len(lifecycles) == 1
+    assert lifecycles[0]["diagnosis_id"] == rows[0].diagnosis_id
+
+    # A later delivery is a dedup onto the visible failed outcome, not a black hole.
+    again = client.post("/api/v1/diagnoses", json=_alert_body("fp-thread"))
+    assert again.status_code == 201
+    assert again.json()["deduped"] is True
+    assert again.json()["diagnosis_id"] == rows[0].diagnosis_id

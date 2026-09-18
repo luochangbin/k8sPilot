@@ -194,7 +194,7 @@ class Agent:
         retrieval = self._retrieval_flags(req)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message(req.resource)},
+            {"role": "user", "content": user_message(req.resource, req.alert)},
         ]
         tools = tool_definitions(capabilities, retrieval)
 
@@ -354,7 +354,11 @@ class Agent:
                 if name == "inspect" and self._uid_mismatch(output):
                     raise UIDMismatchError("目标资源已重建（当前 UID 与请求不一致），拒绝本次诊断")
 
-                steps.append(self._step_summary(name, args))
+                # Only successful tool calls are listed as investigation steps;
+                # a failed call has no result and must not be shown as a success
+                # (the failure itself is recorded in the timeline/trace).
+                if tool_err is None:
+                    steps.append(self._step_summary(name, args))
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
 
         store.update(diagnosis_id, status="failed",

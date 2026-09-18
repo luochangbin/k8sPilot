@@ -7,7 +7,7 @@ import pytest
 from app.agent import Agent, UIDMismatchError
 from app.config import Config
 from app.connector import ConnectorError
-from app.models import DiagnosisRequest, ResourceRef, Trigger
+from app.models import AlertContext, DiagnosisRequest, ResourceRef, Trigger
 from app.store import SessionStore
 
 from .fakes import ScriptedLLM, StubConnector
@@ -564,3 +564,96 @@ def test_trace_records_actual_llm_attempts(tmp_path):
     assert llm_spans
     assert all(s["attributes"]["attempts"] == 2 and s["attributes"]["retries"] == 1
                for s in llm_spans)
+
+
+def _alert_request(starts_at="2026-09-15T00:00:00Z") -> DiagnosisRequest:
+    return DiagnosisRequest(
+        trigger=Trigger.alert,
+        resource=RESOURCE,
+        alert=AlertContext(
+            fingerprint="fp-1",
+            alertname="PodHighMemory",
+            starts_at=starts_at,
+            labels={"severity": "critical"},
+            annotations={"summary": "container memory usage is above 90%"},
+            snapshot={"pod": {"restart_count": 37}},
+        ),
+    )
+
+
+def _submit_ok() -> Any:
+    return ScriptedLLM.tool_response("submit_result", {
+        "symptom": "Pod 持续重启",
+        "evidence": [{"source": "kubernetes.status", "summary": "OOMKilled"}],
+        "root_cause": "容器内存上限不足",
+        "confidence": "high",
+        "recommendations": [],
+    })
+
+
+def test_alert_context_is_included_in_the_initial_prompt():
+    """The model must not investigate blind: alertname/labels/starts_at/snapshot
+    from Alertmanager are part of the first user message (design §26)."""
+    seen_messages: list[list[dict]] = []
+
+    class RecordingLLM(ScriptedLLM):
+        def chat(self, messages, tools, tool_choice):
+            seen_messages.append(list(messages))
+            return super().chat(messages, tools, tool_choice)
+
+    llm = RecordingLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        _submit_ok(),
+    ])
+    store = SessionStore()
+    req = _alert_request()
+    d = store.create(req)
+    make_agent(llm).run(req, store, d.diagnosis_id)
+    assert store.get(d.diagnosis_id).status == "completed"
+
+    user = seen_messages[0][1]["content"]
+    assert "告警自动触发" in user
+    assert "PodHighMemory" in user
+    assert "2026-09-15T00:00:00Z" in user
+    assert "critical" in user            # labels
+    assert "memory usage is above" in user  # annotations
+    assert "restart_count" in user       # connector snapshot as initial lead
+    assert "人工触发" not in user
+
+
+def test_manual_request_has_no_alert_context():
+    seen_messages: list[list[dict]] = []
+
+    class RecordingLLM(ScriptedLLM):
+        def chat(self, messages, tools, tool_choice):
+            seen_messages.append(list(messages))
+            return super().chat(messages, tools, tool_choice)
+
+    llm = RecordingLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        _submit_ok(),
+    ])
+    store = SessionStore()
+    d = store.create(make_request())
+    make_agent(llm).run(make_request(), store, d.diagnosis_id)
+
+    user = seen_messages[0][1]["content"]
+    assert "人工触发" in user
+    assert "告警自动触发" not in user
+
+
+def test_failed_tool_call_is_not_listed_as_an_investigation_step():
+    """Only successful tool calls may appear as completed steps; the failure is
+    recorded in the trace/timeline, never shown as a success."""
+    connector = StubConnector(raise_on="not_found")   # ToolError on inspect
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        _submit_ok(),
+    ])
+    d = run(make_agent(llm, connector))
+
+    assert d.status == "completed"
+    assert d.result.investigation_steps == []

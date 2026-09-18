@@ -143,14 +143,25 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
         if req.resource.uid is None and req.resource.kind in ("Pod", "Deployment", "PersistentVolumeClaim"):
             raise HTTPException(status_code=400, detail="需要提供 resource.uid")
 
-    def _start(req: DiagnosisRequest, execution: ExecutionContext) -> dict[str, Any]:
-        d = store.create(req)
-        threading.Thread(
-            target=agent.run,
-            args=(req, store, d.diagnosis_id),
-            kwargs={"execution": execution},
-            daemon=True,
-        ).start()
+    def _start(req: DiagnosisRequest, execution: ExecutionContext,
+               lifecycle_id: Optional[int] = None) -> dict[str, Any]:
+        # For alerts, the diagnosis row and its lifecycle link are written in one
+        # transaction (a crash must not orphan the diagnosis). The worker thread
+        # starts only after that commit.
+        d = (store.create(req) if lifecycle_id is None
+             else store.create_with_alert_link(req, lifecycle_id))
+        try:
+            threading.Thread(
+                target=agent.run,
+                args=(req, store, d.diagnosis_id),
+                kwargs={"execution": execution},
+                daemon=True,
+            ).start()
+        except BaseException:
+            # A queued row without a worker would poll forever: mark it failed so
+            # the caller can release the claim and a retry can re-run it.
+            store.update(d.diagnosis_id, status="failed", error="worker thread failed to start")
+            raise
         # Acceptance response is always "queued"; the client polls for progress.
         return {"diagnosis_id": d.diagnosis_id, "status": "queued", "model": execution.metadata}
 
@@ -182,11 +193,10 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
             return {"status": ALERT_CLOSED if closed else "resolved_noop",
                     "fingerprint": fingerprint, "closed": closed is not None}
 
-        if not alert_limiter.allow():
-            raise HTTPException(status_code=429, detail="alert storm rate limited")
-
         if alert.unresolved_target or req.resource is None:
-            # Never guess a target; a repeated unresolved alert is deduped too.
+            # Never guess a target. Dedup runs before the rate limiter: an unresolved
+            # alert starts no investigation, so it must not spend the diagnosis
+            # quota (and a storm of repeats is already collapsed by the lifecycle).
             _row, created = store.claim_active_alert_lifecycle(
                 fingerprint=fingerprint, state=ALERT_UNRESOLVED, alertname=alert.alertname,
                 labels=alert.labels, starts_at=alert.starts_at)
@@ -227,13 +237,18 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
                 return {"diagnosis_id": None, "status": "in_progress",
                         "fingerprint": fingerprint, "deduped": True}
 
+        # Only a delivery that actually starts a new investigation pays the quota;
+        # duplicates above returned early, so repeats no longer eat the budget.
+        if not alert_limiter.allow():
+            store.release_alert_lifecycle(lifecycle["id"])
+            raise HTTPException(status_code=429, detail="alert storm rate limited")
+
         try:
-            result = _start(req, execution)
+            result = _start(req, execution, lifecycle_id=lifecycle["id"])
         except Exception:
             # Never leave an empty claim behind: a retry must be able to run.
             store.release_alert_lifecycle(lifecycle["id"])
             raise
-        store.link_alert_diagnosis(lifecycle["id"], result["diagnosis_id"])
         result["fingerprint"] = fingerprint
         result["deduped"] = False
         return result
@@ -312,7 +327,9 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
                         resource_kind: Optional[str] = None, namespace: Optional[str] = None,
                         name: Optional[str] = None, uid: Optional[str] = None,
                         since: Optional[str] = None, until: Optional[str] = None,
-                        viewer_id: Optional[str] = None) -> dict[str, Any]:
+                        viewer_id: Optional[str] = None, unread: bool = False) -> dict[str, Any]:
+        if unread and viewer_id is None:
+            raise HTTPException(status_code=422, detail="unread=true requires viewer_id")
         filters = _parse_center_filters(limit, status, trigger, resource_kind, namespace,
                                         name, uid, since, until)
         fingerprint = filter_fingerprint(filters)
@@ -332,7 +349,8 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
             limit=limit, status=filters["status"], trigger=filters["trigger"],
             resource_kind=filters["resource_kind"], namespace=filters["namespace"],
             name=filters["name"], uid=filters["uid"], since=filters["since"],
-            until=filters["until"], after=after_keys, viewer_id=viewer_id)
+            until=filters["until"], after=after_keys, viewer_id=viewer_id,
+            unread_only=unread)
         next_cursor = (encode_cursor(fingerprint, ca=next_keys[0], id=next_keys[1])
                        if next_keys else None)
         return {"items": [_session_item(r) for r in rows], "next_cursor": next_cursor}
@@ -360,8 +378,13 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
                        if next_keys else None)
         return {
             "unread_count": store.count_unread_notifications(viewer_id),
-            "items": [{"diagnosis_id": r["diagnosis_id"], "status": r["status"],
-                       "unread": True} for r in rows],
+            "items": [{
+                "kind": r["kind"],
+                "id": r["ref"],
+                "diagnosis_id": r["ref"] if r["kind"] == "diagnosis" else None,
+                "status": r["status"],
+                "unread": True,
+            } for r in rows],
             "next_cursor": next_cursor,
         }
 
