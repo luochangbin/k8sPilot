@@ -189,6 +189,19 @@ describe('DiagnosisCenter', () => {
     expect(replaceSpy).toHaveBeenCalledWith({ search: '' });
   });
 
+  it('supports the unread entry point and can toggle it off', async () => {
+    currentSearch = '?unread=true';
+    render(<DiagnosisCenter />);
+    await waitFor(() => expect(listSessions).toHaveBeenCalled());
+    const call = vi.mocked(listSessions).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(call).toMatchObject({ unread: true });
+
+    fireEvent.click(screen.getByText('只看未读'));
+    const search = replaceSpy.mock.calls.at(-1)?.[0].search as string;
+    expect(search).not.toContain('unread');
+    expect(search).not.toContain('after'); // any condition change restarts paging
+  });
+
   it('shows the root cause description first, with the code as a secondary tag and a tooltip', async () => {
     const longReason = '容器内存使用超过 cgroup 限制导致 OOMKilled，并持续重启';
     vi.mocked(listSessions).mockResolvedValue({

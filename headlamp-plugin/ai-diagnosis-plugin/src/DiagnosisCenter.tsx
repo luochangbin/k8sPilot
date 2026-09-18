@@ -115,6 +115,7 @@ export default function DiagnosisCenter() {
       name: params.get('name') ?? undefined,
       uid: params.get('uid') ?? undefined,
       after: params.get('after') ?? undefined,
+      unread: params.get('unread') === 'true' ? true : undefined,
       page: Number(params.get('page') ?? '1') || 1,
       perPage: Number(params.get('perPage') ?? '0') || getTablesRowsPerPage(DEFAULT_PER_PAGE),
     }),
@@ -178,6 +179,15 @@ export default function DiagnosisCenter() {
   const clearFilters = useCallback(() => {
     historyRef.current.replace({ search: '' });
   }, []);
+
+  const toggleUnreadOnly = useCallback(() => {
+    const next = new URLSearchParams(location.search);
+    if (next.get('unread') === 'true') next.delete('unread');
+    else next.set('unread', 'true');
+    next.delete('after');
+    next.delete('page');
+    historyRef.current.replace({ search: next.toString() });
+  }, [location.search]);
 
   const load = useCallback(
     async (cursor?: string, append = false) => {
@@ -248,14 +258,31 @@ export default function DiagnosisCenter() {
   }, [filters, location.search, page, load]);
 
   useEffect(() => {
-    const timer = setInterval(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let stopped = false;
+    // Recursive scheduling reads delay.current on every tick, so a failure
+    // actually slows the next poll (a fixed interval would ignore the backoff).
+    const schedule = () => {
+      if (stopped) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(tick, Math.min(delay.current, MAX_BACKOFF_MS));
+    };
+    const tick = () => {
       // Only refresh the head page so the user's current page is not replaced.
+      if (document.visibilityState === 'visible' && !hasMorePages) {
+        void load().finally(schedule);
+      } else {
+        schedule();
+      }
+    };
+    const onVisibility = () => {
       if (document.visibilityState === 'visible' && !hasMorePages) void load();
-    }, Math.min(delay.current, MAX_BACKOFF_MS));
-    const onVisibility = () => (document.visibilityState === 'visible' ? load() : undefined);
+    };
+    schedule();
     document.addEventListener('visibilitychange', onVisibility);
     return () => {
-      clearInterval(timer);
+      stopped = true;
+      if (timer) clearTimeout(timer);
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [load, hasMorePages]);
@@ -318,6 +345,15 @@ export default function DiagnosisCenter() {
 
   const headerActions = [
     <Stack key="unread-actions" direction="row" spacing={1} alignItems="center">
+      <Tooltip title="只显示尚未读过的自动诊断；已读/人工/评测诊断会被隐藏。">
+        <Chip
+          size="small"
+          color={filters.unread ? 'primary' : 'default'}
+          variant={filters.unread ? 'filled' : 'outlined'}
+          label="只看未读"
+          onClick={toggleUnreadOnly}
+        />
+      </Tooltip>
       <Typography variant="body2" color="text.secondary">
         {`未读 ${notifications.unreadCount} 条`}
       </Typography>

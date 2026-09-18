@@ -161,6 +161,36 @@ describe('DiagnosisDetail lifecycle', () => {
     expect(vi.mocked(markRead)).toHaveBeenCalledWith('diag_A', 'viewer-1');
   });
 
+  it('renders a failed diagnosis as unfinished, not as insufficient evidence', async () => {
+    vi.mocked(getDiagnosis).mockResolvedValue({
+      ...runningDiagnosis(),
+      status: 'failed',
+      error: '目标资源已重建（当前 UID 与请求不一致），拒绝本次诊断',
+      // A failed run still carries an (empty) result object from the agent.
+      result: {
+        symptom: '',
+        evidence: [],
+        recommendations: [],
+        missing_evidence: [],
+        investigation_steps: [],
+      },
+    } as never);
+    vi.mocked(getTimeline).mockResolvedValue({
+      items: [],
+      next_after: 0,
+      has_more: false,
+      available: 'available' as const,
+      gap: false,
+    } as never);
+
+    render(<DiagnosisDetail />);
+    await waitFor(() => expect(screen.getByText(/目标资源已重建/)).toBeTruthy());
+    expect(screen.getByText(/诊断未完成，无结论/)).toBeTruthy();
+    expect(screen.getByText(/诊断失败，无证据/)).toBeTruthy();
+    expect(screen.queryByText(/证据不足，无法确定唯一根因/)).toBeNull();
+    expect(screen.queryByText(/调查进行中/)).toBeNull();
+  });
+
   it('drains remaining pages (has_more) within one refresh pass', async () => {
     let calls = 0;
     vi.mocked(getDiagnosis).mockResolvedValue(completedDiagnosis() as never);

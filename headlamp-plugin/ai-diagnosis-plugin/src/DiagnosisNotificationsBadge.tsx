@@ -13,7 +13,9 @@ export default function DiagnosisNotificationsBadge() {
   // The center route is cluster-scoped: on the home page (no cluster selected)
   // navigating would 404, so the action is disabled until a cluster is chosen.
   const cluster = Utils.getCluster();
-  const href = centerUrl();
+  // Unread is a filter, not a separate page: the badge lands on the unread view
+  // so the user can find the fresh items directly.
+  const href = centerUrl(unreadCount > 0 ? 'unread=true' : undefined);
   const badge = (
     <Badge color="error" badgeContent={unreadCount || undefined} max={99}>
       <Icon icon="mdi:stethoscope" />

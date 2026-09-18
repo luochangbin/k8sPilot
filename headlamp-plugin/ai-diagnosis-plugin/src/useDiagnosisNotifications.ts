@@ -40,7 +40,7 @@ function setState(patch: Partial<State>): void {
 }
 
 function liveMessageFor(count: number): string {
-  return count > 0 ? `${count} 个新的自动诊断` : '没有新的自动诊断';
+  return count > 0 ? `${count} 条未读的自动诊断或未解析告警` : '没有未读的自动诊断或未解析告警';
 }
 
 function schedule(): void {

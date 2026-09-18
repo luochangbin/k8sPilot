@@ -40,18 +40,19 @@ beforeEach(() => {
 
 describe('DiagnosisNotificationsBadge', () => {
   it('links to the current cluster diagnosis center and shows the count', () => {
-    mockNotifications(3, '3 个新的自动诊断');
+    mockNotifications(3, '3 条未读的自动诊断或未解析告警');
     render(<DiagnosisNotificationsBadge />);
 
     const link = screen.getByTestId('diagnosis-center-link');
-    expect(link.getAttribute('href')).toBe('/c/cluster-a/ai-diagnosis');
+    // Unread entry point: lands directly on the unread view when there is unread.
+    expect(link.getAttribute('href')).toBe('/c/cluster-a/ai-diagnosis?unread=true');
     expect(link.getAttribute('aria-label')).toBe('打开智能诊断中心');
     expect(screen.getByText('3')).toBeTruthy();
-    expect(screen.getByRole('status').textContent).toBe('3 个新的自动诊断');
+    expect(screen.getByRole('status').textContent).toBe('3 条未读的自动诊断或未解析告警');
   });
 
   it('stays navigable with zero unread', () => {
-    mockNotifications(0, '没有新的自动诊断');
+    mockNotifications(0, '没有未读的自动诊断或未解析告警');
     render(<DiagnosisNotificationsBadge />);
 
     const link = screen.getByTestId('diagnosis-center-link');
@@ -60,7 +61,7 @@ describe('DiagnosisNotificationsBadge', () => {
   });
 
   it('is disabled on the home page before a cluster is selected', () => {
-    mockNotifications(2, '2 个新的自动诊断');
+    mockNotifications(2, '2 条未读的自动诊断或未解析告警');
     vi.mocked(Utils.getCluster).mockReturnValue(null);
     render(<DiagnosisNotificationsBadge />);
 

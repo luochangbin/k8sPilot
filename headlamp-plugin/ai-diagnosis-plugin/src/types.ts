@@ -100,7 +100,10 @@ export interface CenterSessionsPage {
 }
 
 export interface NotificationItem {
-  diagnosis_id: string;
+  /** `unresolved_target` items have no diagnosis: the alert never resolved to a resource. */
+  kind: 'diagnosis' | 'unresolved_target';
+  id: string;
+  diagnosis_id: string | null;
   status: string;
   unread: boolean;
 }
@@ -156,6 +159,8 @@ export interface SessionFilters {
   since?: string;
   until?: string;
   after?: string;
+  /** Unread only (requires viewer_id); used by the app-bar unread entry point. */
+  unread?: boolean;
   /** 1-based page number (keyset pages, kept in the URL for refresh/back). */
   page?: number;
   /** Rows per page; defaults to the Headlamp table setting. */

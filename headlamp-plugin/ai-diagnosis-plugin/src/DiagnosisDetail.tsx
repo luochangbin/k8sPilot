@@ -193,12 +193,25 @@ export default function DiagnosisDetail() {
   // Poll status while running; after completion keep draining the trace for a
   // bounded window until the terminal event appears.
   useEffect(() => {
-    const timer = setInterval(() => {
-      if (document.visibilityState !== 'visible') return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let stopped = false;
+    // Recursive scheduling re-reads delayRef each tick; a fixed interval would
+    // keep hammering a failing service at the base cadence.
+    const schedule = () => {
+      if (stopped) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(tick, Math.min(delayRef.current, MAX_BACKOFF_MS));
+    };
+    const tick = () => {
+      if (document.visibilityState !== 'visible') {
+        schedule();
+        return;
+      }
       const status = statusRef.current ?? diagnosis?.status;
       if (!isTerminal(status)) {
         void refreshStatus();
         void refreshTimeline();
+        schedule();
         return;
       }
       const waitingForFinal =
@@ -212,8 +225,13 @@ export default function DiagnosisDetail() {
         // and tell the user the timeline may be incomplete.
         setTimelineIncomplete(true);
       }
-    }, Math.min(delayRef.current, MAX_BACKOFF_MS));
-    return () => clearInterval(timer);
+      schedule();
+    };
+    schedule();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [diagnosis, refreshStatus, refreshTimeline]);
 
   // Mark read only after a terminal state is rendered and the tab is visible.
@@ -300,7 +318,7 @@ export default function DiagnosisDetail() {
       <Typography variant="subtitle1" fontWeight={600}>
         结论
       </Typography>
-      {result ? (
+      {result && diagnosis.status !== 'failed' ? (
         <>
           <Typography variant="body2" sx={{ mb: 0.5 }}>
             症状：{result.symptom || '（无）'}
@@ -320,6 +338,10 @@ export default function DiagnosisDetail() {
           )}
           <Typography variant="body2">置信度：{result.confidence ?? 'unknown'}</Typography>
         </>
+      ) : diagnosis.status === 'failed' ? (
+        <Typography variant="body2" color="text.secondary">
+          诊断未完成，无结论；请查看上方错误信息与下方执行时间线。
+        </Typography>
       ) : (
         <Typography variant="body2" color="text.secondary">
           （暂无结论）
@@ -328,7 +350,12 @@ export default function DiagnosisDetail() {
 
       <Divider sx={{ my: 1.5 }} />
       <Typography variant="subtitle1" fontWeight={600}>
-        实时证据
+        关键证据
+      </Typography>
+      <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 0.5 }}>
+        {isTerminal(diagnosis.status)
+          ? '来自最终诊断结论。'
+          : '调查进行中；结论产出前请以下方执行时间线为准。'}
       </Typography>
       <List dense disablePadding>
         {(result?.evidence ?? []).map((ev, idx) => (
@@ -336,7 +363,17 @@ export default function DiagnosisDetail() {
             <ListItemText primary={ev.summary} secondary={`来源: ${ev.source}`} />
           </ListItem>
         ))}
-        {!result?.evidence?.length && <ListItemText primary="（无）" />}
+        {!result?.evidence?.length && (
+          <ListItemText
+            primary={
+              diagnosis.status === 'failed'
+                ? '（诊断失败，无证据）'
+                : result
+                ? '（无）'
+                : '（调查进行中，暂无结论）'
+            }
+          />
+        )}
       </List>
 
       <Divider sx={{ my: 1.5 }} />
@@ -355,6 +392,9 @@ export default function DiagnosisDetail() {
       <Divider sx={{ my: 1.5 }} />
       <Typography variant="subtitle1" fontWeight={600}>
         调查过程
+      </Typography>
+      <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 0.5 }}>
+        仅列出已成功返回结果的工具调用；失败的调用请见下方执行时间线。
       </Typography>
       {result?.investigation_steps?.length ? (
         <InvestigationSteps steps={result.investigation_steps} />

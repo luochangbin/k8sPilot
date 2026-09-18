@@ -266,7 +266,7 @@ function EvidenceBlock({ evidence }: { evidence: Evidence[] }) {
     >
       <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
         <Typography variant="subtitle1" fontWeight={600}>
-          实时证据
+          关键证据
         </Typography>
         <Chip label="实时" color="primary" size="small" variant="outlined" />
       </Stack>
