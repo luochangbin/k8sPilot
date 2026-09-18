@@ -138,13 +138,52 @@ GET  /api/v1/diagnoses/{id}                               (旧接口，仅增 nu
 
 教训（供后续插件开发）：插件只能用 SDK 明确外部化的子路径；引入其它子路径前先查 `node_modules/@kinvolk/headlamp-plugin/config/vite.config.mjs` 的 `externalModules` 白名单，否则运行时为 undefined。
 
+## 审阅修正（2026-09-18，第 11 轮：12 条）
+
+按外部审阅逐条处理：11 条属实已改，第 12 条为行为分析（不改代码）。
+
+1. **告警上下文未进入调查**（属实）：`prompts.user_message` 现接收 `AlertContext`，把 alertname/status/starts_at/fingerprint/labels/annotations 与 **connector 触发快照**（有界 4000 字符，标注“仅初始线索、非工具证据，需用工具核实”）注入首条消息，并给出 starts_at 时间基准指引（query_metrics/query_logs 的窗口围绕该时刻）；manual 保持“人工触发”且不含告警块。
+2. **限流早于去重**（属实）：`_handle_alert` 调整为 resolved → claim/去重 → 仅在**真正要新建诊断**时校验 limiter；429 时 `release_alert_lifecycle` 回滚空 claim。unresolved 告警不消耗诊断额度（重复投递本就被生命周期折叠）。
+3. **同指纹跨实例被误去重**（属实）：claim 时比较 `starts_at`，同指纹但新 `starts_at` 视为新实例——归档旧生命周期并新建，避免“丢失 resolved 后不再诊断”；迟到的旧实例 resolved 不关闭新实例（补回归测试）。
+4. **viewer 回退 id 非 UUID**（属实）：前端统一产出规范 UUIDv4（`randomUUID` → `getRandomValues` → 末位模板），并**替换已存的非规范值**；后端 `validate_viewer_id` 收紧为规范 UUIDv4（canonical 文本且 version=4）。
+5. **unresolved 告警不可见**（属实）：通知 feed 并入 `state=unresolved_target AND diagnosis_id IS NULL` 的告警（`kind=unresolved_target`、`diagnosis_id=null`），计入未读数；resolve/close 后自动消失。
+6. **新浏览器把历史全标未读**（属实）：新增 `viewer_state(viewer_id, first_seen_at)` 基线，未读口径加 `created_at > 基线`；新 viewer 首次打开只看到“此后新产生的”未读。
+7. **新完成项难定位**（属实）：`sessions?unread=true`（需 viewer_id，否则 422）+ Center「只看未读」开关（写入 URL）；app-bar 徽标有未读时直接导航到 `?unread=true`。
+8. **退避未生效**（属实）：Center/Detail 由固定 `setInterval` 改为**递归 `setTimeout`**，每次 tick 重读 delay，失败才真正放大间隔（上限 30s）。
+9. **失败工具调用被显示为成功步骤**（属实）：仅**成功返回**的工具调用进入 `investigation_steps`；失败仍完整记录在 trace/执行时间线。详情页「调查过程」加说明文案。
+10. **「实时证据」在调查中为空易误解**（属实）：更名「关键证据」并说明“来自最终结论，进行中以执行时间线为准”，空态区分进行中/无。
+11. **创建诊断与关联生命周期非原子**（属实）：新增 `store.create_with_alert_link`（单事务 INSERT+UPDATE，UPDATE 影响行数≠1 则回滚）后再启动线程；线程启动失败将诊断标记 `failed`（不再静默 queued），并保留关联使重复投递可见地去重。`_start` 支持 `lifecycle_id`。
+12. **Connector 批量部分失败会整批重试**（不改代码）：`Summary{accepted/unresolved/failed/rate_limited,results}` 已是现成可观测面，`RetryableStatus()` 仅全 429 返回 429、部分失败返回 502。第 2 条修完后，重试中**已完成**的告警在 Agent 侧是零成本 dedup。未加 Prometheus 指标：当前单实例、响应体即汇总，待确有跨进程告警风暴观测需求再引入。
+
+13. **失败态被当作“证据不足/进行中”渲染**（联调时发现）：Agent 在校验失败（如「目标资源已重建」）时会写入一个**空 result**，详情页据此显示“证据不足，无法确定唯一根因 / 置信度 unknown”，第 10 轮的新文案还会说“调查进行中”。现在 `status=failed` 时结论区改为“诊断未完成，无结论；请查看上方错误信息与下方执行时间线”，关键证据区文案与空态按状态区分（失败→“（诊断失败，无证据）”，进行中→“调查进行中…”，完成→“来自最终诊断结论”）。
+
+真机验证（重启 Agent 后，connector Pod `10.244.1.4:8080`）：
+
+```text
+namespaces=aiops-eval, loki-demo            # 已排除评测命名空间
+fresh viewer unread=0                        # 第 6 条基线
+AM 触发 e2e-review-1 -> diag_b0d166cbb178 completed
+  alert={fingerprint:36daf397f4768786, starts_at:2026-09-18T02:10:59Z, state:open}
+  symptom 明确引用“触发 PodCrashLooping 告警”   # 告警上下文确实进入 prompt
+firing starts=A  -> deduped=False
+firing starts=A  -> deduped=True  same_id
+firing starts=B  -> deduped=False new_id      # 第 3 条
+late resolved A  -> resolved_noop closed=False
+unresolved       -> first_deduped=False, repeat_deduped=True
+notifications: unresolved 后 unread=1 kinds=unresolved_target，resolve 后 unread=0
+```
+
+测试：后端 **131 passed**（新增：告警上下文进 prompt / manual 无告警块 / 失败工具不计步骤 / 去重不吃限流额度 / 新 starts_at 新生命周期 / 迟到 resolved / 线程启动失败 / 新 viewer 基线 / unresolved 通知 / unread 过滤）；插件 **37 passed**、`tsc` 0、`eslint --max-warnings 0` 0、build 成功并安装。
+
+另修运维脚本一个真实缺陷：`restart-agent.ps1` 原先**先杀旧 Agent 再解析 Connector IP**，集群不可达时会把服务留在 down（本次 VM 掉线即触发）。现改为**先解析**并支持 `-ConnectorBaseUrl` 用已知地址启动，解析失败不再影响运行中的服务。
+
 ## 验证记录
 
 自动化（本机）：
 
-- `agent-service`：**77 passed**（含 `tests/test_center.py` 9 项：顺序/过滤/UID、unread(null/viewer)、422 矩阵、游标绑定过滤集、alert 投影、未读计数口径、read 幂等/409/404/422/viewer 隔离、unresolved、timeline 投影/gap/半行/分页/越界/pending/unavailable）。
+- `agent-service`：**92 passed**（含 `tests/test_center.py`：顺序/过滤/UID、unread(null/viewer)、422 矩阵、游标绑定过滤集、alert 投影、未读计数口径、read 幂等/409/404/422/viewer 隔离、unresolved、timeline 投影/gap/半行/分页/越界/pending/unavailable；第 11 轮新增 viewer 基线、unresolved 通知、unread 过滤、alert 上下文进 prompt、失败工具不计步骤、去重不吃限额、新 starts_at 新生命周期、线程启动失败）。
 - `eval`：**39 passed**（无回归）。
-- 插件：`tsc --noEmit` 0 错误、`eslint --max-warnings 0` 0 问题、`npm run build` 成功并安装到 `%APPDATA%\Headlamp\Config\plugins\ai-diagnosis-plugin\`、`vitest run` **7 passed**（viewer 身份/回退/修订订阅、API URL 构建与错误映射）。
+- 插件：`tsc --noEmit` 0 错误、`eslint --max-warnings 0` 0 问题、`npm run build` 成功并安装到 `%APPDATA%\Headlamp\Config\plugins\ai-diagnosis-plugin\`、`vitest run` **37 passed**（viewer 身份/回退/修订订阅、API URL 构建与错误映射、Center 筛选与未读入口、徽标未读入口、详情页步骤）。
 
 真实 API 联调（Agent 8000 + 既有 Trace，viewer 随机 UUID）：
 
