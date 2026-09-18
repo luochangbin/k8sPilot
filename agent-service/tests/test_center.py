@@ -467,3 +467,38 @@ def test_sessions_unread_filter_returns_only_unread(tmp_path):
         f"/api/v1/diagnosis-center/sessions?viewer_id={VIEWER}&unread=true").json()
     assert [item["diagnosis_id"] for item in body["items"]] == [unread.diagnosis_id]
     assert client.get("/api/v1/diagnosis-center/sessions?unread=true").status_code == 422
+
+
+def test_unread_view_orders_by_completion_not_creation(tmp_path):
+    """A diagnosis created early but finished late must not be buried behind
+    newer, already-read rows in the unread entry point."""
+    client, store, _ = make_center(tmp_path)
+    _prime(store, VIEWER)
+    older = _seed_diagnosis(store, trigger=Trigger.alert, status="queued", result=None,
+                            name="old", uid="u1")
+    newer = _seed_diagnosis(store, trigger=Trigger.alert, result=_result(),
+                            name="new", uid="u2")
+    assert client.post(f"/api/v1/diagnosis-center/sessions/{newer.diagnosis_id}/read",
+                       json={"viewer_id": VIEWER}).status_code == 200
+    # The older one finishes last, after the newer one was already read.
+    store.update(older.diagnosis_id, status="completed", result=_result())
+
+    page = client.get(f"/api/v1/diagnosis-center/sessions?viewer_id={VIEWER}&unread=true").json()
+    assert [item["diagnosis_id"] for item in page["items"]] == [older.diagnosis_id]
+
+    # Keyset pagination follows the same ordering (updated_at, id).
+    both = _seed_diagnosis(store, trigger=Trigger.alert, result=_result(), name="newer2", uid="u3")
+    first = client.get(
+        f"/api/v1/diagnosis-center/sessions?viewer_id={VIEWER}&unread=true&limit=1").json()
+    assert [item["diagnosis_id"] for item in first["items"]] == [both.diagnosis_id]
+    second = client.get(
+        "/api/v1/diagnosis-center/sessions"
+        f"?viewer_id={VIEWER}&unread=true&limit=1&after={first['next_cursor']}").json()
+    assert [item["diagnosis_id"] for item in second["items"]] == [older.diagnosis_id]
+
+    # The unread view sorts by updated_at, so its cursor must not be accepted by
+    # the default (created_at) list: the fingerprint covers the unread flag.
+    cross = client.get(
+        "/api/v1/diagnosis-center/sessions"
+        f"?viewer_id={VIEWER}&limit=1&after={first['next_cursor']}")
+    assert cross.status_code == 422

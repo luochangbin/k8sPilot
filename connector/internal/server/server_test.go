@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"k8spilot/connector/internal/config"
+	"k8spilot/connector/internal/datasource"
 	"k8spilot/connector/internal/tools"
 )
 
@@ -122,3 +124,207 @@ func TestUnsupportedKindReturns400(t *testing.T) {
 
 // ensure context import stays used across builds
 var _ = context.Background
+
+func testServerWithDataSources(promURL, lokiURL string) *httptest.Server {
+	cfg := &config.Config{EventLimit: 50, EventSince: time.Hour, LogTail: 300, LogLimitKB: 64,
+		DataSourceTimeout: 5 * time.Second, MetricsMaxSeries: 5}
+	t := tools.New(fake.NewSimpleClientset(), cfg)
+	if promURL != "" {
+		t.Prom = &datasource.PrometheusClient{BaseURL: promURL}
+	}
+	if lokiURL != "" {
+		t.Loki = &datasource.LokiClient{BaseURL: lokiURL}
+	}
+	return httptest.NewServer(New(cfg, t).Handler())
+}
+
+func TestQueryMetricsHandlerForwardsAlertTimeToPrometheus(t *testing.T) {
+	var starts, ends []string
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		starts = append(starts, r.URL.Query().Get("start"))
+		ends = append(ends, r.URL.Query().Get("end"))
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[
+			{"metric":{"namespace":"ns","pod":"p"},"values":[[1700000000,"1.0"]]}]}}`))
+	}))
+	defer prom.Close()
+	s := testServerWithDataSources(prom.URL, "")
+	defer s.Close()
+
+	anchor := time.Now().UTC().Add(-3 * time.Minute).Truncate(time.Second)
+	resp := do(t, s, "POST", "/tools/query_metrics", map[string]any{
+		"target":        map[string]any{"kind": "Pod", "namespace": "ns", "name": "p"},
+		"metric":        "memory",
+		"range_minutes": 15,
+		"alert_time":    anchor.Format(time.RFC3339),
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var out struct {
+		Available    bool   `json:"available"`
+		RangeMinutes int    `json:"range_minutes"`
+		WindowAnchor string `json:"window_anchor"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Available || out.WindowAnchor != anchor.Format(time.RFC3339) {
+		t.Fatalf("unexpected response: %+v", out)
+	}
+	if len(starts) != 1 || len(ends) != 1 {
+		t.Fatalf("expected one prometheus call, got start=%v end=%v", starts, ends)
+	}
+	end, _ := strconv.ParseInt(ends[0], 10, 64)
+	start, _ := strconv.ParseInt(starts[0], 10, 64)
+	if end != anchor.Unix() {
+		t.Fatalf("prometheus end = %d, want anchor %d", end, anchor.Unix())
+	}
+	if end-start != 15*60 {
+		t.Fatalf("prometheus span = %ds, want 15m", end-start)
+	}
+}
+
+func TestQueryMetricsHandlerRejectsBadAlertTimeWithoutCallingPrometheus(t *testing.T) {
+	calls := 0
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+	}))
+	defer prom.Close()
+	s := testServerWithDataSources(prom.URL, "")
+	defer s.Close()
+
+	resp := do(t, s, "POST", "/tools/query_metrics", map[string]any{
+		"target":     map[string]any{"kind": "Pod", "namespace": "ns", "name": "p"},
+		"metric":     "memory",
+		"alert_time": "2026-09-18T12:00:00", // no timezone offset
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("a bad anchor must degrade, not error; status = %d", resp.StatusCode)
+	}
+	var out struct {
+		Available      bool   `json:"available"`
+		DegradedReason string `json:"degraded_reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Available || out.DegradedReason == "" {
+		t.Fatalf("expected explicit degradation, got %+v", out)
+	}
+	if calls != 0 {
+		t.Fatalf("must not query prometheus with an unverifiable anchor, calls=%d", calls)
+	}
+}
+
+func TestQueryMetricsHandlerRejectsAlertRunWithoutAnchor(t *testing.T) {
+	calls := 0
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+	}))
+	defer prom.Close()
+	s := testServerWithDataSources(prom.URL, "")
+	defer s.Close()
+
+	// alert_expected without alert_time: must degrade, never query now-relative.
+	resp := do(t, s, "POST", "/tools/query_metrics", map[string]any{
+		"target":         map[string]any{"kind": "Pod", "namespace": "ns", "name": "p"},
+		"metric":         "memory",
+		"alert_expected": true,
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var out struct {
+		Available      bool   `json:"available"`
+		DegradedReason string `json:"degraded_reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Available || out.DegradedReason == "" {
+		t.Fatalf("expected explicit degradation, got %+v", out)
+	}
+	if calls != 0 {
+		t.Fatalf("must not query prometheus, calls=%d", calls)
+	}
+}
+
+func TestQueryMetricsHandlerRejectsOutOfReachAlertWindow(t *testing.T) {
+	calls := 0
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+	}))
+	defer prom.Close()
+	s := testServerWithDataSources(prom.URL, "")
+	defer s.Close()
+
+	// A 29m-old anchor with the 30m default window reaches 59m back.
+	anchor := time.Now().UTC().Add(-29 * time.Minute).Truncate(time.Second)
+	resp := do(t, s, "POST", "/tools/query_metrics", map[string]any{
+		"target":         map[string]any{"kind": "Pod", "namespace": "ns", "name": "p"},
+		"metric":         "memory",
+		"range_minutes":  30,
+		"alert_time":     anchor.Format(time.RFC3339),
+		"alert_expected": true,
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var out struct {
+		Available      bool   `json:"available"`
+		DegradedReason string `json:"degraded_reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Available || out.DegradedReason == "" {
+		t.Fatalf("expected explicit degradation, got %+v", out)
+	}
+	if calls != 0 {
+		t.Fatalf("must not query prometheus, calls=%d", calls)
+	}
+}
+
+func TestQueryMetricsHandlerAcceptsInRangeAlertWindow(t *testing.T) {
+	var ends []string
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ends = append(ends, r.URL.Query().Get("end"))
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[
+			{"metric":{"namespace":"ns","pod":"p"},"values":[[1700000000,"1.0"]]}]}}`))
+	}))
+	defer prom.Close()
+	s := testServerWithDataSources(prom.URL, "")
+	defer s.Close()
+
+	anchor := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second)
+	resp := do(t, s, "POST", "/tools/query_metrics", map[string]any{
+		"target":         map[string]any{"kind": "Pod", "namespace": "ns", "name": "p"},
+		"metric":         "memory",
+		"range_minutes":  10,
+		"alert_time":     anchor.Format(time.RFC3339),
+		"alert_expected": true,
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var out struct {
+		Available bool `json:"available"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Available {
+		t.Fatal("an in-range alert window must succeed")
+	}
+	if len(ends) != 1 || ends[0] != strconv.FormatInt(anchor.Unix(), 10) {
+		t.Fatalf("unexpected prometheus end: %v (anchor %d)", ends, anchor.Unix())
+	}
+}

@@ -18,6 +18,12 @@ type MetricsParams struct {
 	Name         string
 	Metric       string // memory | cpu
 	RangeMinutes int
+	// AlertTime is the trusted Alertmanager starts_at (RFC3339); empty for
+	// manual runs (now-relative window).
+	AlertTime string
+	// AlertExpected is true for alert-triggered runs: an empty/invalid
+	// AlertTime must then degrade explicitly instead of becoming now-relative.
+	AlertExpected bool
 }
 
 // MetricsResponse is the normalized output of query_metrics.
@@ -28,6 +34,9 @@ type MetricsResponse struct {
 	DegradedReason string                  `json:"degraded_reason,omitempty"`
 	Metric         string                  `json:"metric"`
 	RangeMinutes   int                     `json:"range_minutes"`
+	WindowStart    string                  `json:"window_start,omitempty"`
+	WindowEnd      string                  `json:"window_end,omitempty"`
+	WindowAnchor   string                  `json:"window_anchor,omitempty"`
 	Summary        map[string]any          `json:"summary"`
 	Series         []datasource.TimeSeries `json:"series"`
 	Truncated      bool                    `json:"truncated"`
@@ -44,7 +53,7 @@ func (t *Tools) QueryMetrics(ctx context.Context, target Target, params MetricsP
 		RangeMinutes: params.RangeMinutes,
 	}
 	if params.RangeMinutes <= 0 {
-		params.RangeMinutes = 30
+		params.RangeMinutes = DefaultRangeMinutes
 	}
 	resp.RangeMinutes = params.RangeMinutes
 
@@ -52,6 +61,18 @@ func (t *Tools) QueryMetrics(ctx context.Context, target Target, params MetricsP
 		resp.DegradedReason = "prometheus not configured on connector"
 		return resp, nil
 	}
+
+	window, degraded := resolveWindow(params.AlertTime, params.RangeMinutes, time.Now(),
+		params.AlertExpected)
+	if degraded != "" {
+		// Missing/invalid/future/out-of-reach anchor: fail closed. Never silently query "now".
+		resp.DegradedReason = degraded
+		return resp, nil
+	}
+	resp.RangeMinutes = window.Minutes
+	resp.WindowStart = window.Start.Format(time.RFC3339)
+	resp.WindowEnd = window.End.Format(time.RFC3339)
+	resp.WindowAnchor = window.Anchor
 
 	nodeIP := ""
 	if target.Kind == "Node" {
@@ -68,9 +89,8 @@ func (t *Tools) QueryMetrics(ctx context.Context, target Target, params MetricsP
 		return resp, nil
 	}
 
-	end := time.Now().UTC()
-	start := end.Add(-time.Duration(params.RangeMinutes) * time.Minute)
-	step := time.Duration(params.RangeMinutes) * time.Minute / 60
+	start, end := window.Start, window.End
+	step := time.Duration(window.Minutes) * time.Minute / 60
 	if step < 15*time.Second {
 		step = 15 * time.Second
 	}

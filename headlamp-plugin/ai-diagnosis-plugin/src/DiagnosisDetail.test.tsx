@@ -189,6 +189,10 @@ describe('DiagnosisDetail lifecycle', () => {
     expect(screen.getByText(/诊断失败，无证据/)).toBeTruthy();
     expect(screen.queryByText(/证据不足，无法确定唯一根因/)).toBeNull();
     expect(screen.queryByText(/调查进行中/)).toBeNull();
+    // Failed tool calls never appear as green steps (backend only records
+    // successes; the UI must not render a check for an empty step list).
+    expect(screen.queryAllByTestId('step-check')).toHaveLength(0);
+    expect(screen.getByText(/失败的调用请见下方执行时间线/)).toBeTruthy();
   });
 
   it('drains remaining pages (has_more) within one refresh pass', async () => {

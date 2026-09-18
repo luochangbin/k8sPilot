@@ -23,6 +23,54 @@ SUPPORTED_KINDS = [
     "Namespace",
 ]
 
+# Single, deterministic time-window definition shared with the connector
+# (see docs/diagnosis-center.md "告警时间窗"):
+#   * window length W = min(requested, MAX_RANGE_MINUTES) — the connector's
+#     existing default, never increased; no arbitrary start/end is accepted.
+#   * manual run:  [now - W, now]
+#   * alert run:   [starts_at - W, starts_at]  (anchor injected by code below,
+#     never taken from the model).
+MAX_RANGE_MINUTES = 30
+
+# Tools whose time window must be anchored to the trusted alert timestamp.
+ALERT_ANCHOR_TOOLS = frozenset({"query_metrics", "query_logs"})
+
+# Tools that accept a range_minutes window (see MAX_RANGE_MINUTES).
+RANGE_TOOLS = ALERT_ANCHOR_TOOLS
+
+
+def apply_alert_anchor(name: str, args: dict[str, Any],
+                       alert: Any = None) -> dict[str, Any]:
+    """Inject the alert time anchor and bound the window (deterministic).
+
+    The model's tool arguments are untrusted: any `alert_time`/`alert_expected`
+    it emits is dropped, and for alert runs the anchor is set from the trusted
+    `AlertContext.starts_at`. Manual runs carry no anchor at all (now-relative
+    semantics are preserved in the connector).
+
+    An alert run whose alert context has no usable `starts_at` keeps
+    `alert_expected=True` with no `alert_time`: the connector then fails closed
+    with an explicit degraded result instead of silently answering a
+    now-relative query. `range_minutes` is clamped to MAX_RANGE_MINUTES so a
+    model cannot widen the window.
+    """
+    if name not in RANGE_TOOLS:
+        return args
+    out = dict(args)
+    out.pop("alert_time", None)
+    out.pop("alert_expected", None)
+    starts_at = getattr(alert, "starts_at", None) if alert is not None else None
+    if alert is not None:
+        out["alert_expected"] = True
+        if starts_at:
+            out["alert_time"] = starts_at
+    requested = out.get("range_minutes")
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested <= 0:
+        out["range_minutes"] = MAX_RANGE_MINUTES
+    else:
+        out["range_minutes"] = min(requested, MAX_RANGE_MINUTES)
+    return out
+
 
 def _resource_param() -> dict[str, Any]:
     return {
@@ -121,7 +169,10 @@ def tool_definitions(capabilities: dict[str, Any] | None = None,
                 "description": (
                     "Query Prometheus metrics (memory or cpu) for the target Pod or Node over a "
                     "recent window. Use to confirm resource-exhaustion hypotheses (OOM, CPU saturation). "
-                    "Returns a bounded summary (latest/max/avg) plus samples; unavailable data degrades explicitly."
+                    "Returns a bounded summary (latest/max/avg) plus samples; unavailable data degrades explicitly. "
+                    "Time window: for auto-triggered alert diagnoses the server anchors the window to the "
+                    "alert's starts_at automatically (you cannot and need not pass a timestamp); for manual "
+                    "diagnoses it is relative to now. range_minutes only sets the window length (max 30)."
                 ),
                 "parameters": {
                     "type": "object",
@@ -130,7 +181,7 @@ def tool_definitions(capabilities: dict[str, Any] | None = None,
                         "namespace": {"type": "string", "description": "Namespace of the Pod (empty for Node)."},
                         "name": {"type": "string"},
                         "metric": {"type": "string", "enum": ["memory", "cpu"]},
-                        "range_minutes": {"type": "integer", "description": "Lookback window in minutes (default 30)."},
+                        "range_minutes": {"type": "integer", "description": "Window length in minutes (default 30, max 30). The end of the window is set by the server (alert time or now)."},
                     },
                     "required": ["kind", "name", "metric"],
                 },
@@ -145,14 +196,17 @@ def tool_definitions(capabilities: dict[str, Any] | None = None,
                 "description": (
                     "Query aggregated container logs for a Pod from Loki over a recent window. "
                     "Returns error-line counts, top patterns and a bounded evidence list. "
-                    "Complement the kubernetes.logs tool when deeper/historical log evidence is needed."
+                    "Complement the kubernetes.logs tool when deeper/historical log evidence is needed. "
+                    "Time window: for auto-triggered alert diagnoses the server anchors the window to the "
+                    "alert's starts_at automatically (you cannot and need not pass a timestamp); for manual "
+                    "diagnoses it is relative to now. range_minutes only sets the window length (max 30)."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "namespace": {"type": "string"},
                         "name": {"type": "string", "description": "Pod name."},
-                        "range_minutes": {"type": "integer", "description": "Lookback window in minutes (default 30)."},
+                        "range_minutes": {"type": "integer", "description": "Window length in minutes (default 30, max 30). The end of the window is set by the server (alert time or now)."},
                         "filter": {"type": "string", "description": "Optional substring filter, e.g. 'error'."},
                         "max_lines": {"type": "integer", "description": "Max lines (default 200)."},
                     },
@@ -348,6 +402,8 @@ def execute_tool(connector: ConnectorClient, name: str, args: dict[str, Any]) ->
                 _target(),
                 metric=args.get("metric"),
                 range_minutes=args.get("range_minutes"),
+                alert_time=args.get("alert_time"),
+                alert_expected=args.get("alert_expected"),
             ),
             ensure_ascii=False,
         )
@@ -358,6 +414,8 @@ def execute_tool(connector: ConnectorClient, name: str, args: dict[str, Any]) ->
                 range_minutes=args.get("range_minutes"),
                 filter=args.get("filter"),
                 max_lines=args.get("max_lines"),
+                alert_time=args.get("alert_time"),
+                alert_expected=args.get("alert_expected"),
             ),
             ensure_ascii=False,
         )

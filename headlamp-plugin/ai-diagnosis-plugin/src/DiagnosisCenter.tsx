@@ -478,7 +478,9 @@ export default function DiagnosisCenter() {
 
       {!loading && items.length === 0 && (
         <Typography variant="body2" color="text.secondary">
-          暂无诊断记录。
+          {filters.unread
+            ? '暂无未读自动诊断；未解析目标的告警见下方独立区块。'
+            : '暂无诊断记录。'}
         </Typography>
       )}
 
@@ -524,6 +526,12 @@ export default function DiagnosisCenter() {
         labelRowsPerPage="每页行数："
         labelDisplayedRows={({ from, to }) => `${from}-${to}`}
       />
+
+      {filters.unread && (
+        <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
+          未读列表只包含自动诊断；未解析目标的告警不在此列表，见下方「未解析目标的告警」。
+        </Typography>
+      )}
 
       <Divider sx={{ my: 2 }} />
       <Typography variant="subtitle1" fontWeight={600}>

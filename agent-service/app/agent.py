@@ -25,7 +25,7 @@ from .models import DIAGNOSABLE_KINDS, DiagnosisRequest, DiagnosisResult, Eviden
 from .prompts import SYSTEM_PROMPT, user_message
 from .root_causes import is_valid_root_cause_code
 from .store import SessionStore
-from .tools import execute_tool, tool_definitions
+from .tools import apply_alert_anchor, execute_tool, tool_definitions
 from .trace import (
     AGENT_PLANNING,
     CONNECTOR,
@@ -291,6 +291,9 @@ class Agent:
                     return
 
                 args = self._inject_target_uid(name, args, req.resource)
+                # Alert runs get the trusted starts_at anchor (and a bounded
+                # window); the model's own time arguments are ignored.
+                args = apply_alert_anchor(name, args, req.alert)
                 t0 = time.time()
                 tool_err: Optional[str] = None
                 fail_layer: Optional[str] = None

@@ -195,6 +195,8 @@ describe('DiagnosisCenter', () => {
     await waitFor(() => expect(listSessions).toHaveBeenCalled());
     const call = vi.mocked(listSessions).mock.calls.at(-1)?.[0] as Record<string, unknown>;
     expect(call).toMatchObject({ unread: true });
+    // The unread view is diagnoses-only; unresolved alerts stay in their block.
+    expect(screen.getByText(/未读列表只包含自动诊断/)).toBeTruthy();
 
     fireEvent.click(screen.getByText('只看未读'));
     const search = replaceSpy.mock.calls.at(-1)?.[0].search as string;

@@ -15,18 +15,27 @@ type LokiLogsParams struct {
 	RangeMinutes int
 	MaxLines     int
 	Filter       string // optional substring (e.g. "error")
+	// AlertTime is the trusted Alertmanager starts_at (RFC3339); empty for
+	// manual runs (now-relative window). Shares resolveWindow with metrics.
+	AlertTime string
+	// AlertExpected is true for alert-triggered runs: an empty/invalid
+	// AlertTime must then degrade explicitly instead of becoming now-relative.
+	AlertExpected bool
 }
 
 // LokiLogsResponse is a bounded, summarized log view (design §12).
 type LokiLogsResponse struct {
-	Target         Target            `json:"target"`
-	Capability     string            `json:"capability"`
-	Available      bool              `json:"available"`
-	DegradedReason string            `json:"degraded_reason,omitempty"`
-	RangeMinutes   int               `json:"range_minutes"`
-	Summary        map[string]any    `json:"summary"`
-	Evidence       []string          `json:"evidence"`
-	Truncated      bool              `json:"truncated"`
+	Target         Target         `json:"target"`
+	Capability     string         `json:"capability"`
+	Available      bool           `json:"available"`
+	DegradedReason string         `json:"degraded_reason,omitempty"`
+	RangeMinutes   int            `json:"range_minutes"`
+	WindowStart    string         `json:"window_start,omitempty"`
+	WindowEnd      string         `json:"window_end,omitempty"`
+	WindowAnchor   string         `json:"window_anchor,omitempty"`
+	Summary        map[string]any `json:"summary"`
+	Evidence       []string       `json:"evidence"`
+	Truncated      bool           `json:"truncated"`
 }
 
 // QueryLogs fetches pod logs from Loki with cardinality limits and error-line
@@ -40,7 +49,7 @@ func (t *Tools) QueryLogs(ctx context.Context, target Target, params LokiLogsPar
 		Evidence:     []string{},
 	}
 	if params.RangeMinutes <= 0 {
-		params.RangeMinutes = 30
+		params.RangeMinutes = DefaultRangeMinutes
 	}
 	resp.RangeMinutes = params.RangeMinutes
 	if params.MaxLines <= 0 {
@@ -55,13 +64,25 @@ func (t *Tools) QueryLogs(ctx context.Context, target Target, params LokiLogsPar
 		return resp, nil
 	}
 
+	// Same window definition as query_metrics (see timewindow.go).
+	window, degraded := resolveWindow(params.AlertTime, params.RangeMinutes, time.Now(),
+		params.AlertExpected)
+	if degraded != "" {
+		// Missing/invalid/future/out-of-reach anchor: fail closed. Never silently query "now".
+		resp.DegradedReason = degraded
+		return resp, nil
+	}
+	resp.RangeMinutes = window.Minutes
+	resp.WindowStart = window.Start.Format(time.RFC3339)
+	resp.WindowEnd = window.End.Format(time.RFC3339)
+	resp.WindowAnchor = window.Anchor
+
 	query := fmt.Sprintf(`{namespace=%q, pod=%q}`, target.Namespace, target.Name)
 	if f := strings.TrimSpace(params.Filter); f != "" {
 		query += fmt.Sprintf(` |= %q`, f)
 	}
 
-	end := time.Now().UTC()
-	start := end.Add(-time.Duration(params.RangeMinutes) * time.Minute)
+	start, end := window.Start, window.End
 	ctx, cancel := context.WithTimeout(ctx, t.Cfg.DataSourceTimeout)
 	defer cancel()
 	entries, err := t.Loki.QueryRange(ctx, query, start, end, params.MaxLines)

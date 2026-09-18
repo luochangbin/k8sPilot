@@ -56,16 +56,26 @@ class ConnectorClient:
         return self._request("POST", "/tools/logs", payload)
 
     def query_metrics(self, target: dict[str, Any], *, metric: Optional[str] = None,
-                      range_minutes: Optional[int] = None) -> dict[str, Any]:
+                      range_minutes: Optional[int] = None,
+                      alert_time: Optional[str] = None,
+                      alert_expected: Optional[bool] = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"target": target}
         if metric:
             payload["metric"] = metric
         if range_minutes is not None:
             payload["range_minutes"] = range_minutes
+        if alert_time:
+            # Trusted anchor injected by the agent (never the model's value).
+            payload["alert_time"] = alert_time
+        if alert_expected:
+            # Alert run: a missing anchor must degrade, not become now-relative.
+            payload["alert_expected"] = True
         return self._request("POST", "/tools/query_metrics", payload)
 
     def query_logs(self, target: dict[str, Any], *, range_minutes: Optional[int] = None,
-                   filter: Optional[str] = None, max_lines: Optional[int] = None) -> dict[str, Any]:
+                   filter: Optional[str] = None, max_lines: Optional[int] = None,
+                   alert_time: Optional[str] = None,
+                   alert_expected: Optional[bool] = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"target": target}
         if range_minutes is not None:
             payload["range_minutes"] = range_minutes
@@ -73,6 +83,10 @@ class ConnectorClient:
             payload["filter"] = filter
         if max_lines is not None:
             payload["max_lines"] = max_lines
+        if alert_time:
+            payload["alert_time"] = alert_time
+        if alert_expected:
+            payload["alert_expected"] = True
         return self._request("POST", "/tools/query_logs", payload)
 
     def _request(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:

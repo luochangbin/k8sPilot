@@ -72,6 +72,12 @@ type toolRequest struct {
 	// query_metrics
 	Metric       string `json:"metric,omitempty"`
 	RangeMinutes *int   `json:"range_minutes,omitempty"`
+	// AlertTime is the trusted alert anchor (RFC3339) injected by the Agent for
+	// alert-triggered runs; absent for manual runs (now-relative window).
+	AlertTime string `json:"alert_time,omitempty"`
+	// AlertExpected marks alert-triggered runs whose anchor is mandatory: an
+	// empty AlertTime then degrades explicitly instead of falling back to now.
+	AlertExpected bool `json:"alert_expected,omitempty"`
 
 	// query_logs
 	Filter   string `json:"filter,omitempty"`
@@ -171,10 +177,12 @@ func (s *Server) handleQueryMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params := tools.MetricsParams{
-		Kind:      req.Target.Kind,
-		Namespace: req.Target.Namespace,
-		Name:      req.Target.Name,
-		Metric:    req.Metric,
+		Kind:          req.Target.Kind,
+		Namespace:     req.Target.Namespace,
+		Name:          req.Target.Name,
+		Metric:        req.Metric,
+		AlertTime:     req.AlertTime,
+		AlertExpected: req.AlertExpected,
 	}
 	if req.RangeMinutes != nil {
 		params.RangeMinutes = *req.RangeMinutes
@@ -193,9 +201,11 @@ func (s *Server) handleQueryLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params := tools.LokiLogsParams{
-		Namespace:    req.Target.Namespace,
-		Pod:          req.Target.Name,
-		Filter:       req.Filter,
+		Namespace:     req.Target.Namespace,
+		Pod:           req.Target.Name,
+		Filter:        req.Filter,
+		AlertTime:     req.AlertTime,
+		AlertExpected: req.AlertExpected,
 	}
 	if req.RangeMinutes != nil {
 		params.RangeMinutes = *req.RangeMinutes

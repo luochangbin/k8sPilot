@@ -386,7 +386,13 @@ class SessionStore:
                       viewer_id: Optional[str] = None,
                       unread_only: bool = False
                       ) -> tuple[list[dict[str, Any]], Optional[tuple[str, str]]]:
-        """Keyset page over (created_at, diagnosis_id) DESC with filters."""
+        """Keyset page over (sort_ts, diagnosis_id) DESC with filters.
+
+        Default ordering is by creation time. The unread view sorts by
+        `updated_at` instead, so a diagnosis that was created early but finished
+        late is not buried behind newer (already read) rows.
+        """
+        order_col = "d.updated_at" if unread_only else "d.created_at"
         where: list[str] = []
         params: list[Any] = []
         if status:
@@ -416,7 +422,7 @@ class SessionStore:
             where.append("d.created_at <= ?")
             params.append(until)
         if after:
-            where.append("(d.created_at < ? OR (d.created_at = ? AND d.diagnosis_id < ?))")
+            where.append(f"({order_col} < ? OR ({order_col} = ? AND d.diagnosis_id < ?))")
             params.extend([after[0], after[0], after[1]])
         join = ""
         unread_expr = "NULL"
@@ -443,13 +449,14 @@ class SessionStore:
         sql = (f"SELECT d.diagnosis_id, d.trigger, d.status, d.resource, d.result, "
                f"d.created_at, d.updated_at, {unread_expr} AS unread "
                f"FROM diagnoses d{join}{clause} "
-               f"ORDER BY d.created_at DESC, d.diagnosis_id DESC LIMIT ?")
+               f"ORDER BY {order_col} DESC, d.diagnosis_id DESC LIMIT ?")
         with self._lock:
             rows = self._conn.execute(sql, [*params, limit + 1]).fetchall()
         out = [dict(r) for r in rows[:limit]]
         next_cursor = None
         if len(rows) > limit and out:
-            next_cursor = (out[-1]["created_at"], out[-1]["diagnosis_id"])
+            sort_key = "updated_at" if unread_only else "created_at"
+            next_cursor = (out[-1][sort_key], out[-1]["diagnosis_id"])
         return out, next_cursor
 
     def ensure_viewer(self, viewer_id: str) -> str:

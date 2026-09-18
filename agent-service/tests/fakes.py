@@ -18,6 +18,10 @@ class StubConnector:
         self._inspect_response = inspect_response
         self._capabilities = capabilities
         self.call_log = call_log if call_log is not None else []
+        # Recorded payloads for the data-source tools, so tests can assert the
+        # alert time anchor actually reaches the connector.
+        self.metrics_calls: list[dict[str, Any]] = []
+        self.logs_calls: list[dict[str, Any]] = []
 
     def capabilities(self) -> dict[str, Any]:
         return self._capabilities if self._capabilities is not None else {}
@@ -53,6 +57,29 @@ class StubConnector:
         self._maybe_raise("logs")
         return {"namespace": target.get("namespace"), "pod": target.get("name"),
                 "data": "line1\nline2", "truncated": False}
+
+    def query_metrics(self, target: dict[str, Any], *, metric: Optional[str] = None,
+                      range_minutes: Optional[int] = None,
+                      alert_time: Optional[str] = None,
+                      alert_expected: Optional[bool] = None) -> dict[str, Any]:
+        self._maybe_raise("query_metrics")
+        self.metrics_calls.append({"target": target, "metric": metric,
+                                   "range_minutes": range_minutes, "alert_time": alert_time,
+                                   "alert_expected": alert_expected})
+        return {"target": target, "capability": "prometheus.metrics", "available": True,
+                "metric": metric, "range_minutes": range_minutes,
+                "summary": {"latest": 1.0, "max": 3.0, "avg": 2.0}, "series": []}
+
+    def query_logs(self, target: dict[str, Any], *, range_minutes: Optional[int] = None,
+                   filter: Optional[str] = None, max_lines: Optional[int] = None,
+                   alert_time: Optional[str] = None,
+                   alert_expected: Optional[bool] = None) -> dict[str, Any]:
+        self._maybe_raise("query_logs")
+        self.logs_calls.append({"target": target, "range_minutes": range_minutes,
+                                "filter": filter, "max_lines": max_lines,
+                                "alert_time": alert_time, "alert_expected": alert_expected})
+        return {"target": target, "capability": "loki.logs", "available": True,
+                "range_minutes": range_minutes, "summary": {"total_lines": 0}, "evidence": []}
 
 
 class ScriptedLLM:

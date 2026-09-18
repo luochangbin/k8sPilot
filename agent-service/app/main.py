@@ -332,7 +332,10 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
             raise HTTPException(status_code=422, detail="unread=true requires viewer_id")
         filters = _parse_center_filters(limit, status, trigger, resource_kind, namespace,
                                         name, uid, since, until)
-        fingerprint = filter_fingerprint(filters)
+        # `unread` changes both the row set and the sort key, so it must be part
+        # of the cursor fingerprint: a cursor from the unread view must never be
+        # accepted by the default list (or vice versa).
+        fingerprint = filter_fingerprint({**filters, "unread": unread})
         after_keys = None
         if after:
             try:
