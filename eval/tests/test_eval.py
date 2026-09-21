@@ -1024,10 +1024,12 @@ def test_benchmark_report_flags_uneven_attempt_counts():
 
     base = {**_row(_case(), verdict="diagnosis_correct"),
             # Identity must be verified, otherwise the benchmark reports
-            # identity_unknown independently of the attempt-count question.
+            # identity_unknown independently of the attempt-count question, and
+            # effective budgets must be known for the budget signature check.
             "identity_ok": True, "llm_request_attempts": 1, "provider": "test",
             "protocol": "openai_chat_completions", "config_fingerprint": "fp-1",
-            "effective_parameters": {}}
+            "effective_parameters": {}, "effective_max_tool_calls": 12,
+            "effective_max_agent_rounds": 12, "max_finalization_attempts": 1}
     rows = []
     for model, reps in (("m1", 3), ("m2", 1)):
         for _ in range(reps):
@@ -1175,3 +1177,189 @@ def test_cause_level_v1_suite_is_fully_pinned():
         case = load_case_entry(root / "cases", entry)
         for manifest in case.setup_manifests:
             assert "versions" in str(manifest), f"{entry}: manifest not frozen"
+
+
+def test_compare_treats_unknown_finalization_budget_as_unknown(tmp_path):
+    """Unknown != same: a missing finalization budget is not 'equal'."""
+    from eval.compare import compare_runs
+    from eval.reporter import write_json, write_jsonl
+
+    def make_run(name, finalization):
+        run_dir = tmp_path / name
+        run_dir.mkdir()
+        write_jsonl(run_dir / "case-results.jsonl", [
+            {"case_id": "pod-crashloop-001", "case_version": "1",
+             "verdict": "diagnosis_correct", "fixture_ready": True,
+             "abstention_expected": False, "effective_max_tool_calls": 12,
+             "effective_max_agent_rounds": 12, "max_finalization_attempts": finalization}])
+        write_json(run_dir / "report.json", {
+            "run": {"run_id": name, "cases": ["pod-crashloop-001@1"],
+                    "scorer_version": "5", "root_cause_vocabulary_version": "v2"},
+            "report": {"scorer_version": "5", "root_cause_accuracy": 1.0,
+                       "wrong_root_cause_rate": 0.0, "schema_valid_rate": 1.0,
+                       "evidence_recall_avg": None, "diagnosis_duration_ms": {"p50": None},
+                       "token_usage": {"p50": None}},
+            "by_case": {},
+        })
+        return run_dir
+
+    result = compare_runs(make_run("b-fin-none", None), make_run("c-fin-none", None))
+    assert result["comparable"] is False
+    assert "effective_budget_unknown" in result["incomparable_reason"]
+
+
+def test_incomparable_runs_have_no_per_case_deltas(tmp_path):
+    from eval.compare import compare_runs
+    from eval.reporter import write_json, write_jsonl
+
+    def make_run(name, scorer):
+        run_dir = tmp_path / name
+        run_dir.mkdir()
+        write_jsonl(run_dir / "case-results.jsonl", [
+            {"case_id": "pod-crashloop-001", "case_version": "1",
+             "verdict": "diagnosis_correct", "fixture_ready": True,
+             "abstention_expected": False, "effective_max_tool_calls": 12,
+             "effective_max_agent_rounds": 12, "max_finalization_attempts": 1}])
+        write_json(run_dir / "report.json", {
+            "run": {"run_id": name, "cases": ["pod-crashloop-001@1"],
+                    "scorer_version": scorer, "root_cause_vocabulary_version": "v2"},
+            "report": {"scorer_version": scorer, "root_cause_accuracy": 1.0,
+                       "wrong_root_cause_rate": 0.0, "schema_valid_rate": 1.0,
+                       "evidence_recall_avg": None, "diagnosis_duration_ms": {"p50": None},
+                       "token_usage": {"p50": None}},
+            "by_case": {},
+        })
+        return run_dir
+
+    result = compare_runs(make_run("b-v3", "3"), make_run("c-v5", "5"))
+    assert result["comparable"] is False
+    assert all(metric["delta"] is None for metric in result["aggregate"].values())
+    for case in result["per_case"].values():
+        assert case["root_cause_accuracy"]["delta"] is None
+
+
+def test_benchmark_flags_budget_variation_across_models():
+    from eval.benchmark import build_benchmark_report
+
+    base = {**_row(_case(), verdict="diagnosis_correct"),
+            "identity_ok": True, "llm_request_attempts": 1, "provider": "test",
+            "protocol": "openai_chat_completions", "config_fingerprint": "fp-1",
+            "effective_parameters": {}, "case_id": "c-1", "case_version": "1"}
+
+    def run(models_budgets):
+        rows = []
+        for model, budget in models_budgets.items():
+            rows.append({**base, "model_profile": model,
+                         "effective_max_tool_calls": budget,
+                         "effective_max_agent_rounds": 12,
+                         "max_finalization_attempts": 1})
+        return build_benchmark_report("b", {"models": list(models_budgets), "case_budgets": {}},
+                                      rows, None)
+
+    varies = run({"m1": 12, "m2": 6})
+    assert varies["comparable"] is False
+    assert "effective_budget_varies_across_models" in varies["incomparable_reason"]
+
+    same = run({"m1": 12, "m2": 12})
+    assert same["comparable"] is True
+
+    unknown = run({"m1": 12, "m2": None})
+    assert unknown["comparable"] is False
+    assert "effective_budget_unknown" in unknown["incomparable_reason"]
+
+
+def test_path_evidence_must_stay_inside_the_source_allowlist():
+    """A path may not smuggle metadata (namespace/pod/container/metric) as evidence."""
+    from app.validation import UNVERIFIABLE, VERIFIED, validate_submission
+
+    def submission(source, path, value):
+        return {"root_cause_code": "CRASH_LOOP_BACKOFF", "root_cause": "rc",
+                "insufficient_evidence": False,
+                "evidence": [{"source": source, "path": path, "operator": "equals",
+                              "value": value}]}
+
+    logs = [{"tool": "logs", "tool_call_id": "c1", "kind": "realtime",
+             "args": {"namespace": "payment", "name": "p", "uid": "u1"},
+             "output": json.dumps({"namespace": "payment", "pod": "api-x",
+                                   "container": "app", "data": "real log line"})}]
+    ok, _, report = validate_submission(submission("kubernetes.logs", "namespace", "payment"),
+                                        logs)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+    ok, _, report = validate_submission(submission("kubernetes.logs", "data", "real log line"),
+                                        logs)
+    assert ok and report[0]["status"] == VERIFIED
+
+    metrics = [{"tool": "query_metrics", "tool_call_id": "c2", "kind": "realtime",
+                "args": {"namespace": "payment", "name": "p", "uid": "u1"},
+                "output": json.dumps({"metric": "memory", "capability": "prometheus.metrics",
+                                      "summary": {"max": 3.0}, "series": []})}]
+    for bad_path in ("metric", "capability", "target.namespace"):
+        ok, _, report = validate_submission(
+            submission("prometheus.metrics", bad_path, "memory"), metrics)
+        assert not ok and report[0]["status"] == UNVERIFIABLE, bad_path
+    ok, _, report = validate_submission(submission("prometheus.metrics", "summary.max", "3.0"),
+                                        metrics)
+    assert ok and report[0]["status"] == VERIFIED
+
+    events = [{"tool": "events", "tool_call_id": "c3", "kind": "realtime",
+               "args": {"kind": "Pod", "namespace": "payment", "name": "p", "uid": "u1"},
+               "output": json.dumps({"count": 1, "events": [
+                   {"type": "Warning", "reason": "BackOff", "message": "Back-off"}]})}]
+    ok, _, report = validate_submission(
+        submission("kubernetes.events", "events[0].count", "1"), events)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+    ok, _, report = validate_submission(
+        submission("kubernetes.events", "events[0].reason", "BackOff"), events)
+    assert ok and report[0]["status"] == VERIFIED
+
+    status = [{"tool": "inspect", "tool_call_id": "c4", "kind": "realtime",
+               "args": {"kind": "Pod", "namespace": "payment", "name": "p", "uid": "u1"},
+               "output": json.dumps({"target": {"name": "p"},
+                                     "actual_state": {"phase": "Pending"}})}]
+    ok, _, report = validate_submission(
+        submission("kubernetes.status", "target.name", "p"), status)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+    ok, _, report = validate_submission(
+        submission("kubernetes.status", "actual_state.phase", "Pending"), status)
+    assert ok and report[0]["status"] == VERIFIED
+
+
+def test_case_entry_resolution_is_shared_between_loading_and_hashing(tmp_path):
+    """load_case_entry and the hash path must use the same resolution rules."""
+    from eval.cases import load_case_entry, resolve_and_load_case_entry
+
+    cases_dir = Path(__file__).resolve().parents[1] / "cases"
+    case, path = resolve_and_load_case_entry(cases_dir, "pod-crashloop-001@1")
+    assert case.case_version == "1"
+    assert "versions" in str(path)
+    assert load_case_entry(cases_dir, "pod-crashloop-001@1").id == case.id
+    # A pinned copy wins for @2 as well, and the returned path is the one used
+    # for hashing (no second, stricter lookup).
+    current, current_path = resolve_and_load_case_entry(cases_dir, "pod-crashloop-001@2")
+    assert current.case_version == "2"
+    assert "versions" in str(current_path)
+    assert current_path.is_file()
+    # When there is no pinned copy, @current falls back to the current file and
+    # still reports that path.
+    only_current = tmp_path / "cases"
+    (only_current / "versions").mkdir(parents=True)
+    (only_current / "manifests").mkdir(parents=True)
+    shutil.copy(cases_dir / "pod-crashloop-001.yaml", only_current / "pod-crashloop-001.yaml")
+    shutil.copy(cases_dir / "manifests" / "pod-crashloop-001.yaml",
+                only_current / "manifests" / "pod-crashloop-001.yaml")
+    fallback, fallback_path = resolve_and_load_case_entry(only_current, "pod-crashloop-001@2")
+    assert fallback.case_version == "2"
+    assert fallback_path == only_current / "pod-crashloop-001.yaml"
+
+
+def test_benchmark_meta_records_case_hashes():
+    from eval.benchmark import run_benchmark
+    from eval.cases import case_hashes, resolve_and_load_case_entry
+
+    cases_dir = Path(__file__).resolve().parents[1] / "cases"
+    case, path = resolve_and_load_case_entry(cases_dir, "pod-crashloop-001@1")
+    hashes = case_hashes([case], [path])
+    assert set(hashes) == {"pod-crashloop-001@1"}
+    entry = hashes["pod-crashloop-001@1"]
+    assert len(entry["definition"]) == 64
+    assert entry["manifests"], "fixture hashes must be recorded"

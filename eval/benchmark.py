@@ -17,10 +17,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .cases import Case, case_key, load_case_entry, load_suite
+from .cases import (Case, case_hashes, case_key, load_suite,
+                    resolve_and_load_case_entry)
 from .reporter import build_report, write_json, write_jsonl, _pct
 from .runner import REPO_ROOT, Runner, file_hash
-from .scorer import ROOT_CAUSE_VOCABULARY_VERSION, SCORER_VERSION
+from .scorer import (ROOT_CAUSE_VOCABULARY_VERSION, SCORER_VERSION,
+                     budget_signature, budget_signature_unknown)
 
 
 def _now_iso() -> str:
@@ -122,7 +124,9 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
                   enable_incidents: Optional[bool] = None) -> tuple[str, Path]:
     suite_raw = load_suite(suite_path)
     cases_dir = Path(__file__).resolve().parent / "cases"
-    cases = [load_case_entry(cases_dir, cid) for cid in case_ids]
+    loaded = [resolve_and_load_case_entry(cases_dir, cid) for cid in case_ids]
+    cases = [case for case, _path in loaded]
+    case_paths = [path for _case, path in loaded]
 
     benchmark_id = f"benchmark-{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
     run_dir = Path(reports_dir) / benchmark_id
@@ -160,6 +164,8 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
         "declared_model_label": model_label or None,
         # Declared Case budgets (the per-attempt *effective* values are recorded
         # on each row from the trace root span).
+        # Content proof, same helper the single-run path uses.
+        "case_hashes": case_hashes(cases, case_paths),
         "case_budgets": {
             c.key(): {"max_tool_calls": c.budgets.max_tool_calls,
                       "max_agent_rounds": c.budgets.max_agent_rounds}
@@ -304,6 +310,27 @@ def build_benchmark_report(benchmark_id: str, meta: dict[str, Any],
             issues.append("attempt_counts_differ:" + json.dumps(
                 {m: dict(sorted(c.items())) for m, c in sorted(counts.items())},
                 sort_keys=True))
+        # The same service config is assumed for every model; a restart or a
+        # config change mid-benchmark can hand later models a different budget,
+        # which changes coverage/abstention/cost. Budgets must match per case and
+        # must be known.
+        signatures = {
+            model: {case_key(r): budget_signature(r) for r in model_rows_of(model)}
+            for model in covered
+        }
+        unknown_cases = sorted({
+            key for sig in signatures.values() for key, value in sig.items()
+            if budget_signature_unknown(value)
+        })
+        varies = sorted({
+            key for key in common_cases
+            if any(sig.get(key) != next(iter(signatures.values())).get(key)
+                   for sig in signatures.values())
+        })
+        if unknown_cases:
+            issues.append("effective_budget_unknown:" + ",".join(unknown_cases))
+        elif varies:
+            issues.append("effective_budget_varies_across_models:" + ",".join(varies))
     # 3. Configuration drift within a profile. Failures with execution identity
     #    also enter the quality denominators, so they must be consistent too.
     for model in models:

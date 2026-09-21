@@ -67,6 +67,10 @@ class FakeRunner:
         self.calls.append((case.id, model_profile))
         row = _row(case.id, verdict=self.verdict)
         row["diagnosis_id"] = f"diag_{len(self.calls)}"
+        # Effective budgets come from the trace root span in real runs; the fake
+        # must provide them or the budget-signature check reports unknown.
+        row.update({"effective_max_tool_calls": 12, "effective_max_agent_rounds": 12,
+                    "max_finalization_attempts": 1})
         if self.trace_dir and model_profile:
             _write_trace(self.trace_dir, row["diagnosis_id"], model_profile,
                          include_response=self.include_response)

@@ -221,6 +221,22 @@ def _with_evidence_metrics(row: dict[str, Any], result: dict[str, Any], gt) -> d
     return row
 
 
+def budget_signature(row: dict[str, Any]) -> tuple:
+    """The effective investigation budget a row was produced under.
+
+    Shared by `eval compare` and the multi-model benchmark so both use exactly
+    the same definition (including the finalization budget).
+    """
+    return (row.get("effective_max_tool_calls"),
+            row.get("effective_max_agent_rounds"),
+            row.get("max_finalization_attempts"))
+
+
+def budget_signature_unknown(signature: tuple) -> bool:
+    """True when any budget element is unknown (unknown != same)."""
+    return any(value is None for value in signature)
+
+
 def summarize_trace(trace: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Extract run-quality metrics from a collected trace (empty when absent).
 

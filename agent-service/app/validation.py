@@ -59,6 +59,45 @@ def _resolve_path(doc: Any, path: str) -> tuple[bool, Any]:
     return True, current
 
 
+# Path-based evidence is also restricted: a path may only address the source's
+# business facts, never transport metadata (target/namespace/pod/container/
+# metric name/capability/window_*). The first path segment must be an allowed
+# root, and for events the leaf must be one of the documented fact fields.
+_PATH_ROOTS: dict[str, tuple[str, ...]] = {
+    "kubernetes.status": ("desired_state", "actual_state", "conditions", "anomalies"),
+    "kubernetes.events": ("events",),
+    "kubernetes.logs": ("data",),
+    "loki.logs": ("evidence",),
+    "prometheus.metrics": ("summary", "series"),
+}
+_PATH_LEAF_FIELDS: dict[str, tuple[str, ...]] = {
+    "kubernetes.events": ("reason", "message", "type"),
+}
+
+
+def _path_segments(path: str) -> list[str]:
+    """Top-level keys of a path, ignoring list indexes.
+
+    `_PATH_TOKEN` yields a match per key AND per index; index matches carry an
+    empty name and must be dropped, otherwise `events[0].reason` would look like
+    ['events', '', 'reason'] and be rejected.
+    """
+    return [name for name, _index in _PATH_TOKEN.findall(path) if name]
+
+
+def _path_allowed(source: str, path: str) -> bool:
+    roots = _PATH_ROOTS.get(source)
+    if roots is None:
+        return False
+    segments = _path_segments(path)
+    if not segments or segments[0] not in roots:
+        return False
+    leaves = _PATH_LEAF_FIELDS.get(source)
+    if leaves and len(segments) > 1 and segments[1] not in leaves:
+        return False
+    return True
+
+
 def _parse(text: Optional[str]) -> Any:
     try:
         return json.loads(text or "")
@@ -168,6 +207,10 @@ def verify_evidence(evidence: dict[str, Any],
         return {"status": UNVERIFIABLE, "reason": "evidence has no value"}
 
     if path:
+        if not _path_allowed(source, str(path)):
+            return {"status": UNVERIFIABLE,
+                    "reason": (f"path {path!r} is outside the {source} field allowlist "
+                               "(metadata is not evidence)")}
         mismatch: Optional[dict[str, Any]] = None
         for result in relevant:
             doc = _parse(result.get("output"))

@@ -114,13 +114,11 @@ def case_key(row: dict[str, Any]) -> str:
     return f"{row.get('case_id')}@{row.get('case_version')}"
 
 
-def load_case_entry(cases_dir: Path, entry: str) -> Case:
-    """Resolve + load a suite entry, verifying the pinned file really is that
-    case and version (a mis-copied file must not silently pass).
+def resolve_and_load_case_entry(cases_dir: Path, entry: str) -> tuple[Case, Path]:
+    """Resolve + load + cross-validate a suite entry, returning (Case, path).
 
-    `case-id@version` prefers the pinned copy under `versions/`; when there is no
-    pinned copy it accepts the current definition if that definition *is* that
-    version (so `@<current>` keeps working without duplicating files).
+    Use this everywhere a caller needs both: resolving separately would apply
+    different rules for `id@version` (pinned file vs current-file fallback).
     """
     entry = str(entry).strip()
     try:
@@ -137,17 +135,39 @@ def load_case_entry(cases_dir: Path, entry: str) -> Case:
             raise CaseError(
                 f"suite entry {entry!r} has no pinned definition and the current "
                 f"file is {current.id}@{current.case_version}")
-        return current
+        return current, path
     case = load_case(path)
     if "@" in entry:
         case_id, _, version = entry.partition("@")
         if case.id != case_id or case.case_version != version:
             raise CaseError(
-                f"suite entry {entry!r} resolved to {case.id}@{case.case_version} "
-                f"({resolve_case_entry(cases_dir, entry)})")
+                f"suite entry {entry!r} resolved to {case.id}@{case.case_version} ({path})")
     elif case.id != entry:
         raise CaseError(f"suite entry {entry!r} resolved to case id {case.id!r}")
+    return case, path
+
+
+def load_case_entry(cases_dir: Path, entry: str) -> Case:
+    """Resolve + load a suite entry (see resolve_and_load_case_entry)."""
+    case, _path = resolve_and_load_case_entry(cases_dir, entry)
     return case
+
+
+def case_hashes(cases: list[Case], paths: list[Path]) -> dict[str, dict[str, Any]]:
+    """Content proof for a run: definition + fixture hashes per case@version."""
+    import hashlib
+
+    def _sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    return {
+        case.key(): {
+            "definition": _sha256(path),
+            "manifests": {manifest.name: _sha256(manifest)
+                          for manifest in case.setup_manifests},
+        }
+        for case, path in zip(cases, paths)
+    }
 
 
 def load_case(path: Path) -> Case:

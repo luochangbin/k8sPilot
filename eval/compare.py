@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .cases import case_key
-from .scorer import (VERDICT_CORRECT, VERDICT_FIXTURE_FAILED, VERDICT_INCORRECT,
+from .scorer import (budget_signature, budget_signature_unknown,
+                     VERDICT_CORRECT, VERDICT_FIXTURE_FAILED, VERDICT_INCORRECT,
                      VERDICT_SCHEMA_FAILED, VERDICT_SYSTEM_FAILED)
 
 
@@ -129,9 +130,12 @@ def compare_runs(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
     comparable = not reasons
     reason = None if comparable else "; ".join(reasons)
     if not comparable:
-        # Results scored under different semantics must not be diffed silently.
+        # Results scored under different semantics must not be diffed silently:
+        # this includes the per-case deltas, which are computed earlier.
         for metric in agg.values():
             metric["delta"] = None
+        for case in per_case.values():
+            case["root_cause_accuracy"]["delta"] = None
     gates = _evaluate_gates(agg) if comparable else []
     return {"aggregate": agg, "per_case": per_case, "gates": gates,
             "comparable": comparable, "incomparable_reason": reason,
@@ -142,14 +146,10 @@ def _budget_mismatch(b_rows: dict[str, list[dict[str, Any]]],
                      c_rows: dict[str, list[dict[str, Any]]]) -> Optional[str]:
     """Per-case effective budgets must be identical (and known) on both sides."""
     def budgets(rows_by_case: dict[str, list[dict[str, Any]]]) -> dict[str, set]:
-        out: dict[str, set] = {}
-        for key, rows in rows_by_case.items():
-            out[key] = {
-                (r.get("effective_max_tool_calls"), r.get("effective_max_agent_rounds"),
-                 r.get("max_finalization_attempts"))
-                for r in rows
-            }
-        return out
+        return {
+            key: {budget_signature(r) for r in rows}
+            for key, rows in rows_by_case.items()
+        }
 
     b_budgets = budgets(b_rows)
     c_budgets = budgets(c_rows)
@@ -158,14 +158,13 @@ def _budget_mismatch(b_rows: dict[str, list[dict[str, Any]]],
         if b_budgets[key] != c_budgets[key]:
             diffs[key] = {"baseline": sorted(map(str, b_budgets[key])),
                           "candidate": sorted(map(str, c_budgets[key]))}
-    # Check BOTH sides: merging the dicts would hide one side's unknown values.
+    # Check BOTH sides (merging would hide one side) and every element of the
+    # signature, including the finalization budget.
     unknown = sorted(
         key for key in set(b_budgets) | set(c_budgets)
-        if any(value[0] is None or value[1] is None
-               for value in (b_budgets.get(key, set()) | c_budgets.get(key, set())))
+        if any(budget_signature_unknown(signature)
+               for signature in (b_budgets.get(key, set()) | c_budgets.get(key, set())))
     )
-    # "Unknown" is checked first: a side without trace budget data cannot be
-    # proven equal, and must not be reported as a concrete mismatch either.
     if unknown:
         return "effective_budget_unknown: " + ",".join(unknown)
     if diffs:

@@ -13,8 +13,8 @@ from typing import Any, Optional
 
 import httpx
 
-from .cases import (Case, CaseError, load_case_entry, load_suite,
-                    resolve_case_entry)
+from .cases import (Case, CaseError, case_hashes, load_case_entry, load_suite,
+                    resolve_and_load_case_entry)
 from .injector import Injector, InjectorError
 from .reporter import build_report, render_markdown, report_by_case, write_json, write_jsonl
 from .scorer import ROOT_CAUSE_VOCABULARY_VERSION, score_case, summarize_trace
@@ -42,8 +42,9 @@ class Runner:
             enable_incidents: Optional[bool] = None,
             model_profile: Optional[str] = None) -> tuple[str, Path]:
         suite_raw = load_suite(suite_path)
-        cases = [self._load_case(cid) for cid in case_ids]
-        case_paths = [resolve_case_entry(self._cases_dir(), cid) for cid in case_ids]
+        loaded = [resolve_and_load_case_entry(self._cases_dir(), cid) for cid in case_ids]
+        cases = [case for case, _path in loaded]
+        case_paths = [path for _case, path in loaded]
 
         run_id = f"{profile}-{time.strftime('%Y%m%dT%H%M%S')}"
         run_dir = self._reports_dir / run_id
@@ -66,14 +67,7 @@ class Runner:
             "root_cause_vocabulary_version": ROOT_CAUSE_VOCABULARY_VERSION,
             # Audit trail: prove the pinned definition and fixture bytes are the
             # ones this run measured (compare refuses drift when both sides have it).
-            "case_hashes": {
-                case.key(): {
-                    "definition": file_hash(path),
-                    "manifests": {manifest.name: file_hash(manifest)
-                                  for manifest in case.setup_manifests},
-                }
-                for case, path in zip(cases, case_paths)
-            },
+            "case_hashes": case_hashes(cases, case_paths),
         }
         write_json(run_dir / "run.json", meta)
 
