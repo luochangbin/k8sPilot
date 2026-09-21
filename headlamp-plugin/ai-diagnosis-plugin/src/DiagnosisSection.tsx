@@ -95,11 +95,28 @@ interface Diagnosis {
 interface ResourceLike {
   kind: string;
   cluster: string;
+  apiVersion?: string;
   metadata?: {
     name?: string;
     namespace?: string;
     uid?: string;
   };
+}
+
+/** Fallback mapping when Headlamp does not hand us the resource's apiVersion. */
+function apiVersionForKind(kind: string): string {
+  switch (kind) {
+    case 'Deployment':
+    case 'ReplicaSet':
+    case 'StatefulSet':
+    case 'DaemonSet':
+      return 'apps/v1';
+    case 'Job':
+    case 'CronJob':
+      return 'batch/v1';
+    default:
+      return 'v1';
+  }
 }
 
 async function createDiagnosis(resource: ResourceLike): Promise<{ diagnosis_id: string }> {
@@ -109,7 +126,7 @@ async function createDiagnosis(resource: ResourceLike): Promise<{ diagnosis_id: 
     body: JSON.stringify({
       trigger: 'manual',
       resource: {
-        apiVersion: 'v1',
+        apiVersion: resource.apiVersion ?? apiVersionForKind(resource.kind),
         kind: resource.kind,
         namespace: resource.metadata?.namespace,
         name: resource.metadata?.name,
@@ -148,11 +165,14 @@ export default function DiagnosisSection({ resource }: { resource: ResourceLike 
   const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stoppedRef = useRef(false);
+  const inFlightRef = useRef(false);
 
   const stopPolling = useCallback(() => {
+    stoppedRef.current = true;
     if (pollTimer.current) {
-      clearInterval(pollTimer.current);
+      clearTimeout(pollTimer.current);
       pollTimer.current = null;
     }
   }, []);
@@ -163,24 +183,41 @@ export default function DiagnosisSection({ resource }: { resource: ResourceLike 
     setError(null);
     setDiagnosis(null);
     setRunning(true);
+    stopPolling(); // reset any previous run
+    stoppedRef.current = false;
+    inFlightRef.current = false;
     try {
       const created = await createDiagnosis(resource);
-      const poll = async () => {
+      // Recursive setTimeout + in-flight guard: a terminal first poll never
+      // schedules another poll, and a slow request cannot overlap the next one.
+      const tick = async (): Promise<void> => {
+        if (stoppedRef.current || inFlightRef.current) return;
+        inFlightRef.current = true;
         try {
           const current = await fetchDiagnosis(created.diagnosis_id);
+          if (stoppedRef.current) return;
           setDiagnosis(current);
           if (current.status === 'completed' || current.status === 'failed') {
             stopPolling();
             setRunning(false);
+            return;
           }
         } catch (e) {
+          if (stoppedRef.current) return;
           stopPolling();
           setRunning(false);
           setError((e as Error).message);
+          return;
+        } finally {
+          inFlightRef.current = false;
+        }
+        if (!stoppedRef.current) {
+          pollTimer.current = setTimeout(() => {
+            void tick();
+          }, POLL_INTERVAL_MS);
         }
       };
-      await poll();
-      pollTimer.current = setInterval(poll, POLL_INTERVAL_MS);
+      await tick();
     } catch (e) {
       setRunning(false);
       setError((e as Error).message);
