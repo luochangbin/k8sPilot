@@ -129,8 +129,11 @@ class DiagnosisTrace:
         self.emit("llm.final", "llm_final", attrs, failure_layer=layer)
 
     def finish(self, status: str, error: Optional[str] = None,
-               failure_layer: Optional[str] = None) -> None:
+               failure_layer: Optional[str] = None,
+               attributes: Optional[dict[str, Any]] = None) -> None:
         attrs = {"status": status, "duration_ms": round(_now_ms() - self._start_ms, 1)}
+        if attributes:
+            attrs.update(attributes)
         self.emit("diagnosis", "diagnosis_root", attrs, error=error, failure_layer=failure_layer)
 
 

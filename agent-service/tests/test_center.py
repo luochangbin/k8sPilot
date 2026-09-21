@@ -582,3 +582,35 @@ def test_unread_cursor_is_bound_to_the_viewer(tmp_path):
     assert client.get(
         "/api/v1/diagnosis-center/sessions"
         f"?viewer_id={VIEWER}&limit=1&after={plain_cursor}").status_code == 200
+
+
+def test_mark_all_read_respects_the_viewer_baseline(tmp_path):
+    """read-all must use the same scope as the unread count: history that a new
+    viewer never saw as unread is not receipted."""
+    client, store, _ = make_center(tmp_path)
+    history = _seed_diagnosis(store, trigger=Trigger.alert, result=_result(),
+                              name="old", uid="u1")
+    _prime(store, VIEWER)  # baseline established AFTER the history row
+    fresh = _seed_diagnosis(store, trigger=Trigger.alert, result=_result(),
+                            name="new", uid="u2")
+
+    notes = client.get(f"/api/v1/diagnosis-center/notifications?viewer_id={VIEWER}").json()
+    assert notes["unread_diagnosis_count"] == 1
+    assert [i["diagnosis_id"] for i in notes["items"]] == [fresh.diagnosis_id]
+
+    read = client.post("/api/v1/diagnosis-center/notifications/read-all",
+                       json={"viewer_id": VIEWER}).json()
+    assert read["read"] == 1  # history is not part of the unread set
+
+    assert store.count_unread_diagnoses(VIEWER) == 0
+    with store._lock:  # noqa: SLF001 - test-only receipt inspection
+        rows = store._conn.execute(
+            "SELECT diagnosis_id FROM diagnosis_read_receipts WHERE viewer_id = ?",
+            (VIEWER,),
+        ).fetchall()
+    assert [r["diagnosis_id"] for r in rows] == [fresh.diagnosis_id]
+    assert history.diagnosis_id not in {r["diagnosis_id"] for r in rows}
+
+    # A diagnosis finishing after that is still unread.
+    _seed_diagnosis(store, trigger=Trigger.alert, result=_result(), name="newer", uid="u3")
+    assert store.count_unread_diagnoses(VIEWER) == 1

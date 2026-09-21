@@ -1,6 +1,8 @@
 """Unit tests for the diagnosis loop: success, failure boundaries, evidence-insufficient."""
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +20,58 @@ from app.models import AlertContext, DiagnosisRequest, ResourceRef, Trigger
 from app.store import SessionStore
 
 from .fakes import ScriptedLLM, StubConnector
+
+def _verified_evidence(summary: str = "Pod actual state", **overrides: Any) -> dict[str, Any]:
+    """Evidence that the deterministic gate can verify against the default
+    StubConnector inspect output (actual_state.restart_count == 37)."""
+    item: dict[str, Any] = {
+        "source": "kubernetes.status",
+        "path": "actual_state.restart_count",
+        "operator": "equals",
+        "value": "37",
+        "summary": summary,
+    }
+    item.update(overrides)
+    return item
+
+
+def _abstain_result(**overrides: Any) -> Any:
+    payload = {
+        "symptom": "证据不足",
+        "root_cause_code": "",
+        "root_cause": "",
+        "insufficient_evidence": True,
+        "confidence": "low",
+        "recommendations": [],
+        "missing_evidence": ["关键日志已被轮转"],
+    }
+    payload.update(overrides)
+    return ScriptedLLM.tool_response("submit_result", payload)
+
+
+def _two_call_round() -> Any:
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content=None,
+        tool_calls=[
+            SimpleNamespace(id="call_a", type="function", function=SimpleNamespace(
+                name="inspect", arguments=json.dumps(
+                    {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}))),
+            SimpleNamespace(id="call_b", type="function", function=SimpleNamespace(
+                name="events", arguments=json.dumps(
+                    {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}))),
+        ],
+    ))],)
+
+
+def _trace_root(trace_dir: str, diagnosis_id: str) -> dict:
+    path = Path(trace_dir) / f"{diagnosis_id}.jsonl"
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    # The root span is emitted twice: "started" at boot and the final span with
+    # status/duration/budget counters. Pick the final one.
+    return next(e for e in events
+                if e.get("kind") == "diagnosis_root"
+                and "duration_ms" in (e.get("attributes") or {}))
+
 
 RESOURCE = ResourceRef(kind="Pod", namespace="payment", name="payment-api-7b8c9", uid="uid-1")
 
@@ -65,9 +119,11 @@ def test_successful_diagnosis_completes_with_parsed_result():
         ScriptedLLM.tool_response("submit_result", {
             "symptom": "Pod 持续重启",
             "evidence": [
-                {"source": "kubernetes.status", "summary": "Last termination reason is OOMKilled"},
+                _verified_evidence("Last termination reason is OOMKilled"),
                 {"source": "kubernetes.logs", "summary": "java.lang.OutOfMemoryError"},
             ],
+            "root_cause_code": "CONTAINER_OOMKILLED",
+            "insufficient_evidence": False,
             "root_cause": "容器内存上限不足",
             "confidence": "high",
             "recommendations": ["提高 memory limit"],
@@ -94,7 +150,9 @@ def test_stringified_json_list_fields_are_normalized_not_char_split():
         ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}),
         ScriptedLLM.tool_response("submit_result", {
             "symptom": "Pod 持续重启",
-            "evidence": json.dumps([{"source": "kubernetes.status", "summary": "OOMKilled"}]),
+            "evidence": json.dumps([_verified_evidence("OOMKilled")]),
+            "root_cause_code": "CONTAINER_OOMKILLED",
+            "insufficient_evidence": False,
             "root_cause": "容器内存上限不足",
             "confidence": "high",
             "recommendations": json.dumps(["提高 memory limit", "重启前检查堆配置"], ensure_ascii=False),
@@ -117,7 +175,9 @@ def test_plain_string_single_field_is_wrapped_not_split():
         ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}),
         ScriptedLLM.tool_response("submit_result", {
             "symptom": "Pod 持续重启",
-            "evidence": [{"source": "kubernetes.status", "summary": "OOMKilled"}],
+            "evidence": [_verified_evidence("OOMKilled")],
+            "root_cause_code": "CONTAINER_OOMKILLED",
+            "insufficient_evidence": False,
             "root_cause": "容器内存上限不足",
             "confidence": "high",
             "recommendations": "建议先核对 ConfigMap 挂载再重启",
@@ -153,7 +213,9 @@ def test_tool_call_provider_extras_are_echoed_back():
             "inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}, extra),
         ScriptedLLM.tool_response("submit_result", {
             "symptom": "Pod 持续重启",
-            "evidence": [{"source": "kubernetes.status", "summary": "OOMKilled"}],
+            "evidence": [_verified_evidence("OOMKilled")],
+            "root_cause_code": "CONTAINER_OOMKILLED",
+            "insufficient_evidence": False,
             "root_cause": "容器内存上限不足",
             "confidence": "high",
             "recommendations": [],
@@ -217,29 +279,160 @@ def test_tool_not_found_is_fed_back_and_loop_continues():
     connector = StubConnector(raise_on="not_found")
     llm = ScriptedLLM([
         ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}),
-        ScriptedLLM.tool_response("submit_result", {
-            "symptom": "Pod 不存在",
-            "evidence": [{"source": "kubernetes.status", "summary": "not found"}],
-            "root_cause": "Pod 已被删除",
-            "confidence": "medium",
-            "recommendations": [],
-        }),
+        _abstain_result(),
     ])
     d = run(make_agent(llm, connector))
 
     assert d.status == "completed"
-    assert d.result.root_cause == "Pod 已被删除"
+    assert d.result.insufficient_evidence is True
 
 
-def test_max_tool_calls_without_conclusion_fails():
+def test_budget_exhausted_without_conclusion_fails_as_planning_failure():
+    """Running out of investigation budget is a *planning* failure: the model
+    gets a terminal-only round, and if it cannot submit a valid result the
+    session fails with failure_reason=budget_exhausted (never an abstention)."""
     llm = ScriptedLLM([
-        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"})
-        for _ in range(3)
+        *[ScriptedLLM.tool_response("inspect",
+                                    {"kind": "Pod", "namespace": "payment",
+                                     "name": "payment-api-7b8c9"})
+          for _ in range(3)],
+        ScriptedLLM.text_response("无法给出结论"),      # finalization attempt 1
+        ScriptedLLM.text_response("仍然无法给出结论"),  # finalization attempt 2
     ])
     d = run(make_agent(llm, max_calls=3))
 
     assert d.status == "failed"
-    assert "最大工具调用次数" in (d.error or "")
+    assert d.failure_reason == "budget_exhausted"
+    assert "预算已用尽" in (d.error or "")
+
+
+def test_budget_exhausted_finalization_can_still_abstain():
+    """A valid abstention produced in the terminal-only round is a normal
+    completed diagnosis, not a budget failure."""
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "Pod 重启过一次，随后稳定运行",
+            "evidence": [],
+            "root_cause_code": "",
+            "root_cause": "",
+            "insufficient_evidence": True,
+            "confidence": "low",
+            "recommendations": [],
+            "missing_evidence": ["崩溃前的容器日志已被轮转"],
+        }),
+    ])
+    d = run(make_agent(llm, max_calls=1))
+
+    assert d.status == "completed"
+    assert d.failure_reason is None
+    assert d.result is not None and d.result.insufficient_evidence is True
+
+
+def test_multi_tool_round_is_rejected_without_executing_any_tool():
+    """A round with several tool calls is a policy violation: nothing runs, the
+    round is consumed, the tool budget is untouched, and every tool_call_id gets
+    an answerable policy message."""
+    seen_messages: list[list[dict]] = []
+
+    class RecordingLLM(ScriptedLLM):
+        def chat(self, messages, tools, tool_choice):
+            seen_messages.append([dict(m) for m in messages])
+            return super().chat(messages, tools, tool_choice)
+
+    two_calls = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content=None,
+        tool_calls=[
+            SimpleNamespace(id="call_a", type="function", function=SimpleNamespace(
+                name="inspect", arguments=json.dumps(
+                    {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}))),
+            SimpleNamespace(id="call_b", type="function", function=SimpleNamespace(
+                name="events", arguments=json.dumps(
+                    {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}))),
+        ],
+    ))],)
+    llm = RecordingLLM([
+        two_calls,
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        _submit_ok(),
+    ])
+    connector = StubConnector()
+    d = run(make_agent(llm, connector))
+
+    assert d.status == "completed"
+    # Nothing from the rejected round was executed.
+    assert connector.call_log == ["inspect"]
+    # The next request carries a policy message for BOTH rejected call ids.
+    follow_up = seen_messages[1]
+    tool_msgs = [m for m in follow_up if m.get("role") == "tool"]
+    assert {m["tool_call_id"] for m in tool_msgs} == {"call_a", "call_b"}
+    assert all("only one tool" in m["content"] for m in tool_msgs)
+
+
+def test_tool_and_round_budgets_are_counted_separately(tmp_path):
+    """Rounds = LLM decisions; tool_calls = executed investigation tools
+    (submit_result excluded). Counters are recorded on the trace root span."""
+    llm = ScriptedLLM([
+        _two_call_round(),
+        _abstain_result(),  # no tool output exists, so only abstention is valid
+    ])
+    connector = StubConnector()
+    agent = make_agent(llm, connector)
+    agent.cfg.trace_dir = str(tmp_path / "trace")
+    store = SessionStore()
+    d = store.create(make_request())
+    agent.run(make_request(), store, d.diagnosis_id)
+
+    row = store.get(d.diagnosis_id)
+    assert row.status == "completed"
+    root = _trace_root(str(tmp_path / "trace"), d.diagnosis_id)
+    assert root["attributes"]["rounds_used"] == 2  # rejected round + abstain round
+    assert root["attributes"]["tool_calls_used"] == 0  # submit_result is not a tool
+    assert root["attributes"]["multi_tool_rejected_rounds"] == 1
+    assert connector.call_log == []
+
+
+def test_eval_budget_can_only_shrink_the_service_budget():
+    """A Case budget caps the session (frozen effective values)."""
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        # The model would happily keep investigating, but the Case budget is 2:
+        # the third call must be the terminal-only finalization.
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "s", "evidence": [_verified_evidence("x")],
+            "root_cause": "r", "root_cause_code": "CRASH_LOOP_BACKOFF",
+            "confidence": "high", "recommendations": [],
+        }),
+    ])
+    connector = StubConnector()
+    agent = make_agent(llm, connector)
+    req = make_request().model_copy(update={
+        "eval_run_id": "run-1", "eval_max_tool_calls": 2, "eval_max_agent_rounds": 99})
+    store = SessionStore()
+    d = store.create(req)
+    agent.run(req, store, d.diagnosis_id)
+
+    assert store.get(d.diagnosis_id).status == "completed"
+    assert len(connector.call_log) == 2  # capped at 2, not the service default 12
+
+
+def test_submit_result_does_not_consume_the_tool_budget():
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        _submit_ok(),
+    ])
+    connector = StubConnector()
+    agent = make_agent(llm, connector)
+    assert agent.effective_budgets(make_request())["max_tool_calls"] == 12
+    d = run(agent)
+    assert d.status == "completed"
+    assert connector.call_log == ["inspect"]
 
 
 def test_plain_text_answer_steered_back_to_submit_result():
@@ -248,7 +441,9 @@ def test_plain_text_answer_steered_back_to_submit_result():
         ScriptedLLM.text_response("Pod 持续重启，根因是 OOMKilled。"),
         ScriptedLLM.tool_response("submit_result", {
             "symptom": "Pod 持续重启",
-            "evidence": [{"source": "kubernetes.status", "summary": "OOMKilled"}],
+            "evidence": [_verified_evidence("OOMKilled")],
+            "root_cause_code": "CONTAINER_OOMKILLED",
+            "insufficient_evidence": False,
             "root_cause": "容器内存上限不足",
             "confidence": "medium",
             "recommendations": ["提高 memory limit"],
@@ -342,34 +537,45 @@ def test_reasoning_content_passed_back():
 
 
 def test_parses_scorable_root_cause_and_structured_evidence():
+    inspect_response = {
+        "target": {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"},
+        "exists": True, "uid_mismatch": False,
+        "desired_state": {}, "conditions": [], "anomalies": ["last terminated reason=OOMKilled"],
+        "actual_state": {"phase": "Running", "restart_count": 37,
+                         "container_states": [
+                             {"name": "app",
+                              "last_termination": {"reason": "OOMKilled", "exit_code": 137}}]},
+    }
     llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
         ScriptedLLM.tool_response("submit_result", {
-            "symptom": "Pod 持续重启",
+            "symptom": "Pod restarting",
             "root_cause_code": "CONTAINER_OOMKILLED",
             "insufficient_evidence": False,
             "evidence": [
                 {
                     "source": "kubernetes.status",
                     "resource_uid": "uid-1",
-                    "path": "status.containerStatuses[0].lastState.terminated.reason",
+                    "path": "actual_state.container_states[0].last_termination.reason",
                     "operator": "equals",
                     "value": "OOMKilled",
                     "summary": "Last termination reason is OOMKilled",
                 },
             ],
-            "root_cause": "容器内存上限不足",
+            "root_cause": "container memory limit too low",
             "confidence": "high",
-            "recommendations": ["提高 memory limit"],
+            "recommendations": ["raise memory limit"],
         }),
     ])
-    d = run(make_agent(llm))
+    d = run(make_agent(llm, StubConnector(inspect_response=inspect_response)))
 
     assert d.status == "completed"
     assert d.result.root_cause_code == "CONTAINER_OOMKILLED"
     assert d.result.insufficient_evidence is False
     ev = d.result.evidence[0]
     assert ev.resource_uid == "uid-1"
-    assert ev.path == "status.containerStatuses[0].lastState.terminated.reason"
+    assert ev.path == "actual_state.container_states[0].last_termination.reason"
     assert ev.operator == "equals"
     assert ev.value == "OOMKilled"
 
@@ -411,7 +617,8 @@ def test_trace_recorded_when_enabled(tmp_path):
         ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}),
         ScriptedLLM.tool_response("submit_result", {
             "symptom": "s", "root_cause_code": "CONTAINER_OOMKILLED", "insufficient_evidence": False,
-            "evidence": [], "root_cause": "r", "confidence": "high", "recommendations": [],
+            "evidence": [_verified_evidence("r")], "root_cause": "r", "confidence": "high",
+            "recommendations": [],
         }),
     ])
     Agent(cfg, StubConnector(), llm).run(req, store, d.diagnosis_id)
@@ -540,13 +747,15 @@ def test_empty_submit_result_is_steered_not_accepted():
             return super().chat(messages, tools, tool_choice)
 
     llm = RecordingLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
         # First: an empty submit_result (empty args {}).
         ScriptedLLM.tool_response("submit_result", {}),
         # After steering, the model submits a proper result.
         ScriptedLLM.tool_response("submit_result", {
             "symptom": "Pod 持续重启", "root_cause_code": "CRASH_LOOP_BACKOFF",
             "insufficient_evidence": False,
-            "evidence": [{"source": "kubernetes.status", "summary": "CrashLoopBackOff"}],
+            "evidence": [_verified_evidence("CrashLoopBackOff")],
             "root_cause": "应用崩溃", "confidence": "high", "recommendations": ["修复应用"],
         }),
     ])
@@ -610,7 +819,9 @@ def _alert_request(starts_at="2026-09-15T00:00:00Z") -> DiagnosisRequest:
 def _submit_ok() -> Any:
     return ScriptedLLM.tool_response("submit_result", {
         "symptom": "Pod 持续重启",
-        "evidence": [{"source": "kubernetes.status", "summary": "OOMKilled"}],
+        "root_cause_code": "CONTAINER_OOMKILLED",
+        "insufficient_evidence": False,
+        "evidence": [_verified_evidence("OOMKilled")],
         "root_cause": "容器内存上限不足",
         "confidence": "high",
         "recommendations": [],
@@ -677,7 +888,7 @@ def test_failed_tool_call_is_not_listed_as_an_investigation_step():
     llm = ScriptedLLM([
         ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
                                               "name": "payment-api-7b8c9"}),
-        _submit_ok(),
+        _abstain_result(),
     ])
     d = run(make_agent(llm, connector))
 
@@ -731,6 +942,8 @@ def test_alert_run_injects_starts_at_anchor_and_caps_the_window():
     neither omit it nor forge/override it, and cannot widen the window."""
     connector = _data_tool_connector()
     llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
         # 1) model omits any time argument (and asks for a huge window)
         ScriptedLLM.tool_response("query_metrics", {
             "kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9",
@@ -763,6 +976,8 @@ def test_manual_run_has_no_anchor_and_stays_now_relative():
     """Manual diagnoses must not carry an anchor; a forged one is dropped."""
     connector = _data_tool_connector()
     llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
         ScriptedLLM.tool_response("query_metrics", {
             "kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9",
             "metric": "memory", "range_minutes": 5,
@@ -785,6 +1000,8 @@ def test_alert_run_without_starts_at_marks_the_anchor_required():
     connector fails closed instead of answering a now-relative query."""
     connector = _data_tool_connector()
     llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
         ScriptedLLM.tool_response("query_metrics", {
             "kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9",
             "metric": "memory"}),
@@ -826,6 +1043,8 @@ def test_alert_run_with_invalid_starts_at_passes_it_through_flagged():
 def test_manual_run_never_marks_an_anchor_required():
     connector = _data_tool_connector()
     llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
         # The model even tries to forge the flag: it must be dropped.
         ScriptedLLM.tool_response("query_metrics", {
             "kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9",
@@ -942,3 +1161,239 @@ def test_alert_labels_are_capped_by_total_budget():
     for key, value in rendered.items():
         assert len(value) <= _ALERT_VALUE_MAX_CHARS, f"{key} rendered {len(value)} chars"
     assert 0 < _rendered_fields_cost(rendered) <= _ALERT_FIELDS_TOTAL_MAX_CHARS
+
+
+def test_evidence_assertion_validator_reports_mismatch_and_unverifiable():
+    from app.validation import MISMATCH, UNVERIFIABLE, validate_submission
+
+    results = [{"tool": "inspect", "kind": "realtime",
+                "output": json.dumps({"actual_state": {"restart_count": 37}})}]
+    ok, problems, report = validate_submission({
+        "root_cause_code": "CONTAINER_OOMKILLED", "root_cause": "rc",
+        "insufficient_evidence": False,
+        "evidence": [{"source": "kubernetes.status", "path": "actual_state.restart_count",
+                      "operator": "equals", "value": "99"}],
+    }, results)
+    assert not ok
+    assert report[0]["status"] == MISMATCH
+    assert report[0]["expected"] == "99" and report[0]["actual"] == 37
+    assert any("verified real-time evidence" in p for p in problems)
+
+    # Retrieval-only "evidence" can never satisfy the final gate.
+    ok2, _, report2 = validate_submission({
+        "root_cause_code": "CONTAINER_OOMKILLED", "root_cause": "rc",
+        "insufficient_evidence": False,
+        "evidence": [{"source": "knowledge.runbook", "value": "x"}],
+    }, [{"tool": "search_knowledge", "kind": "retrieval", "output": "[]"}])
+    assert not ok2
+    assert report2[0]["status"] == UNVERIFIABLE
+
+
+def test_explicit_root_cause_without_verifiable_evidence_is_rejected():
+    seen: list[list[dict]] = []
+
+    class RecordingLLM(ScriptedLLM):
+        def chat(self, messages, tools, tool_choice):
+            seen.append([dict(m) for m in messages])
+            return super().chat(messages, tools, tool_choice)
+
+    llm = RecordingLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "s", "root_cause_code": "CONTAINER_OOMKILLED",
+            "insufficient_evidence": False,
+            "evidence": [{"source": "kubernetes.status", "path": "actual_state.phase",
+                          "operator": "equals", "value": "Terminated", "summary": "invented"}],
+            "root_cause": "rc", "confidence": "high", "recommendations": []}),
+        _submit_ok(),
+    ])
+    d = run(make_agent(llm))
+
+    assert d.status == "completed"
+    # The rejected submission is reported back with expected/actual.
+    rejections = [m for m in seen[2] if m.get("role") == "tool"
+                  and "submit_result" in (m.get("content") or "")
+                  and "mismatch" in (m.get("content") or "")]
+    assert rejections, "expected the gate to hand the mismatch back to the model"
+
+
+def test_out_of_vocabulary_root_cause_code_is_rejected():
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "s", "root_cause_code": "TOTALLY_MADE_UP",
+            "insufficient_evidence": False, "evidence": [_verified_evidence("x")],
+            "root_cause": "rc", "confidence": "high", "recommendations": []}),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "s", "root_cause_code": "CRASH_LOOP_BACKOFF",
+            "insufficient_evidence": False, "evidence": [_verified_evidence("x")],
+            "root_cause": "rc", "confidence": "high", "recommendations": []}),
+    ])
+    d = run(make_agent(llm))
+
+    assert d.status == "completed"
+    assert d.result.root_cause_code == "CRASH_LOOP_BACKOFF"
+
+
+def test_abstention_with_a_conclusion_is_rejected():
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "s", "root_cause_code": "CONTAINER_OOMKILLED", "root_cause": "rc",
+            "insufficient_evidence": True, "evidence": [_verified_evidence("x")],
+            "confidence": "low", "recommendations": []}),
+        _abstain_result(),
+    ])
+    d = run(make_agent(llm))
+
+    assert d.status == "completed"
+    assert d.result.insufficient_evidence is True
+    assert not d.result.root_cause_code
+
+
+def test_tools_outside_the_diagnosis_scope_are_blocked():
+    connector = StubConnector()
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        # Out of scope: another namespace / name.
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "kube-system",
+                                              "name": "coredns-abc"}),
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        _submit_ok(),
+    ])
+    d = run(make_agent(llm, connector))
+
+    assert d.status == "completed"
+    # Only the two in-scope inspects reached the connector.
+    assert connector.call_log == ["inspect", "inspect"]
+
+
+def test_relations_discovered_resources_become_in_scope():
+    class RelConnector(StubConnector):
+        def relations(self, target):
+            self.call_log.append("relations")
+            return {"target": target, "relations": [
+                {"role": "child", "kind": "Pod", "namespace": "payment",
+                 "name": "payment-api-7b8c9-child", "apiVersion": "v1"}]}
+
+    connector = RelConnector()
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("relations", {"kind": "Pod", "namespace": "payment",
+                                                "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9-child"}),
+        _submit_ok(),
+    ])
+    d = run(make_agent(llm, connector))
+
+    assert d.status == "completed"
+    assert connector.call_log == ["relations", "inspect"]
+
+
+def test_target_uid_is_injected_into_every_target_tool():
+    """The diagnosis target's UID travels with every tool call that addresses
+    it, so the connector can detect a recreated object (not just inspect)."""
+    connector = _data_tool_connector()
+    target_args = {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", dict(target_args)),
+        ScriptedLLM.tool_response("relations", dict(target_args)),
+        ScriptedLLM.tool_response("events", dict(target_args)),
+        ScriptedLLM.tool_response("logs", {"namespace": "payment", "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("query_metrics", {**target_args, "metric": "memory"}),
+        ScriptedLLM.tool_response("query_logs", {"namespace": "payment", "name": "payment-api-7b8c9"}),
+        _submit_ok(),
+    ])
+    d = run(make_agent(llm, connector))
+
+    assert d.status == "completed"
+    for tool in ("inspect", "relations", "events", "logs", "query_metrics", "query_logs"):
+        calls = connector.targets.get(tool) or []
+        assert calls, f"expected a {tool} call"
+        assert calls[0].get("uid") == "uid-1", f"{tool} lost the target uid: {calls[0]}"
+
+
+def test_uid_mismatch_tool_error_aborts_the_diagnosis():
+    """A tool that answers uid_mismatch means the object is gone: the diagnosis
+    must stop instead of mixing in the recreated object's data."""
+    from app.connector import ToolError
+
+    class RecreatedConnector(StubConnector):
+        def logs(self, target, **kwargs):
+            raise ToolError("uid_mismatch",
+                            "target resource was recreated (uid mismatch): Pod/payment/p")
+
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("logs", {"namespace": "payment",
+                                           "name": "payment-api-7b8c9"}),
+        _submit_ok(),
+    ])
+    d = run(make_agent(llm, RecreatedConnector()))
+
+    assert d.status == "failed"
+    assert "recreated" in (d.error or "")
+
+
+def test_cancelled_diagnosis_stops_before_the_next_tool():
+    """A cancel request is honoured between rounds: no further tool runs."""
+    store = SessionStore()
+    d = store.create(make_request())
+
+    class CancellingConnector(StubConnector):
+        def inspect(self, target):
+            self._maybe_raise("inspect")
+            self.targets.setdefault("inspect", []).append(target)
+            store.request_cancel(d.diagnosis_id)   # simulate an eval timeout
+            return self._inspect_response or {
+                "target": target, "exists": True, "uid_mismatch": False,
+                "desired_state": {}, "conditions": [], "anomalies": [],
+                "actual_state": {"phase": "Running", "restart_count": 0},
+            }
+
+    connector = CancellingConnector()
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("events", {"kind": "Pod", "namespace": "payment",
+                                             "name": "payment-api-7b8c9"}),
+        _submit_ok(),
+    ])
+    make_agent(llm, connector).run(make_request(), store, d.diagnosis_id)
+
+    row = store.get(d.diagnosis_id)
+    assert row.status == "failed"
+    assert row.failure_reason == "cancelled"
+    assert connector.call_log == ["inspect"]   # the events call never happened
+
+
+def test_root_cause_vocabulary_has_two_levels_and_exposes_both():
+    from app.root_causes import (FAILURE_MODE_CODES, ROOT_CAUSE_CODE_VERSION,
+                                 ROOT_CAUSE_CODES, ROOT_CAUSE_CODES_V1,
+                                 ROOT_CAUSE_CODES_V2, is_valid_root_cause_code)
+    from app.tools import tool_definitions
+
+    assert ROOT_CAUSE_CODE_VERSION == "v2"
+    # Cause-level codes are new; failure-mode codes stay valid for compatibility.
+    assert "NODE_SELECTOR_MISMATCH" in ROOT_CAUSE_CODES_V2
+    assert "CRASH_LOOP_BACKOFF" in ROOT_CAUSE_CODES_V1
+    assert is_valid_root_cause_code("APPLICATION_EXIT_NONZERO")
+    assert is_valid_root_cause_code("CRASH_LOOP_BACKOFF")
+    assert not is_valid_root_cause_code("MADE_UP_CODE")
+    # The schema offers both levels so the model can be as specific as evidence allows.
+    submit = next(d for d in tool_definitions({}, {})
+                  if d["function"]["name"] == "submit_result")
+    enum = submit["function"]["parameters"]["properties"]["root_cause_code"]["enum"]
+    assert "NODE_SELECTOR_MISMATCH" in enum and "PVC_UNBOUND" in enum
+    assert "CRASH_LOOP_BACKOFF" in enum
+    # Failure-mode codes are explicitly flagged (used to keep cause-level case
+    # ground truth from accepting them).
+    assert "SCHEDULING_FAILED" in FAILURE_MODE_CODES
+    assert "HEALTHY" not in FAILURE_MODE_CODES
+    assert "NODE_SELECTOR_MISMATCH" not in FAILURE_MODE_CODES

@@ -91,6 +91,13 @@ class DiagnosisRequest(BaseModel):
     # profiles are rejected (422) before a session is created.
     model_profile: Optional[str] = None
 
+    # --- Eval-only investigation budgets (design: rounds != tool calls) ---
+    # Honoured only when eval_run_id is present (rejected otherwise) and frozen
+    # when the session is created, so a Case's declared budget is reproducible
+    # and product clients can never widen their own budget.
+    eval_max_tool_calls: Optional[int] = None
+    eval_max_agent_rounds: Optional[int] = None
+
 
 class Evidence(BaseModel):
     """Evidence item. Structured fields (resource_uid/path/operator/value) are
@@ -136,6 +143,9 @@ class Diagnosis(BaseModel):
     status: str  # queued | investigating | completed | failed
     result: Optional[DiagnosisResult] = None
     error: Optional[str] = None
+    # Machine-readable failure cause, e.g. "budget_exhausted". None when the
+    # session completed (including valid abstention).
+    failure_reason: Optional[str] = None
     # Phase 5 / Diagnosis Center: nullable alert lifecycle projection (None when
     # the diagnosis is manual or predates alert tracking).
     alert: Optional[dict] = None

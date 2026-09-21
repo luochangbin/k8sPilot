@@ -89,13 +89,18 @@ def test_retrieval_tools_gated_by_request_and_references_resolved():
             return ScriptedLLM.tool_response("submit_result", {
                 "symptom": "容器重启", "root_cause_code": "CONTAINER_OOMKILLED",
                 "insufficient_evidence": False,
-                "evidence": [{"source": "kubernetes.status", "summary": "OOMKilled"}],
+                "evidence": [{"source": "kubernetes.status",
+                              "path": "actual_state.restart_count", "operator": "equals",
+                              "value": "37", "summary": "OOMKilled"}],
                 "root_cause": "内存超限", "confidence": "high", "recommendations": [],
                 "knowledge_references": [{"retrieval_id": rid, "used_for": "explanation"}],
             })
 
     llm = RecordingLLM([
         ScriptedLLM.tool_response("search_knowledge", {"query": "OOMKilled memory limit"}),
+        # A real-time tool result is required before an explicit conclusion can
+        # pass the deterministic gate; retrieval hits never count as evidence.
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "n", "name": "p"}),
     ])
     req = DiagnosisRequest(trigger=Trigger.manual,
                            resource=ResourceRef(kind="Pod", namespace="n", name="p", uid="u"),

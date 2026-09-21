@@ -2,7 +2,6 @@
 concurrency, rate limiting and persistence (design §26)."""
 
 import time
-from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
@@ -371,16 +370,14 @@ def test_worker_thread_start_failure_is_visible_not_silently_queued():
     client, store = make_client_with_store()
     raw = TestClient(client.app, raise_server_exceptions=False)
 
-    class _Boom:
-        def __init__(self, *args, **kwargs):
-            pass
+    class _BoomPool:
+        """Stands in for the worker pool; submit() fails like a shut-down pool."""
 
-        def start(self):
-            raise RuntimeError("no threads")
+        def submit(self, *args, **kwargs):
+            raise RuntimeError("no workers")
 
-    # Patch only the reference used by app.main; patching threading.Thread
-    # globally would also break the test client's own worker threads.
-    with patch("app.main.threading", SimpleNamespace(Thread=_Boom)):
+    # Patch only the app's worker pool; the agent is dispatched through it now.
+    with patch.object(client.app.state, "executor", _BoomPool()):
         resp = raw.post("/api/v1/diagnoses", json=_alert_body("fp-thread"))
     assert resp.status_code == 500
     rows = store.list(10)

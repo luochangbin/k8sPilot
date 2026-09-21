@@ -64,3 +64,44 @@ def test_update_does_not_clobber_result(tmp_path):
     got = s.update(d.diagnosis_id, error="later")
     assert got.result is not None
     assert got.result.root_cause == "r"
+
+
+def test_request_cancel_is_idempotent_and_terminal_aware():
+    from app.models import DiagnosisRequest, ResourceRef, Trigger
+
+    store = SessionStore()
+    req = DiagnosisRequest(trigger=Trigger.manual,
+                           resource=ResourceRef(kind="Pod", namespace="ns", name="p", uid="u"))
+    d = store.create(req)
+
+    assert store.is_cancelled(d.diagnosis_id) is False
+    assert store.request_cancel(d.diagnosis_id) == "ok"
+    assert store.is_cancelled(d.diagnosis_id) is True
+    assert store.request_cancel(d.diagnosis_id) == "ok"  # idempotent
+    assert store.request_cancel("diag_missing") == "not_found"
+
+    store.update(d.diagnosis_id, status="completed")
+    assert store.request_cancel(d.diagnosis_id) == "terminal"
+
+
+def test_mark_orphans_failed_only_touches_non_terminal_sessions():
+    from app.models import DiagnosisRequest, ResourceRef, Trigger
+
+    store = SessionStore()
+    made = {}
+    for status in ("queued", "investigating", "completed", "failed"):
+        d = store.create(DiagnosisRequest(
+            trigger=Trigger.manual,
+            resource=ResourceRef(kind="Pod", namespace="ns", name=status, uid=status)))
+        store.update(d.diagnosis_id, status=status)
+        made[status] = d.diagnosis_id
+
+    assert store.mark_orphans_failed("agent service restarted during diagnosis") == 2
+
+    for status in ("queued", "investigating"):
+        row = store.get(made[status])
+        assert row.status == "failed"
+        assert row.failure_reason == "agent_restarted"
+        assert "restarted" in (row.error or "")
+    assert store.get(made["completed"]).status == "completed"
+    assert store.get(made["failed"]).status == "failed"

@@ -39,7 +39,17 @@ class Config:
         self.llm_max_retries: int = int(_env("LLM_MAX_RETRIES", "2"))
         self.llm_max_tokens: int = int(_env("LLM_MAX_TOKENS", "2048"))
 
+        # Investigation budgets (design: rounds != tool calls).
+        #   max_agent_rounds = max LLM decision responses (a rejected multi-tool
+        #     response still consumes a round).
+        #   max_tool_calls   = max investigation tools actually executed;
+        #     submit_result never counts, policy-rejected calls never count.
+        self.max_agent_rounds: int = int(_env("MAX_AGENT_ROUNDS", "12"))
         self.max_tool_calls: int = int(_env("MAX_TOOL_CALLS", "12"))
+        # Global worker pool: bounds concurrent investigations so a burst of
+        # requests cannot spawn unbounded LLM/connector load. Requests beyond the
+        # limit stay "queued" until a worker frees up.
+        self.max_concurrent_diagnoses: int = int(_env("MAX_CONCURRENT_DIAGNOSES", "4"))
 
         # Phase 2 eval trace: when set, per-diagnosis JSONL trace files are
         # written to this directory. Empty disables tracing (product default).

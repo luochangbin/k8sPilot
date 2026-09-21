@@ -26,6 +26,7 @@ from .prompts import SYSTEM_PROMPT, user_message
 from .root_causes import is_valid_root_cause_code
 from .store import SessionStore
 from .tools import apply_alert_anchor, execute_tool, tool_definitions
+from .validation import validate_submission
 from .trace import (
     AGENT_PLANNING,
     CONNECTOR,
@@ -38,8 +39,45 @@ from .trace import (
 )
 
 
+BUDGET_EXHAUSTED = "budget_exhausted"
+
+# Tool -> (kind field, namespace field, name field). None kind means the tool is
+# Pod-only (logs/query_logs).
+_TOOL_SCOPE: dict[str, tuple[Optional[str], str, str]] = {
+    "inspect": ("kind", "namespace", "name"),
+    "relations": ("kind", "namespace", "name"),
+    "events": ("kind", "namespace", "name"),
+    "query_metrics": ("kind", "namespace", "name"),
+    "logs": (None, "namespace", "name"),
+    "query_logs": (None, "namespace", "name"),
+}
+
+SCOPE_VIOLATION = (
+    "resource is outside the current diagnosis scope: {kind}/{namespace}/{name}. "
+    "Only the diagnosis target and resources discovered through relations() may "
+    "be queried."
+)
+
+POLICY_ONE_TOOL = (
+    "Each investigation round may execute only one tool. Select the single "
+    "highest-value next action based on current evidence and retry with exactly "
+    "one tool call; multiple tool calls are rejected as a policy violation."
+)
+
+
 class UIDMismatchError(Exception):
     """Raised when the target resource was recreated (UID differs)."""
+
+
+class DiagnosisCancelled(Exception):
+    """The session was cancelled (eval timeout / explicit cancel). Cooperative
+    stop: no further LLM call or tool execution is started."""
+
+
+class BudgetExhaustedError(Exception):
+    """Investigation budgets ran out and the terminal-only round produced no
+    valid submit_result. This is a planning/system failure, NOT an abstention."""
+
 
 
 _STEP_LABELS = {
@@ -58,17 +96,44 @@ class Agent:
         self.llm = llm
         self.knowledge = knowledge  # Optional KnowledgeService (Phase 4)
 
+    def effective_budgets(self, req: DiagnosisRequest) -> dict[str, int]:
+        """Frozen per-session budgets: Case budgets may only *shrink* the
+        service defaults, and only for eval runs (checked by the API layer)."""
+        max_rounds = self.cfg.max_agent_rounds
+        max_tools = self.cfg.max_tool_calls
+        if req.eval_run_id:
+            if req.eval_max_agent_rounds is not None:
+                max_rounds = min(max_rounds, req.eval_max_agent_rounds)
+            if req.eval_max_tool_calls is not None:
+                max_tools = min(max_tools, req.eval_max_tool_calls)
+        return {"max_agent_rounds": max(1, max_rounds), "max_tool_calls": max(1, max_tools)}
+
     def run(self, req: DiagnosisRequest, store: SessionStore, diagnosis_id: str,
             execution: Optional[ExecutionContext] = None) -> None:
         llm = execution.llm if execution is not None else self.llm
         store.update(diagnosis_id, status="investigating")
         steps: list[str] = []
         retrieved: dict[str, Any] = {}
+        budgets = self.effective_budgets(req)
+        # Observable budget/policy accounting, surfaced on the root span.
+        budget: dict[str, Any] = {
+            **budgets,
+            "rounds_used": 0,
+            "tool_calls_used": 0,
+            "multi_tool_rejected_rounds": 0,
+        }
         trace = self._new_trace(req, diagnosis_id, execution)
         try:
-            self._run_inner(req, store, diagnosis_id, steps, trace, retrieved, llm, execution)
+            self._run_inner(req, store, diagnosis_id, steps, trace, retrieved, llm, execution,
+                            budget)
         except UIDMismatchError as exc:
             self._fail(store, diagnosis_id, str(exc), steps, trace, KUBERNETES_API)
+        except DiagnosisCancelled as exc:
+            self._fail(store, diagnosis_id, str(exc), steps, trace, AGENT_PLANNING,
+                       failure_reason="cancelled")
+        except BudgetExhaustedError as exc:
+            self._fail(store, diagnosis_id, str(exc), steps, trace, AGENT_PLANNING,
+                       failure_reason=BUDGET_EXHAUSTED)
         except ConnectorError as exc:
             self._fail(store, diagnosis_id, str(exc), steps, trace, CONNECTOR)
         except LLMError as exc:
@@ -78,11 +143,10 @@ class Agent:
         else:
             d = store.get(diagnosis_id)
             if trace is not None:
-                # Normal return: either completed, or _run_inner failed the
-                # session after exhausting the tool-call budget (planning).
                 layer = AGENT_PLANNING if (d and d.status == "failed") else None
                 trace.finish(d.status if d else "unknown",
-                             error=d.error if d else None, failure_layer=layer)
+                             error=d.error if d else None, failure_layer=layer,
+                             attributes=dict(budget))
 
     def _new_trace(self, req: DiagnosisRequest, diagnosis_id: str,
                    execution: Optional[ExecutionContext] = None) -> Optional[DiagnosisTrace]:
@@ -164,9 +228,11 @@ class Agent:
 
     @staticmethod
     def _fail(store: SessionStore, diagnosis_id: str, message: str,
-              steps: list[str], trace: Optional[DiagnosisTrace], layer: str) -> None:
+              steps: list[str], trace: Optional[DiagnosisTrace], layer: str,
+              failure_reason: Optional[str] = None) -> None:
         store.update(diagnosis_id, status="failed", error=message,
-                     result=DiagnosisResult(investigation_steps=steps))
+                     result=DiagnosisResult(investigation_steps=steps),
+                     failure_reason=failure_reason)
         if trace is not None:
             trace.finish("failed", error=message, failure_layer=layer)
 
@@ -184,7 +250,9 @@ class Agent:
                    steps: list[str], trace: Optional[DiagnosisTrace],
                    retrieved: Optional[dict[str, Any]] = None,
                    llm: Any = None,
-                   execution: Optional[ExecutionContext] = None) -> None:
+                   execution: Optional[ExecutionContext] = None,
+                   budget: Optional[dict[str, Any]] = None,
+                   tool_results: Optional[list[dict[str, Any]]] = None) -> None:
         llm = llm if llm is not None else self.llm
         if req.resource.kind not in DIAGNOSABLE_KINDS:
             raise Exception(f"Phase 3 仅支持诊断 {', '.join(DIAGNOSABLE_KINDS)}，收到 {req.resource.kind}")
@@ -198,11 +266,108 @@ class Agent:
         ]
         tools = tool_definitions(capabilities, retrieval)
 
-        for iteration in range(self.cfg.max_tool_calls):
+        if budget is None:
+            budget = {**self.effective_budgets(req), "rounds_used": 0,
+                      "tool_calls_used": 0, "multi_tool_rejected_rounds": 0}
+        tool_results = tool_results if tool_results is not None else []
+        allowed: set[tuple[str, str, str]] = set()
+        if req.resource is not None:
+            allowed.add(self._scope_key(req.resource.kind, req.resource.namespace,
+                                        req.resource.name))
+
+        def _finalize_only() -> None:
+            """Terminal-only round after the investigation budgets ran out.
+
+            The model may still submit a valid conclusion or a valid abstention
+            from the evidence it already gathered. If it cannot, the session
+            fails with failure_reason=budget_exhausted (a planning failure, never
+            silently converted into an abstention).
+            """
+            forced: Any = {"type": "function", "function": {"name": "submit_result"}}
+            for attempt in range(2):
+                if store.is_cancelled(diagnosis_id):
+                    raise DiagnosisCancelled("diagnosis cancelled")
+                t0 = time.time()
+                try:
+                    resp = llm.chat(messages, tools, forced)
+                except LLMError as exc:
+                    if trace is not None:
+                        trace.llm_call(duration_ms=(time.time() - t0) * 1000.0,
+                                       retries=int(getattr(llm, "max_retries", 0)),
+                                       error="LLM request failed")
+                    raise
+                if trace is not None:
+                    attempts = int(getattr(llm, "last_attempt_count", 1) or 1)
+                    usage = getattr(resp, "usage", None)
+                    trace.llm_call(
+                        duration_ms=(time.time() - t0) * 1000.0,
+                        retries=max(0, attempts - 1), attempts=attempts,
+                        finish_reason=(getattr(resp.choices[0], "finish_reason", None)
+                                       if resp.choices else None),
+                        prompt_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+                        completion_tokens=(getattr(usage, "completion_tokens", None)
+                                           if usage else None),
+                        response_model=getattr(resp, "model", None))
+                msg = resp.choices[0].message
+                calls = getattr(msg, "tool_calls", None) or []
+                assistant_msg: dict[str, Any] = {"role": "assistant", "content": msg.content}
+                if calls:
+                    assistant_msg["tool_calls"] = [self._tool_call_payload(tc) for tc in calls]
+                messages.append(assistant_msg)
+                submit_tc = next((tc for tc in calls
+                                  if tc.function.name == "submit_result"), None)
+                if submit_tc is None:
+                    messages.append({
+                        "role": "user",
+                        "content": "调查预算已用尽。请只调用 submit_result 提交最终结论；"
+                                   "若证据不足，请设置 insufficient_evidence=true 并填写 "
+                                   "missing_evidence，不要继续调用调查工具。",
+                    })
+                    continue
+                try:
+                    args = json.loads(submit_tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                if self._submit_valid(args):
+                    parsed = self._parse_result(args, steps, retrieved)
+                    ok, problems, verification = validate_submission(
+                        parsed.model_dump(), tool_results)
+                    if ok:
+                        result = parsed
+                        if trace is not None:
+                            schema_valid = (result.root_cause_code is None
+                                            or is_valid_root_cause_code(result.root_cause_code))
+                            trace.llm_final(root_cause_code=result.root_cause_code,
+                                            schema_valid=schema_valid,
+                                            confidence=result.confidence)
+                        store.update(diagnosis_id, status="completed", result=result)
+                        return
+                    messages.append({
+                        "role": "tool", "tool_call_id": submit_tc.id,
+                        "content": ("submit_result 未通过确定性校验：\n- "
+                                    + "\n- ".join(problems)
+                                    + "\n证据校验：" + json.dumps(verification,
+                                                                   ensure_ascii=False)[:600]),
+                    })
+                    continue
+                messages.append({
+                    "role": "tool", "tool_call_id": submit_tc.id,
+                    "content": "submit_result 参数为空或缺少关键字段，请在本次收口中补全。",
+                })
+            raise BudgetExhaustedError(
+                f"调查预算已用尽（rounds={budget['rounds_used']}/"
+                f"{budget['max_agent_rounds']}, tools={budget['tool_calls_used']}/"
+                f"{budget['max_tool_calls']}）且未能在收口轮提交合法结论")
+
+        while True:
+            if store.is_cancelled(diagnosis_id):
+                raise DiagnosisCancelled("diagnosis cancelled")
+            if (budget["tool_calls_used"] >= budget["max_tool_calls"]
+                    or budget["rounds_used"] >= budget["max_agent_rounds"]):
+                _finalize_only()
+                return
+            budget["rounds_used"] += 1
             tool_choice: Any = "auto"
-            if iteration == self.cfg.max_tool_calls - 1:
-                # Force a structured final answer on the last allowed call.
-                tool_choice = {"type": "function", "function": {"name": "submit_result"}}
 
             t0 = time.time()
             try:
@@ -258,6 +423,23 @@ class Agent:
                     })
                 continue
 
+            if len(tool_calls) > 1:
+                # Policy: one investigation tool per round. Executing "the first
+                # one" would silently pick a tool for the model; instead reject
+                # the whole round, consume the round (not the tool budget), and
+                # make every tool_call_id answerable.
+                budget["multi_tool_rejected_rounds"] += 1
+                for tc in tool_calls:
+                    messages.append({"role": "tool", "tool_call_id": tc.id,
+                                     "content": POLICY_ONE_TOOL})
+                if trace is not None:
+                    trace.emit("agent.multi_tool_rejected", "agent_planning", {
+                        "round": budget["rounds_used"],
+                        "tool_calls": len(tool_calls),
+                        "tools": [tc.function.name for tc in tool_calls],
+                    })
+                continue
+
             for tc in tool_calls:
                 name = tc.function.name
                 try:
@@ -279,7 +461,29 @@ class Agent:
                             "content": "submit_result 参数为空或缺少关键字段。请基于已收集的证据，完整填写 symptom、root_cause_code/root_cause、evidence、confidence、recommendations 后重新调用 submit_result。若证据确实不足，请正确设置 insufficient_evidence=true 并说明 missing_evidence。",
                         })
                         continue
-                    result = self._parse_result(args, steps, retrieved)
+                    parsed = self._parse_result(args, steps, retrieved)
+                    ok, problems, verification = validate_submission(
+                        parsed.model_dump(), tool_results)
+                    if not ok:
+                        # Deterministic gate rejected the submission: feed the
+                        # report back to the SAME model so it can fix the
+                        # evidence/hypothesis, keep investigating, or abstain.
+                        messages.append({
+                            "role": "tool", "tool_call_id": tc.id,
+                            "content": ("submit_result 未通过确定性校验，本次提交作废：\n- "
+                                        + "\n- ".join(problems)
+                                        + "\n证据校验：" + json.dumps(verification,
+                                                                       ensure_ascii=False)[:800]
+                                        + "\n请修正证据/结论后重新提交；若证据确实不足，"
+                                          "请提交合法弃权（insufficient_evidence=true + "
+                                          "missing_evidence）。"),
+                        })
+                        if trace is not None:
+                            trace.emit("agent.submission_rejected", "agent_planning",
+                                       {"problems": problems,
+                                        "verification": verification[:5]})
+                        continue
+                    result = parsed
                     if trace is not None:
                         schema_valid = (
                             result.root_cause_code is None
@@ -290,6 +494,10 @@ class Agent:
                     store.update(diagnosis_id, status="completed", result=result)
                     return
 
+                if store.is_cancelled(diagnosis_id):
+                    raise DiagnosisCancelled("diagnosis cancelled")
+                budget["tool_calls_used"] += 1
+                scope_error = self._scope_violation(name, args, allowed)
                 args = self._inject_target_uid(name, args, req.resource)
                 # Alert runs get the trusted starts_at anchor (and a bounded
                 # window); the model's own time arguments are ignored.
@@ -298,6 +506,10 @@ class Agent:
                 tool_err: Optional[str] = None
                 fail_layer: Optional[str] = None
                 try:
+                    if scope_error:
+                        # Never reach the connector with an out-of-scope target:
+                        # prompt-injected text must not widen the blast radius.
+                        raise ToolError("out_of_scope", scope_error)
                     if name == "search_knowledge":
                         refs = self.knowledge.search_knowledge(
                             args.get("query", ""),
@@ -333,6 +545,10 @@ class Agent:
                         diagnosis_id, name, json.dumps(args, ensure_ascii=False), output,
                     )
                 except ToolError as exc:
+                    if exc.code == "uid_mismatch":
+                        # Hard stop: the object this diagnosis is about no longer
+                        # exists; continuing would attribute new-object data to it.
+                        raise UIDMismatchError(str(exc)) from exc
                     logger.error(
                         "diagnosis %s: tool %s(%s) FAILED connector error [%s]: %s",
                         diagnosis_id, name, json.dumps(args, ensure_ascii=False), exc.code, exc,
@@ -357,6 +573,18 @@ class Agent:
                 if name == "inspect" and self._uid_mismatch(output):
                     raise UIDMismatchError("目标资源已重建（当前 UID 与请求不一致），拒绝本次诊断")
 
+                if tool_err is None:
+                    tool_results.append({
+                        "tool": name,
+                        "args": args,
+                        "output": output,
+                        "kind": ("retrieval" if name in ("search_knowledge",
+                                                         "search_incidents")
+                                 else "realtime"),
+                    })
+                    if name == "relations":
+                        self._extend_scope(allowed, output)
+
                 # Only successful tool calls are listed as investigation steps;
                 # a failed call has no result and must not be shown as a success
                 # (the failure itself is recorded in the timeline/trace).
@@ -364,9 +592,9 @@ class Agent:
                     steps.append(self._step_summary(name, args))
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
 
-        store.update(diagnosis_id, status="failed",
-                     error=f"达到最大工具调用次数（{self.cfg.max_tool_calls}）仍未获得结论",
-                     result=DiagnosisResult(investigation_steps=steps))
+        # Unreachable: the loop only exits through _finalize_only() (which either
+        # completes the session or raises BudgetExhaustedError).
+        raise BudgetExhaustedError("investigation loop exited without a result")
 
     @staticmethod
     def _tool_call_payload(tc: Any) -> dict[str, Any]:
@@ -386,19 +614,63 @@ class Agent:
             payload.setdefault("extra_content", extra_content)
         return payload
 
-    @staticmethod
-    def _inject_target_uid(name: str, args: dict[str, Any], target: ResourceRef) -> dict[str, Any]:
-        """Pass the platform-provided UID into inspect calls for the target itself.
+    # ---- tool resource scope guard (prompt-injection blast radius) ----
 
-        The connector's inspect tool verifies UID to detect resource recreation.
+    @staticmethod
+    def _scope_key(kind: str, namespace: str, name: str) -> tuple[str, str, str]:
+        return (kind or "", namespace or "", name or "")
+
+    @staticmethod
+    def _scope_violation(name: str, args: dict[str, Any],
+                         allowed: set[tuple[str, str, str]]) -> Optional[str]:
+        spec = _TOOL_SCOPE.get(name)
+        if spec is None:
+            return None
+        kind_field, namespace_field, name_field = spec
+        kind = (args.get(kind_field) if kind_field else "Pod") or ""
+        namespace = args.get(namespace_field) or ""
+        resource_name = args.get(name_field) or ""
+        if Agent._scope_key(kind, namespace, resource_name) in allowed:
+            return None
+        return SCOPE_VIOLATION.format(kind=kind, namespace=namespace or "-",
+                                      name=resource_name or "-")
+
+    @staticmethod
+    def _extend_scope(allowed: set[tuple[str, str, str]], output: str) -> None:
+        """Trust only ResourceRefs the connector actually returned."""
+        try:
+            body = json.loads(output)
+        except (TypeError, ValueError):
+            return
+        for ref in body.get("relations") or []:
+            if not isinstance(ref, dict):
+                continue
+            allowed.add(Agent._scope_key(ref.get("kind"), ref.get("namespace"),
+                                         ref.get("name")))
+
+    @staticmethod
+    def _inject_target_uid(name: str, args: dict[str, Any],
+                           target: Optional[ResourceRef]) -> dict[str, Any]:
+        """Pass the platform-provided UID into every tool call that targets the
+        diagnosis resource itself.
+
+        The connector uses it to detect a deleted-and-recreated object (same
+        name, new UID) so a diagnosis can never mix in the new object's events,
+        logs or metrics. Relations-discovered resources have no trusted UID and
+        are left untouched.
         """
-        if name != "inspect":
+        if target is None or not target.uid:
             return args
-        if args.get("kind") != target.kind:
+        spec = _TOOL_SCOPE.get(name)
+        if spec is None:
             return args
-        if args.get("name") != target.name:
+        kind_field, namespace_field, name_field = spec
+        kind = (args.get(kind_field) if kind_field else "Pod") or ""
+        if kind != target.kind:
             return args
-        if (args.get("namespace") or "") != (target.namespace or ""):
+        if (args.get(name_field) or "") != target.name:
+            return args
+        if (args.get(namespace_field) or "") != (target.namespace or ""):
             return args
         return {**args, "uid": target.uid}
 

@@ -22,6 +22,8 @@ class StubConnector:
         # alert time anchor actually reaches the connector.
         self.metrics_calls: list[dict[str, Any]] = []
         self.logs_calls: list[dict[str, Any]] = []
+        # Targets received per tool name (asserts UID propagation).
+        self.targets: dict[str, list[dict[str, Any]]] = {}
 
     def capabilities(self) -> dict[str, Any]:
         return self._capabilities if self._capabilities is not None else {}
@@ -35,6 +37,7 @@ class StubConnector:
 
     def inspect(self, target: dict[str, Any]) -> dict[str, Any]:
         self._maybe_raise("inspect")
+        self.targets.setdefault("inspect", []).append(target)
         return self._inspect_response or {
             "target": target,
             "exists": True,
@@ -47,14 +50,17 @@ class StubConnector:
 
     def relations(self, target: dict[str, Any]) -> dict[str, Any]:
         self._maybe_raise("relations")
+        self.targets.setdefault("relations", []).append(target)
         return {"target": target, "relations": []}
 
     def events(self, target: dict[str, Any], **kwargs) -> dict[str, Any]:
         self._maybe_raise("events")
+        self.targets.setdefault("events", []).append(target)
         return {"target": target, "count": 0, "events": [], "truncated": False}
 
     def logs(self, target: dict[str, Any], **kwargs) -> dict[str, Any]:
         self._maybe_raise("logs")
+        self.targets.setdefault("logs", []).append(target)
         return {"namespace": target.get("namespace"), "pod": target.get("name"),
                 "data": "line1\nline2", "truncated": False}
 
@@ -63,6 +69,7 @@ class StubConnector:
                       alert_time: Optional[str] = None,
                       alert_expected: Optional[bool] = None) -> dict[str, Any]:
         self._maybe_raise("query_metrics")
+        self.targets.setdefault("query_metrics", []).append(target)
         self.metrics_calls.append({"target": target, "metric": metric,
                                    "range_minutes": range_minutes, "alert_time": alert_time,
                                    "alert_expected": alert_expected})
@@ -75,6 +82,7 @@ class StubConnector:
                    alert_time: Optional[str] = None,
                    alert_expected: Optional[bool] = None) -> dict[str, Any]:
         self._maybe_raise("query_logs")
+        self.targets.setdefault("query_logs", []).append(target)
         self.logs_calls.append({"target": target, "range_minutes": range_minutes,
                                 "filter": filter, "max_lines": max_lines,
                                 "alert_time": alert_time, "alert_expected": alert_expected})

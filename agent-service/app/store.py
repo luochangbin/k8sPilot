@@ -18,6 +18,14 @@ from typing import Any, Optional
 from .models import Diagnosis, DiagnosisRequest
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Additive migration: SQLite has no ADD COLUMN IF NOT EXISTS."""
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        conn.commit()
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -34,6 +42,8 @@ CREATE TABLE IF NOT EXISTS diagnoses (
     status         TEXT NOT NULL,
     result         TEXT,
     error          TEXT,
+    failure_reason TEXT,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
     eval_run_id    TEXT,
     case_id        TEXT,
     case_version   TEXT,
@@ -107,6 +117,9 @@ class SessionStore:
         with self._lock:
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.executescript(_SCHEMA)
+            _ensure_column(self._conn, "diagnoses", "failure_reason", "TEXT")
+            _ensure_column(self._conn, "diagnoses", "cancel_requested",
+                           "INTEGER NOT NULL DEFAULT 0")
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.commit()
 
@@ -174,15 +187,18 @@ class SessionStore:
         return self._from_row(row) if row else None
 
     def update(self, diagnosis_id: str, *, status: Optional[str] = None,
-               result: Optional[Any] = None, error: Optional[str] = None) -> Optional[Diagnosis]:
+               result: Optional[Any] = None, error: Optional[str] = None,
+               failure_reason: Optional[str] = None) -> Optional[Diagnosis]:
         with self._lock:
             self._conn.execute(
                 "UPDATE diagnoses SET status = COALESCE(?, status), "
-                "result = COALESCE(?, result), error = COALESCE(?, error), updated_at = ? "
+                "result = COALESCE(?, result), error = COALESCE(?, error), "
+                "failure_reason = COALESCE(?, failure_reason), updated_at = ? "
                 "WHERE diagnosis_id = ?",
                 (status,
                  result.model_dump_json() if result is not None else None,
                  error,
+                 failure_reason,
                  _now(),
                  diagnosis_id),
             )
@@ -459,6 +475,53 @@ class SessionStore:
             next_cursor = (out[-1][sort_key], out[-1]["diagnosis_id"])
         return out, next_cursor
 
+    # ---- task lifecycle (cancel / restart recovery) ----
+
+    def request_cancel(self, diagnosis_id: str) -> str:
+        """Ask a running diagnosis to stop. Idempotent.
+
+        Returns ok | not_found | terminal. The worker checks the flag before
+        every LLM call and every tool execution, so the stop is cooperative but
+        prompt (no further model or connector work is started).
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM diagnoses WHERE diagnosis_id = ?", (diagnosis_id,)
+            ).fetchone()
+            if row is None:
+                return "not_found"
+            if row["status"] in ("completed", "failed"):
+                return "terminal"
+            self._conn.execute(
+                "UPDATE diagnoses SET cancel_requested = 1, updated_at = ? WHERE diagnosis_id = ?",
+                (_now(), diagnosis_id),
+            )
+            self._conn.commit()
+        return "ok"
+
+    def is_cancelled(self, diagnosis_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cancel_requested FROM diagnoses WHERE diagnosis_id = ?",
+                (diagnosis_id,),
+            ).fetchone()
+        return bool(row["cancel_requested"]) if row else False
+
+    def mark_orphans_failed(self, reason: str) -> int:
+        """Fail sessions left non-terminal by a previous process.
+
+        Worker threads do not survive a restart, so a persisted `queued` /
+        `investigating` row would otherwise hang forever.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE diagnoses SET status = 'failed', error = ?, failure_reason = ?, "
+                "updated_at = ? WHERE status IN ('queued', 'investigating')",
+                (reason, "agent_restarted", _now()),
+            )
+            self._conn.commit()
+        return int(cur.rowcount or 0)
+
     def ensure_viewer(self, viewer_id: str) -> str:
         """Return the viewer's baseline time, creating it on first sight.
 
@@ -516,10 +579,16 @@ class SessionStore:
     def mark_all_notifications_read(self, viewer_id: str) -> int:
         """Mark every currently-unread auto-diagnosis as read for this viewer.
 
+        Uses the *same* scope as count_unread_diagnoses (including the viewer's
+        first_seen baseline): a new browser must not stamp receipts on the
+        history it never saw as unread, and the returned count is exactly the
+        number of rows the user sees as unread.
+
         The candidate ids are snapshotted under the same lock as the inserts, so
         diagnoses that reach a terminal state while the request is in flight stay
         unread (they were not part of this snapshot).
         """
+        baseline = self.ensure_viewer(viewer_id)
         now = _now()
         with self._lock:
             rows = self._conn.execute(
@@ -527,8 +596,8 @@ class SessionStore:
                 "LEFT JOIN diagnosis_read_receipts r "
                 "  ON r.diagnosis_id = d.diagnosis_id AND r.viewer_id = ? "
                 "WHERE d.trigger = 'alert' AND d.status IN ('completed', 'failed') "
-                "  AND d.eval_run_id IS NULL AND r.read_at IS NULL",
-                (viewer_id,),
+                "  AND d.eval_run_id IS NULL AND r.read_at IS NULL AND d.updated_at > ?",
+                (viewer_id, baseline),
             ).fetchall()
             ids = [r["diagnosis_id"] for r in rows]
             for diagnosis_id in ids:
@@ -648,6 +717,7 @@ class SessionStore:
             status=row["status"],
             result=result,
             error=row["error"],
+            failure_reason=row["failure_reason"],
             eval_run_id=row["eval_run_id"],
             case_id=row["case_id"],
             case_version=row["case_version"],

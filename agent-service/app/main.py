@@ -3,6 +3,7 @@
 import json
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -143,6 +144,16 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
         if req.resource.uid is None and req.resource.kind in ("Pod", "Deployment", "PersistentVolumeClaim"):
             raise HTTPException(status_code=400, detail="需要提供 resource.uid")
 
+    # Bounded worker pool: concurrency is a global property, so a burst cannot
+    # spawn unbounded LLM/connector load. Excess requests stay "queued".
+    executor = ThreadPoolExecutor(max_workers=max(1, cfg.max_concurrent_diagnoses))
+    app.state.executor = executor
+
+    orphaned = store.mark_orphans_failed("agent service restarted during diagnosis")
+    if orphaned:
+        logger.warning("failed %d orphaned session(s) left non-terminal by a previous process",
+                       orphaned)
+
     def _start(req: DiagnosisRequest, execution: ExecutionContext,
                lifecycle_id: Optional[int] = None) -> dict[str, Any]:
         # For alerts, the diagnosis row and its lifecycle link are written in one
@@ -151,12 +162,8 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
         d = (store.create(req) if lifecycle_id is None
              else store.create_with_alert_link(req, lifecycle_id))
         try:
-            threading.Thread(
-                target=agent.run,
-                args=(req, store, d.diagnosis_id),
-                kwargs={"execution": execution},
-                daemon=True,
-            ).start()
+            app.state.executor.submit(agent.run, req, store, d.diagnosis_id,
+                                      execution=execution)
         except BaseException:
             # A queued row without a worker would poll forever: mark it failed so
             # the caller can release the claim and a retry can re-run it.
@@ -253,8 +260,21 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
         result["deduped"] = False
         return result
 
+    def _validate_eval_budgets(req: DiagnosisRequest) -> None:
+        """Case budgets may shrink a session only for eval runs; product clients
+        must never be able to widen (or shrink) their own budget."""
+        if req.eval_max_tool_calls is None and req.eval_max_agent_rounds is None:
+            return
+        if not req.eval_run_id:
+            raise HTTPException(status_code=422, detail="eval budgets require eval_run_id")
+        for name, value in (("eval_max_tool_calls", req.eval_max_tool_calls),
+                            ("eval_max_agent_rounds", req.eval_max_agent_rounds)):
+            if value is not None and value < 1:
+                raise HTTPException(status_code=422, detail=f"{name} must be >= 1")
+
     @app.post("/api/v1/diagnoses", status_code=201)
     def create_diagnosis(req: DiagnosisRequest) -> dict[str, Any]:
+        _validate_eval_budgets(req)
         if req.trigger == "alert":
             return _handle_alert(req)
         if req.trigger != "manual":
@@ -267,6 +287,17 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
         if limit < 1 or limit > 200:
             limit = 50
         return store.list(limit)
+
+    @app.post("/api/v1/diagnoses/{diagnosis_id}/cancel")
+    def cancel_diagnosis(diagnosis_id: str) -> dict[str, Any]:
+        """Cooperative stop: the worker checks this before every LLM call and
+        every tool execution."""
+        outcome = store.request_cancel(diagnosis_id)
+        if outcome == "not_found":
+            raise HTTPException(status_code=404, detail="diagnosis not found")
+        if outcome == "terminal":
+            raise HTTPException(status_code=409, detail="diagnosis already finished")
+        return {"diagnosis_id": diagnosis_id, "cancel_requested": True}
 
     @app.get("/api/v1/diagnoses/{diagnosis_id}")
     def get_diagnosis(diagnosis_id: str) -> Any:

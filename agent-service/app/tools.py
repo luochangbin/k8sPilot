@@ -5,7 +5,7 @@ owns fact-gathering, the LLM owns investigation orchestration.
 """
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 from .connector import ConnectorClient
 from .models import ResourceRef
@@ -357,10 +357,14 @@ def tool_definitions(capabilities: dict[str, Any] | None = None,
     return defs
 
 
-def target_payload(kind: str, namespace: str, name: str) -> dict[str, Any]:
+def target_payload(kind: str, namespace: str, name: str,
+                   uid: Optional[str] = None) -> dict[str, Any]:
     payload: dict[str, Any] = {"kind": kind, "name": name}
     if namespace:
         payload["namespace"] = namespace
+    if uid:
+        # The diagnosis target's UID lets the connector detect recreation.
+        payload["uid"] = uid
     return payload
 
 
@@ -389,7 +393,8 @@ def execute_tool(connector: ConnectorClient, name: str, args: dict[str, Any]) ->
     if name == "logs":
         return json.dumps(
             connector.logs(
-                target_payload("Pod", args.get("namespace", ""), args.get("name", "")),
+                target_payload("Pod", args.get("namespace", ""), args.get("name", ""),
+                               args.get("uid")),
                 container=args.get("container"),
                 previous=bool(args.get("previous", False)),
                 tail_lines=args.get("tail_lines"),
@@ -410,7 +415,8 @@ def execute_tool(connector: ConnectorClient, name: str, args: dict[str, Any]) ->
     if name == "query_logs":
         return json.dumps(
             connector.query_logs(
-                target_payload("Pod", args.get("namespace", ""), args.get("name", "")),
+                target_payload("Pod", args.get("namespace", ""), args.get("name", ""),
+                               args.get("uid")),
                 range_minutes=args.get("range_minutes"),
                 filter=args.get("filter"),
                 max_lines=args.get("max_lines"),
