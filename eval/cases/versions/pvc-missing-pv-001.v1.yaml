@@ -1,0 +1,32 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pvc-missing-pv-001
+case_version: "1"
+description: PVC stays Pending because its spec.volumeName points at a PersistentVolume that does not exist (binding can never succeed)
+target:
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  namespace: eval-pvc-missing-pv-001
+  name: missing-pv-claim
+setup:
+  manifests:
+    - manifests/pvc-missing-pv-001.v1.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_equals
+  path: status.phase
+  value: "Pending"
+  timeout_seconds: 90
+ground_truth:
+  accepted_root_cause_codes: [PVC_UNBOUND]
+  required_evidence:
+    - source: kubernetes.status
+      path: actual_state.phase
+      operator: equals
+      value: Pending
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

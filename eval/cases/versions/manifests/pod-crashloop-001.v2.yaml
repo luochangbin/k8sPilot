@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eval-pod-crashloop-001
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crashloop-demo
+  namespace: eval-pod-crashloop-001
+  labels:
+    app: crashloop-demo
+spec:
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "exit 1"]

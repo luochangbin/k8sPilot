@@ -1,0 +1,35 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: deploy-nodeselector-001
+case_version: "1"
+description: Deployment pods stay Pending because no node matches the pod template's nodeSelector
+target:
+  apiVersion: apps/v1
+  kind: Deployment
+  namespace: eval-deploy-nodeselector-001
+  name: selector-deploy
+setup:
+  manifests:
+    - manifests/deploy-nodeselector-001.v1.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_gte
+  path: status.unavailableReplicas
+  value: "1"
+  timeout_seconds: 120
+ground_truth:
+  accepted_root_cause_codes: [NODE_SELECTOR_MISMATCH]
+  required_evidence:
+    - source: kubernetes.events
+      operator: contains
+      value: didn't match
+    - source: kubernetes.status
+      path: actual_state.phase
+      operator: equals
+      value: Pending
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

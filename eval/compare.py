@@ -7,6 +7,7 @@ schema-valid-rate not down.
 """
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
@@ -98,6 +99,25 @@ def compare_runs(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
         reasons.append(
             "case_set mismatch: only differing ids are listed "
             f"baseline_only={sorted(b_set - c_set)} candidate_only={sorted(c_set - b_set)}")
+    # Paired comparison needs the same number of attempts per case on both
+    # sides; 12x5 vs 12x1 is not a paired delta.
+    b_counts = Counter(case_key(r) for r in _flat_rows(b_rows))
+    c_counts = Counter(case_key(r) for r in _flat_rows(c_rows))
+    if b_counts != c_counts:
+        reasons.append("case_attempt_count_mismatch: " + json.dumps(
+            {"baseline": dict(sorted(b_counts.items())),
+             "candidate": dict(sorted(c_counts.items()))}, sort_keys=True))
+    # Effective budgets (min(case, service)) change coverage/abstention/cost, so
+    # they must match per case; unknown must not be treated as same.
+    budget_reason = _budget_mismatch(b_rows, c_rows)
+    if budget_reason:
+        reasons.append(budget_reason)
+    # Case/fixture content hashes are audit-only, but when both sides record
+    # them and they differ, the "same case version" claim is not substantiated.
+    hash_reason = _hash_mismatch(b["run"], c["run"])
+    if hash_reason:
+        reasons.append(hash_reason)
+
     if not b_vocab or not c_vocab:
         # "Unknown" must never be treated as "same": without a recorded
         # vocabulary version the comparison cannot be proven valid.
@@ -116,6 +136,53 @@ def compare_runs(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
     return {"aggregate": agg, "per_case": per_case, "gates": gates,
             "comparable": comparable, "incomparable_reason": reason,
             "baseline_run": b["run"].get("run_id"), "candidate_run": c["run"].get("run_id")}
+
+
+def _budget_mismatch(b_rows: dict[str, list[dict[str, Any]]],
+                     c_rows: dict[str, list[dict[str, Any]]]) -> Optional[str]:
+    """Per-case effective budgets must be identical (and known) on both sides."""
+    def budgets(rows_by_case: dict[str, list[dict[str, Any]]]) -> dict[str, set]:
+        out: dict[str, set] = {}
+        for key, rows in rows_by_case.items():
+            out[key] = {
+                (r.get("effective_max_tool_calls"), r.get("effective_max_agent_rounds"),
+                 r.get("max_finalization_attempts"))
+                for r in rows
+            }
+        return out
+
+    b_budgets = budgets(b_rows)
+    c_budgets = budgets(c_rows)
+    diffs = {}
+    for key in sorted(set(b_budgets) & set(c_budgets)):
+        if b_budgets[key] != c_budgets[key]:
+            diffs[key] = {"baseline": sorted(map(str, b_budgets[key])),
+                          "candidate": sorted(map(str, c_budgets[key]))}
+    # Check BOTH sides: merging the dicts would hide one side's unknown values.
+    unknown = sorted(
+        key for key in set(b_budgets) | set(c_budgets)
+        if any(value[0] is None or value[1] is None
+               for value in (b_budgets.get(key, set()) | c_budgets.get(key, set())))
+    )
+    # "Unknown" is checked first: a side without trace budget data cannot be
+    # proven equal, and must not be reported as a concrete mismatch either.
+    if unknown:
+        return "effective_budget_unknown: " + ",".join(unknown)
+    if diffs:
+        return "effective_budget_mismatch: " + json.dumps(diffs, sort_keys=True)
+    return None
+
+
+def _hash_mismatch(b_meta: dict[str, Any], c_meta: dict[str, Any]) -> Optional[str]:
+    b_hashes = b_meta.get("case_hashes")
+    c_hashes = c_meta.get("case_hashes")
+    if not b_hashes or not c_hashes:
+        return None
+    if b_hashes != c_hashes:
+        keys = sorted(set(b_hashes) | set(c_hashes))
+        diff = [k for k in keys if b_hashes.get(k) != c_hashes.get(k)]
+        return "case_content_mismatch: " + ",".join(diff[:10])
+    return None
 
 
 def _flat_rows(rows_by_case: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:

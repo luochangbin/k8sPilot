@@ -864,7 +864,9 @@ def test_compare_refuses_case_set_and_vocabulary_drift(tmp_path):
         run_dir.mkdir()
         row = {"case_id": cases[0].split("@")[0], "case_version": cases[0].split("@")[1],
                "verdict": "diagnosis_correct", "fixture_ready": True,
-               "abstention_expected": False, "root_cause_correct": True}
+               "abstention_expected": False, "root_cause_correct": True,
+               "effective_max_tool_calls": 12, "effective_max_agent_rounds": 12,
+               "max_finalization_attempts": 1}
         write_jsonl(run_dir / "case-results.jsonl", [row])
         write_json(run_dir / "report.json", {
             "run": {"run_id": name, "cases": cases, "scorer_version": scorer,
@@ -980,7 +982,8 @@ def test_compare_requires_vocabulary_version_on_both_sides(tmp_path):
         write_jsonl(run_dir / "case-results.jsonl", [
             {"case_id": "pod-crashloop-001", "case_version": "1",
              "verdict": "diagnosis_correct", "fixture_ready": True,
-             "abstention_expected": False}])
+             "abstention_expected": False, "effective_max_tool_calls": 12,
+             "effective_max_agent_rounds": 12, "max_finalization_attempts": 1}])
         write_json(run_dir / "report.json", {
             "run": {"run_id": name, "cases": ["pod-crashloop-001@1"],
                     "scorer_version": "5", "root_cause_vocabulary_version": vocab},
@@ -1013,3 +1016,162 @@ def test_cli_accepts_a_bare_case_id_when_the_suite_has_one_version(tmp_path):
     with pytest.raises(Exception):
         _load_case_ids(suite2, ["pod-crashloop-001"])
     assert _load_case_ids(suite2, ["pod-crashloop-001@2"]) == ["pod-crashloop-001@2"]
+
+
+def test_benchmark_report_flags_uneven_attempt_counts():
+    """Equal case sets with unequal repetitions are not comparable."""
+    from eval.benchmark import build_benchmark_report
+
+    base = {**_row(_case(), verdict="diagnosis_correct"),
+            # Identity must be verified, otherwise the benchmark reports
+            # identity_unknown independently of the attempt-count question.
+            "identity_ok": True, "llm_request_attempts": 1, "provider": "test",
+            "protocol": "openai_chat_completions", "config_fingerprint": "fp-1",
+            "effective_parameters": {}}
+    rows = []
+    for model, reps in (("m1", 3), ("m2", 1)):
+        for _ in range(reps):
+            rows.append({**base, "case_id": "c-1", "case_version": "1",
+                         "model_profile": model})
+    report = build_benchmark_report("b", {"models": ["m1", "m2"], "case_budgets": {}}, rows, None)
+    assert report["comparable"] is False
+    assert "attempt_counts_differ" in report["incomparable_reason"]
+
+    only_m1 = [r for r in rows if r["model_profile"] == "m1"]
+    even = only_m1 + [{**r, "model_profile": "m2"} for r in only_m1]
+    report = build_benchmark_report("b2", {"models": ["m1", "m2"], "case_budgets": {}}, even, None)
+    assert report["comparable"] is True
+
+
+def test_compare_requires_equal_attempt_counts_and_effective_budgets(tmp_path):
+    from eval.compare import compare_runs
+    from eval.reporter import write_json, write_jsonl
+
+    def make_run(name, rows, budgets=(12, 12, 1)):
+        run_dir = tmp_path / name
+        run_dir.mkdir()
+        if budgets is None:
+            payload = list(rows)
+        else:
+            payload = [{**r, "effective_max_tool_calls": budgets[0],
+                        "effective_max_agent_rounds": budgets[1],
+                        "max_finalization_attempts": budgets[2]} for r in rows]
+        write_jsonl(run_dir / "case-results.jsonl", payload)
+        write_json(run_dir / "report.json", {
+            "run": {"run_id": name, "cases": ["pod-crashloop-001@1"],
+                    "scorer_version": "5", "root_cause_vocabulary_version": "v2"},
+            "report": {"scorer_version": "5", "root_cause_accuracy": 1.0,
+                       "wrong_root_cause_rate": 0.0, "schema_valid_rate": 1.0,
+                       "evidence_recall_avg": None, "diagnosis_duration_ms": {"p50": None},
+                       "token_usage": {"p50": None}},
+            "by_case": {},
+        })
+        return run_dir
+
+    row = {"case_id": "pod-crashloop-001", "case_version": "1",
+           "verdict": "diagnosis_correct", "fixture_ready": True,
+           "abstention_expected": False}
+
+    counts = compare_runs(make_run("b-count", [row, row]),
+                          make_run("c-count", [row]))
+    assert counts["comparable"] is False
+    assert "case_attempt_count_mismatch" in counts["incomparable_reason"]
+
+    budgets = compare_runs(make_run("b-budget", [row], budgets=(12, 12, 1)),
+                           make_run("c-budget", [row], budgets=(6, 12, 1)))
+    assert budgets["comparable"] is False
+    assert "effective_budget_mismatch" in budgets["incomparable_reason"]
+
+    unknown = compare_runs(make_run("b-unknown", [row], budgets=None),
+                           make_run("c-known", [row]))
+    assert unknown["comparable"] is False
+    assert "effective_budget_unknown" in unknown["incomparable_reason"]
+
+    same = compare_runs(make_run("b-same", [row]), make_run("c-same", [row]))
+    assert same["comparable"] is True
+
+
+def test_compare_detects_case_content_drift(tmp_path):
+    from eval.compare import compare_runs
+    from eval.reporter import write_json, write_jsonl
+
+    def make_run(name, hashes):
+        run_dir = tmp_path / name
+        run_dir.mkdir()
+        write_jsonl(run_dir / "case-results.jsonl", [
+            {"case_id": "pod-crashloop-001", "case_version": "1",
+             "verdict": "diagnosis_correct", "fixture_ready": True,
+             "abstention_expected": False, "effective_max_tool_calls": 12,
+             "effective_max_agent_rounds": 12, "max_finalization_attempts": 1}])
+        write_json(run_dir / "report.json", {
+            "run": {"run_id": name, "cases": ["pod-crashloop-001@1"],
+                    "scorer_version": "5", "root_cause_vocabulary_version": "v2",
+                    "case_hashes": hashes},
+            "report": {"scorer_version": "5", "root_cause_accuracy": 1.0,
+                       "wrong_root_cause_rate": 0.0, "schema_valid_rate": 1.0,
+                       "evidence_recall_avg": None, "diagnosis_duration_ms": {"p50": None},
+                       "token_usage": {"p50": None}},
+            "by_case": {},
+        })
+        return run_dir
+
+    drift = compare_runs(make_run("b-hash", {"pod-crashloop-001@1": {"definition": "aaa"}}),
+                         make_run("c-hash", {"pod-crashloop-001@1": {"definition": "bbb"}}))
+    assert drift["comparable"] is False
+    assert "case_content_mismatch" in drift["incomparable_reason"]
+
+
+def test_pathless_evidence_only_matches_business_fields():
+    """Metadata (namespace/pod/container/metric names) is not evidence."""
+    from app.validation import UNVERIFIABLE, VERIFIED, validate_submission
+
+    def submission(source, value, operator="equals"):
+        return {"root_cause_code": "CRASH_LOOP_BACKOFF", "root_cause": "rc",
+                "insufficient_evidence": False,
+                "evidence": [{"source": source, "operator": operator, "value": value}]}
+
+    logs = [{"tool": "logs", "tool_call_id": "c1", "kind": "realtime",
+             "args": {"namespace": "payment", "name": "p", "uid": "u1"},
+             "output": json.dumps({"namespace": "payment", "pod": "api-x", "container": "app",
+                                   "data": "real log line"})}]
+    ok, _, report = validate_submission(submission("kubernetes.logs", "payment"), logs)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+    ok, _, report = validate_submission(submission("kubernetes.logs", "real log line",
+                                                   operator="contains"), logs)
+    assert ok and report[0]["status"] == VERIFIED
+
+    metrics = [{"tool": "query_metrics", "tool_call_id": "c2", "kind": "realtime",
+                "args": {"namespace": "payment", "name": "p", "uid": "u1"},
+                "output": json.dumps({"metric": "memory", "summary": {"max": 3.0},
+                                      "series": []})}]
+    ok, _, report = validate_submission(submission("prometheus.metrics", "memory"), metrics)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+    ok, _, report = validate_submission(submission("prometheus.metrics", "3.0"), metrics)
+    assert ok and report[0]["status"] == VERIFIED
+
+    events = [{"tool": "events", "tool_call_id": "c3", "kind": "realtime",
+               "args": {"kind": "Pod", "namespace": "payment", "name": "p", "uid": "u1"},
+               "output": json.dumps({"events": [{"type": "Warning", "reason": "BackOff",
+                                                 "message": "Back-off restarting"}]})}]
+    ok, _, report = validate_submission(submission("kubernetes.events", "BackOff"), events)
+    assert ok and report[0]["status"] == VERIFIED
+    # Status facts must be addressed by path.
+    status = [{"tool": "inspect", "tool_call_id": "c4", "kind": "realtime",
+               "args": {"kind": "Pod", "namespace": "payment", "name": "p", "uid": "u1"},
+               "output": json.dumps({"actual_state": {"phase": "Pending"}})}]
+    ok, _, report = validate_submission(submission("kubernetes.status", "Pending"), status)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+
+
+def test_cause_level_v1_suite_is_fully_pinned():
+    """The future baseline suite must resolve entirely to frozen definitions."""
+    from eval.cases import load_case_entry, load_suite
+
+    root = Path(__file__).resolve().parents[1]
+    suite = load_suite(root / "suites" / "cause-level-v1.yaml")
+    assert suite["cases"], "cause-level-v1 must declare cases"
+    for entry in suite["cases"]:
+        assert "@" in entry, f"{entry} must be pinned to a version"
+        case = load_case_entry(root / "cases", entry)
+        for manifest in case.setup_manifests:
+            assert "versions" in str(manifest), f"{entry}: manifest not frozen"

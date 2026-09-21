@@ -1,0 +1,35 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pod-configerror-mount-001
+case_version: "2"
+description: Volume references a ConfigMap that does not exist (FailedMount is the symptom)
+target:
+  apiVersion: v1
+  kind: Pod
+  namespace: eval-pod-configerror-mount-001
+  name: configerror-mount-demo
+setup:
+  manifests:
+    - manifests/pod-configerror-mount-001.v2.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_equals
+  path: status.phase
+  value: "Pending"
+  timeout_seconds: 120
+ground_truth:
+  accepted_root_cause_codes: [MISSING_CONFIGMAP]
+  required_evidence:
+    - source: kubernetes.events
+      operator: contains
+      value: does-not-exist-cm
+    - source: kubernetes.status
+      path: actual_state.phase
+      operator: equals
+      value: Pending
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

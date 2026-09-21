@@ -1,0 +1,35 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pod-failedscheduling-resource-001
+case_version: "2"
+description: Requested cpu exceeds every node's capacity (FailedScheduling is the symptom)
+target:
+  apiVersion: v1
+  kind: Pod
+  namespace: eval-pod-failedscheduling-resource-001
+  name: sched-resource-demo
+setup:
+  manifests:
+    - manifests/pod-failedscheduling-resource-001.v2.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_equals
+  path: status.phase
+  value: "Pending"
+  timeout_seconds: 90
+ground_truth:
+  accepted_root_cause_codes: [INSUFFICIENT_NODE_RESOURCES]
+  required_evidence:
+    - source: kubernetes.events
+      operator: contains
+      value: Insufficient cpu
+    - source: kubernetes.status
+      path: actual_state.phase
+      operator: equals
+      value: Pending
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eval-pod-configerror-mount-001
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: configerror-mount-demo
+  namespace: eval-pod-configerror-mount-001
+  labels:
+    app: configerror-mount-demo
+spec:
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: cfg
+          mountPath: /etc/cfg
+          subPath: missing-key
+  volumes:
+    - name: cfg
+      configMap:
+        name: does-not-exist-cm

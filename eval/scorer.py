@@ -244,6 +244,7 @@ def summarize_trace(trace: Optional[dict[str, Any]]) -> dict[str, Any]:
         "budget_exhausted": False,
         "effective_max_tool_calls": None,
         "effective_max_agent_rounds": None,
+        "max_finalization_attempts": None,
     }
     if not trace:
         return out
@@ -283,6 +284,7 @@ def summarize_trace(trace: Optional[dict[str, Any]]) -> dict[str, Any]:
             "multi_tool_rejected_rounds", 0) or 0
         out["effective_max_tool_calls"] = finish["attributes"].get("max_tool_calls")
         out["effective_max_agent_rounds"] = finish["attributes"].get("max_agent_rounds")
+        out["max_finalization_attempts"] = finish["attributes"].get("max_finalization_attempts")
     layer = next((s.get("failure_layer") for s in spans if s.get("failure_layer")), None)
     if layer and layer in KNOWN_LAYERS:
         out["trace_failure_layer"] = layer

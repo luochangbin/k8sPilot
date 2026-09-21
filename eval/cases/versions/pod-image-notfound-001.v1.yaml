@@ -1,0 +1,50 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pod-image-notfound-001
+case_version: "1"
+description: Image tag does not exist in a reachable registry. Gated by a
+  registry_tag_absent preflight so the case fails as fixture_failed instead of
+  mis-scoring a network/DNS/TLS failure as IMAGE_NOT_FOUND.
+target:
+  apiVersion: v1
+  kind: Pod
+  namespace: eval-pod-image-notfound-001
+  name: imagenotfound-demo
+setup:
+  manifests:
+    - manifests/pod-image-notfound-001.v1.yaml
+inject:
+  action: apply
+preflight:
+  - type: registry_tag_absent
+    image: docker.io/library/busybox:k8spilot-missing-tag-001
+ready_when:
+  # Composite readiness: kubelet's own Event must report MANIFEST_UNKNOWN (so a
+  # DNS/TLS/network failure can never be scored as IMAGE_NOT_FOUND) AND the
+  # container must already be in the ImagePullBackOff steady state that the
+  # ground-truth evidence names (the first failure surfaces as ErrImagePull, so
+  # waiting on the event alone would race with the required status evidence).
+  type: all
+  timeout_seconds: 240
+  conditions:
+    - type: event_message_contains
+      path: Failed
+      value: manifest unknown
+    - type: jsonpath_equals
+      path: status.containerStatuses[0].state.waiting.reason
+      value: ImagePullBackOff
+ground_truth:
+  accepted_root_cause_codes: [IMAGE_NOT_FOUND]
+  required_evidence:
+    - source: kubernetes.status
+      path: actual_state.container_states[0].reason
+      operator: equals
+      value: ImagePullBackOff
+    - source: kubernetes.events
+      operator: contains
+      value: manifest unknown
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

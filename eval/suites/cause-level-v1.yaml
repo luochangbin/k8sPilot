@@ -1,0 +1,21 @@
+id: cause-level-v1
+description: Pinned cause-level baseline (root cause vocabulary v2). Every entry
+  resolves to eval/cases/versions/<id>.v<version>.yaml with a frozen fixture, so
+  this suite can be replayed as the cause-level baseline. Use cause-level.yaml
+  while iterating (it tracks the current definitions).
+cases:
+  - deploy-configerror-001@1
+  - deploy-nodeselector-001@1
+  - node-notready-synthetic-001@1
+  - pod-abstain-restart-001@1
+  - pod-configerror-env-001@2
+  - pod-configerror-mount-001@2
+  - pod-crashloop-001@2
+  - pod-failedmount-pvc-001@2
+  - pod-failedscheduling-node-001@2
+  - pod-failedscheduling-resource-001@2
+  - pod-healthy-001@1
+  - pod-image-notfound-001@1
+  - pod-oomkilled-001@1
+  - pod-oomkilled-recovered-001@1
+  - pvc-missing-pv-001@1

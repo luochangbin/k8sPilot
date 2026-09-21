@@ -9,6 +9,7 @@ score code and never auto-reruns a failed diagnosis.
 from __future__ import annotations
 
 import json
+from collections import Counter
 import random
 import time
 import uuid
@@ -292,6 +293,17 @@ def build_benchmark_report(benchmark_id: str, meta: dict[str, Any],
             issues.append("no_common_cases")
         elif any(cs != common_cases for cs in covered.values()):
             issues.append("case_sets_differ")
+        # Same case *set* is not enough: a truncated batch (time limit /
+        # max-diagnoses / provider failures) can leave one model with fewer
+        # attempts per case, which makes accuracy and cost incomparable.
+        counts = {
+            model: Counter(case_key(r) for r in model_rows_of(model))
+            for model in covered
+        }
+        if len({json.dumps(dict(sorted(c.items()))) for c in counts.values()}) > 1:
+            issues.append("attempt_counts_differ:" + json.dumps(
+                {m: dict(sorted(c.items())) for m, c in sorted(counts.items())},
+                sort_keys=True))
     # 3. Configuration drift within a profile. Failures with execution identity
     #    also enter the quality denominators, so they must be consistent too.
     for model in models:

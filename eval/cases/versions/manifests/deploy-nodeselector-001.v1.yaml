@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eval-deploy-nodeselector-001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: selector-deploy
+  namespace: eval-deploy-nodeselector-001
+  labels:
+    app: selector-deploy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: selector-deploy
+  template:
+    metadata:
+      labels:
+        app: selector-deploy
+    spec:
+      nodeSelector:
+        k8spilot.dev/disktype: does-not-exist
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["sh", "-c", "sleep 3600"]

@@ -77,20 +77,40 @@ def _compare(actual: Any, operator: str, expected: Any) -> bool:
     return str(actual) == str(expected)
 
 
-def _iter_leaf_values(doc: Any) -> list[Any]:
-    """All scalar leaves of a parsed JSON document (structure-aware, so we never
-    substring-match against the serialized JSON itself)."""
-    if isinstance(doc, dict):
+# Path-less evidence may only match real business fields of the source. Without
+# this allowlist a claim could "verify" against metadata (namespace/pod/container
+# names, metric names, ...) that merely happens to contain the string.
+_BUSINESS_FIELDS: dict[str, tuple[str, ...]] = {
+    "events": ("reason", "message", "type"),
+}
+_RAW_TEXT_SOURCES = {"kubernetes.logs"}          # container logs: line-accurate
+_METRIC_VALUE_SOURCES = {"prometheus.metrics"}   # summary values + series points
+_PATH_REQUIRED_SOURCES = {"kubernetes.status"}   # facts must be addressed by path
+
+
+def _candidate_values(tool: str, tool_name: str, doc: Any) -> list[Any]:
+    """Business values a path-less claim may match, per evidence source."""
+    if not isinstance(doc, dict):
+        return []
+    if tool_name == "events":
         out: list[Any] = []
-        for value in doc.values():
-            out.extend(_iter_leaf_values(value))
+        for event in (doc.get("events") or []):
+            if isinstance(event, dict):
+                out.extend(event[field] for field in _BUSINESS_FIELDS["events"]
+                           if event.get(field) is not None)
         return out
-    if isinstance(doc, list):
-        out = []
-        for value in doc:
-            out.extend(_iter_leaf_values(value))
+    if tool_name == "query_logs":
+        return [item for item in (doc.get("evidence") or []) if item is not None]
+    if tool_name == "query_metrics":
+        out = [value for value in (doc.get("summary") or {}).values()
+               if value is not None]
+        for series in (doc.get("series") or []):
+            if isinstance(series, dict):
+                for point in (series.get("points") or []):
+                    if isinstance(point, dict) and point.get("value") is not None:
+                        out.append(point["value"])
         return out
-    return [doc]
+    return []
 
 
 def verify_evidence(evidence: dict[str, Any],
@@ -166,21 +186,33 @@ def verify_evidence(evidence: dict[str, Any],
         return {"status": UNVERIFIABLE,
                 "reason": f"path {path!r} not found in this run's tool results"}
 
-    # No path (events/logs): compare against the real business fields, never
-    # against the serialized JSON blob.
+    # No path: compare only against the source's business fields (see above).
+    if source in _PATH_REQUIRED_SOURCES:
+        return {"status": UNVERIFIABLE,
+                "reason": f"{source} evidence must carry a path to the fact it cites"}
     for result in relevant:
+        tool_name = str(result.get("tool") or "")
         doc = _parse(result.get("output"))
         if doc is None:
-            # Raw text (e.g. container logs): line-accurate comparison.
-            text = str(result.get("output") or "")
-            if _compare(text, operator, declared) or any(
-                    _compare(line, operator, declared) for line in text.splitlines()):
+            if source in _RAW_TEXT_SOURCES:
+                # Container logs are raw text: compare per line, not the whole blob.
+                text = str(result.get("output") or "")
+                if _compare(text, operator, declared) or any(
+                        _compare(line, operator, declared) for line in text.splitlines()):
+                    return {"status": VERIFIED, "matched": declared, "operator": operator}
+            continue
+        if source in _RAW_TEXT_SOURCES:
+            data = doc.get("data")
+            if isinstance(data, str) and (
+                    _compare(data, operator, declared)
+                    or any(_compare(line, operator, declared) for line in data.splitlines())):
                 return {"status": VERIFIED, "matched": declared, "operator": operator}
             continue
-        if any(_compare(leaf, operator, declared) for leaf in _iter_leaf_values(doc)):
+        if any(_compare(value, operator, declared)
+               for value in _candidate_values(tool, tool_name, doc)):
             return {"status": VERIFIED, "matched": declared, "operator": operator}
     return {"status": UNVERIFIABLE,
-            "reason": f"no field satisfies {operator} {declared!r} in this run's results"}
+            "reason": f"no business field satisfies {operator} {declared!r} in this run's results"}
 
 
 def validate_submission(result: dict[str, Any], tool_results: list[dict[str, Any]],
