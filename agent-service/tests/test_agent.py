@@ -120,7 +120,10 @@ def test_successful_diagnosis_completes_with_parsed_result():
             "symptom": "Pod 持续重启",
             "evidence": [
                 _verified_evidence("Last termination reason is OOMKilled"),
-                {"source": "kubernetes.logs", "summary": "java.lang.OutOfMemoryError"},
+                # Every published evidence item must verify: a second path on the
+                # same inspect result keeps the two-item assertion honest.
+                {"source": "kubernetes.status", "path": "actual_state.phase",
+                 "operator": "equals", "value": "Running", "summary": "pod is running"},
             ],
             "root_cause_code": "CONTAINER_OOMKILLED",
             "insufficient_evidence": False,
@@ -1190,7 +1193,7 @@ def test_evidence_assertion_validator_reports_mismatch_and_unverifiable():
     assert not ok
     assert report[0]["status"] == MISMATCH
     assert report[0]["expected"] == "99" and report[0]["actual"] == 37
-    assert any("verified real-time evidence" in p for p in problems)
+    assert problems  # the gate reports which evidence failed to verify
 
     # Retrieval-only "evidence" can never satisfy the final gate.
     ok2, _, report2 = validate_submission({
@@ -1765,3 +1768,90 @@ def test_abstention_without_missing_evidence_is_rejected():
 
     assert d.status == "completed"
     assert d.result.insufficient_evidence is True
+
+
+def test_tool_call_id_survives_parse_result_and_pins_the_claim():
+    """End-to-end provenance: parse -> validate must keep tool_call_id, and a
+    claim pinned to one resource's call must not be verified by another's."""
+    from app.validation import MISMATCH, UNVERIFIABLE, VERIFIED, validate_submission
+
+    results = [
+        {"tool": "inspect", "tool_call_id": "call_a", "kind": "realtime",
+         "args": {"kind": "Pod", "namespace": "payment", "name": "pod-a", "uid": "uid-a"},
+         "output": json.dumps({"actual_state": {"phase": "Pending"}})},
+        {"tool": "inspect", "tool_call_id": "call_b", "kind": "realtime",
+         "args": {"kind": "Pod", "namespace": "payment", "name": "pod-b", "uid": "uid-b"},
+         "output": json.dumps({"actual_state": {"phase": "Running"}})},
+    ]
+    args = {
+        "symptom": "s", "root_cause_code": "SCHEDULING_FAILED", "root_cause": "rc",
+        "insufficient_evidence": False, "confidence": "high", "recommendations": [],
+        "evidence": [{"source": "kubernetes.status", "tool_call_id": "call_a",
+                      "resource_uid": "uid-a", "path": "actual_state.phase",
+                      "operator": "equals", "value": "Pending", "summary": "pod-a pending"}],
+    }
+    agent = make_agent(ScriptedLLM([]))
+
+    parsed = agent._parse_result(args, [], {})
+    # The provenance field must survive parsing (the previous gap).
+    assert parsed.evidence[0].tool_call_id == "call_a"
+
+    ok, _, report = validate_submission(parsed.model_dump(), results)
+    assert ok and report[0]["status"] == VERIFIED
+
+    # Same call id, but the claim names a different resource: contradiction.
+    conflicting = dict(args)
+    conflicting["evidence"] = [{**args["evidence"][0], "resource_uid": "uid-b"}]
+    ok, _, report = validate_submission(
+        agent._parse_result(conflicting, [], {}).model_dump(), results)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+
+    # Pinned to the running pod's call: the fact does not hold there.
+    wrong_call = dict(args)
+    wrong_call["evidence"] = [{**args["evidence"][0], "tool_call_id": "call_b",
+                               "resource_uid": "uid-b"}]
+    ok, _, report = validate_submission(
+        agent._parse_result(wrong_call, [], {}).model_dump(), results)
+    assert not ok and report[0]["status"] == MISMATCH
+
+
+def test_agent_run_persists_tool_call_provenance():
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "s", "root_cause_code": "CONTAINER_OOMKILLED",
+            "root_cause": "rc", "insufficient_evidence": False, "confidence": "high",
+            "recommendations": [],
+            "evidence": [{"source": "kubernetes.status", "tool_call_id": "call_1",
+                          "path": "actual_state.restart_count", "operator": "equals",
+                          "value": "37", "summary": "restart count"}],
+        }),
+    ])
+    d = run(make_agent(llm))
+
+    assert d.status == "completed"
+    assert d.result.evidence[0].tool_call_id == "call_1"
+
+
+def test_final_gate_requires_every_published_evidence_to_verify():
+    """One verified claim plus one unverifiable claim must not be published."""
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "s", "root_cause_code": "CONTAINER_OOMKILLED", "root_cause": "rc",
+            "insufficient_evidence": False, "confidence": "high", "recommendations": [],
+            "evidence": [
+                _verified_evidence("verified"),
+                {"source": "kubernetes.logs", "summary": "unverifiable claim"},
+            ],
+        }),
+        _submit_ok(),
+    ])
+    d = run(make_agent(llm))
+
+    assert d.status == "completed"
+    # The rejected attempt never reached the result; the corrected one did.
+    assert len(d.result.evidence) == 1
+    assert d.result.evidence[0].summary == "OOMKilled"

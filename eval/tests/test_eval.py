@@ -638,10 +638,15 @@ def test_registry_preflight_fails_closed(monkeypatch):
             if self.status_code >= 400:
                 raise injector.httpx.HTTPStatusError("bad", request=None, response=None)
 
-    # 404 (tag absent) -> preflight passes.
-    monkeypatch.setattr(injector.httpx, "get",
-                        lambda *a, **k: Resp(404))
+    # 404 with MANIFEST_UNKNOWN (tag absent) -> preflight passes.
+    monkeypatch.setattr(injector.httpx, "get", lambda *a, **k: Resp(
+        404, payload={"errors": [{"code": "MANIFEST_UNKNOWN"}]}))
     injector.check_registry_tag_absent("docker.io/library/busybox:missing-tag-001")
+
+    # A bare 404 (no error code) is NOT proof of a missing manifest.
+    monkeypatch.setattr(injector.httpx, "get", lambda *a, **k: Resp(404))
+    with pytest.raises(injector.InjectorError):
+        injector.check_registry_tag_absent("docker.io/library/busybox:missing-tag-001")
 
     # Any other status -> the case must fail closed.
     monkeypatch.setattr(injector.httpx, "get", lambda *a, **k: Resp(500))
@@ -680,7 +685,7 @@ def test_registry_preflight_handles_bearer_challenge(monkeypatch):
         if url.startswith("https://auth.example"):
             return Resp(200, payload={"token": "tok"})
         if headers and headers.get("Authorization") == "Bearer tok":
-            return Resp(404)
+            return Resp(404, payload={"errors": [{"code": "MANIFEST_UNKNOWN"}]})
         return Resp(401, headers={"WWW-Authenticate":
                                   'Bearer realm="https://auth.example/token",service="reg",scope="repository:x/y:pull"'})
 
@@ -790,3 +795,51 @@ def test_event_ready_condition_requires_the_cluster_side_semantics(monkeypatch):
                                                        reason="BackOff")) is False
     # wait_ready polls until the deadline and reports False (fixture_failed).
     assert injector_instance.wait_ready(make_case("manifest unknown", timeout=1)) is False
+
+
+def test_image_notfound_case_loads_top_level_preflight_and_composite_ready():
+    """The preflight must actually load from the case YAML (it is a top-level
+    field), and readiness must require both the event and the steady state."""
+    from eval.cases import load_case
+
+    cases_dir = Path(__file__).resolve().parents[1] / "cases"
+    case = load_case(cases_dir / "pod-image-notfound-001.yaml")
+
+    assert case.preflight, "preflight must be loaded from the case file"
+    assert case.preflight[0]["type"] == "registry_tag_absent"
+    assert case.preflight[0]["image"].endswith("k8spilot-missing-tag-001")
+    assert case.ready_when.type == "all"
+    kinds = [c["type"] for c in case.ready_when.conditions]
+    assert kinds == ["event_message_contains", "jsonpath_equals"]
+    assert case.ready_when.conditions[1]["value"] == "ImagePullBackOff"
+
+
+def test_composite_ready_needs_both_event_and_status(monkeypatch):
+    import eval.injector as injector
+    from eval.cases import Budgets, Case, GroundTruth, ReadyWhen, Target
+
+    events = {"items": [{"reason": "Failed",
+                         "message": 'Failed to pull image "x/y:z": manifest unknown'}]}
+    monkeypatch.setattr(injector, "run_kubectl", lambda args, **k: json.dumps(events))
+
+    statuses = {"reason": "ErrImagePull"}
+    monkeypatch.setattr(injector, "get_object",
+                        lambda kind, ns, name, **k: {"status": {"containerStatuses": [
+                            {"state": {"waiting": {"reason": statuses["reason"]}}}]}})
+
+    case = Case(schema_version="eval.k8spilot.io/v1alpha1", id="t-all", case_version="1",
+                suite="test", description="", target=Target("v1", "Pod", "ns", "p"),
+                ready_when=ReadyWhen(type="all", timeout_seconds=1, conditions=[
+                    {"type": "event_message_contains", "path": "Failed",
+                     "value": "manifest unknown"},
+                    {"type": "jsonpath_equals",
+                     "path": "status.containerStatuses[0].state.waiting.reason",
+                     "value": "ImagePullBackOff"}]),
+                ground_truth=GroundTruth(), budgets=Budgets())
+    injector_instance = injector.Injector()
+
+    # Event matches but the container is still in ErrImagePull: not ready yet.
+    assert injector_instance.wait_ready(case) is False
+
+    statuses["reason"] = "ImagePullBackOff"
+    assert injector_instance.wait_ready(case) is True

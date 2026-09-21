@@ -788,6 +788,9 @@ class Agent:
                 source=str(e.get("source", "")),
                 observed_at=str(e.get("observed_at")) if e.get("observed_at") else None,
                 summary=str(e.get("summary", "")),
+                # Provenance must survive parsing, otherwise the runtime gate can
+                # never pin a claim to the tool call that produced it.
+                tool_call_id=(str(e.get("tool_call_id")) if e.get("tool_call_id") else None),
                 resource_uid=str(e.get("resource_uid")) if e.get("resource_uid") else None,
                 path=str(e.get("path")) if e.get("path") else None,
                 operator=str(e.get("operator")) if e.get("operator") else None,

@@ -29,10 +29,15 @@ class Target:
 
 @dataclass
 class ReadyWhen:
-    type: str  # jsonpath_equals
+    type: str  # jsonpath_equals | jsonpath_exists | jsonpath_gte |
+    #            event_message_contains | all
     path: Optional[str] = None
     value: Optional[str] = None
     timeout_seconds: int = 120
+    # For `all`: every listed condition (same keys as a single ready_when) must
+    # hold, e.g. an Event carrying the expected semantics AND the container
+    # status already in its steady state.
+    conditions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -131,6 +136,7 @@ def load_case(path: Path) -> Case:
         path=rw.get("path"),
         value=_str(rw.get("value")),
         timeout_seconds=int(rw.get("timeout_seconds", 120)),
+        conditions=list(rw.get("conditions") or []),
     )
 
     gt_raw = raw.get("ground_truth") or {}
@@ -161,7 +167,9 @@ def load_case(path: Path) -> Case:
         description=str(raw.get("description", "")),
         target=target,
         setup_manifests=manifests,
-        preflight=setup.get("preflight") or [],
+        # Top-level field (matching the YAML layout): preflight runs before any
+        # resource is created, so it is not part of `setup`.
+        preflight=raw.get("preflight") or [],
         inject_action=raw.get("inject", {}).get("action", "apply"),
         ready_when=ready,
         ground_truth=ground_truth,

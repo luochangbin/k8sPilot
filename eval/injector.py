@@ -67,6 +67,12 @@ class Injector:
         """
         deadline = time.monotonic() + case.ready_when.timeout_seconds
         while time.monotonic() < deadline:
+            if case.ready_when.type == "all":
+                if all(self._condition_holds(case, condition)
+                       for condition in case.ready_when.conditions):
+                    return True
+                time.sleep(2)
+                continue
             if case.ready_when.type == "event_message_contains":
                 if self._events_contain(case):
                     return True
@@ -83,7 +89,27 @@ class Injector:
             time.sleep(2)
         return False
 
+    def _condition_holds(self, case: Case, condition: dict) -> bool:
+        """Evaluate one entry of a composite (`all`) ready_when."""
+        kind = str(condition.get("type") or "")
+        if kind == "event_message_contains":
+            return self._events_contain_values(case, condition.get("path") or "",
+                                               str(condition.get("value") or ""))
+        try:
+            obj = get_object(case.target.kind, case.target.namespace,
+                             case.target.name, kubeconfig=self._kubeconfig)
+            got = json_path_get(obj, condition.get("path") or "")
+        except Exception:  # noqa: BLE001 - transient errors mean "not ready yet"
+            return False
+        return self._ready_holds(kind, got, _str_value(condition.get("value")))
+
     def _events_contain(self, case: Case) -> bool:
+        """True when an Event for the target matches the case's ready filter."""
+        return self._events_contain_values(case, case.ready_when.path or "",
+                                           str(case.ready_when.value or ""))
+
+    def _events_contain_values(self, case: Case, reason_filter: str,
+                               needle: str) -> bool:
         """True when an Event for the target matches the reason/message filter.
 
         ready_when.path holds an optional event reason filter, ready_when.value
@@ -97,8 +123,7 @@ class Injector:
             payload = json.loads(run_kubectl(args, kubeconfig=self._kubeconfig) or "{}")
         except Exception:  # noqa: BLE001 - transient errors mean "not ready yet"
             return False
-        reason = (case.ready_when.path or "").strip()
-        needle = str(case.ready_when.value or "")
+        reason = (reason_filter or "").strip()
         for item in payload.get("items") or []:
             if reason and str(item.get("reason", "")) != reason:
                 continue
@@ -135,6 +160,10 @@ class Injector:
         obj = get_object(case.target.kind, case.target.namespace,
                          case.target.name, kubeconfig=self._kubeconfig)
         return obj.get("metadata", {}).get("uid", "")
+
+
+def _str_value(value: Any) -> str:
+    return "" if value is None else str(value)
 
 
 def _split_image(image: str) -> tuple[str, str, str]:
@@ -203,10 +232,11 @@ def check_registry_tag_absent(image: str, timeout: int = 15) -> None:
             code = str((errors[0] or {}).get("code", "")) if errors else ""
         except (ValueError, AttributeError, TypeError):
             code = ""
-        if code and code != "MANIFEST_UNKNOWN":
+        if code != "MANIFEST_UNKNOWN":
             raise InjectorError(
-                f"registry {registry} answered 404/{code} for {repository}:{reference}; "
-                "only MANIFEST_UNKNOWN can guarantee IMAGE_NOT_FOUND")
+                f"registry {registry} answered 404/{code or 'no-error-code'} for "
+                f"{repository}:{reference}; only an explicit MANIFEST_UNKNOWN can "
+                "guarantee IMAGE_NOT_FOUND")
         return
     raise InjectorError(
         f"registry {registry} answered HTTP {resp.status_code} for "

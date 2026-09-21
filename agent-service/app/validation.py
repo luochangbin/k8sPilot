@@ -123,14 +123,16 @@ def verify_evidence(evidence: dict[str, Any],
     else:
         relevant = [r for r in tool_results
                     if r.get("kind") == "realtime" and r.get("tool") == tool]
-        # Resource attribution: when the claim names a resource, only that
-        # resource's tool result may verify it.
-        uid = evidence.get("resource_uid")
-        if uid:
-            relevant = [r for r in relevant if (r.get("args") or {}).get("uid") == uid]
-            if not relevant:
-                return {"status": UNVERIFIABLE,
-                        "reason": f"no {tool} result for resource_uid {uid!r} in this run"}
+    # Resource attribution is an AND, not an OR: a pinned tool call must still
+    # point at the resource the claim names (tool_call_id + source + resource +
+    # fact), so a claim cannot merge one call's provenance with another
+    # resource's uid.
+    uid = evidence.get("resource_uid")
+    if uid:
+        relevant = [r for r in relevant if (r.get("args") or {}).get("uid") == uid]
+        if not relevant:
+            return {"status": UNVERIFIABLE,
+                    "reason": f"no {tool} result for resource_uid {uid!r} in this run"}
     if not relevant:
         return {"status": UNVERIFIABLE,
                 "reason": f"no {tool} result in this run (source {source!r})"}
@@ -197,9 +199,15 @@ def validate_submission(result: dict[str, Any], tool_results: list[dict[str, Any
     verification = [{"index": index, **verify_evidence(item, tool_results)}
                     for index, item in enumerate(evidence) if isinstance(item, dict)]
     if explicit and not insufficient:
-        if not any(item["status"] == VERIFIED for item in verification):
+        if not verification:
+            problems.append("明确根因必须提供至少一条实时证据")
+        # Every evidence item published with the conclusion must be verified:
+        # "one real + N unverified" would put unproven claims in front of users.
+        unverified = [item for item in verification if item["status"] != VERIFIED]
+        if unverified:
             problems.append(
-                "明确根因缺少至少一条可验证的实时证据（verified real-time evidence）")
+                "存在未通过校验的实时证据（每条证据都必须 VERIFIED）："
+                + ", ".join(f"#{item['index']}={item['status']}" for item in unverified))
     elif insufficient:
         # Abstention is a *diagnostic* outcome, not "I did not look": it requires
         # at least one successful real-time tool call and an explicit statement of

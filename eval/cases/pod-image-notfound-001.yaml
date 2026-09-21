@@ -18,15 +18,20 @@ preflight:
   - type: registry_tag_absent
     image: docker.io/library/busybox:k8spilot-missing-tag-001
 ready_when:
-  # Cluster-side proof of the exact failure semantics: the fixture becomes ready
-  # only once kubelet's own Event reports MANIFEST_UNKNOWN. A DNS/TLS/network
-  # failure never satisfies this, so the case cannot be scored against the wrong
-  # reason even though the HTTP preflight only proves the runner can reach the
-  # registry.
-  type: event_message_contains
-  path: Failed
-  value: manifest unknown
-  timeout_seconds: 180
+  # Composite readiness: kubelet's own Event must report MANIFEST_UNKNOWN (so a
+  # DNS/TLS/network failure can never be scored as IMAGE_NOT_FOUND) AND the
+  # container must already be in the ImagePullBackOff steady state that the
+  # ground-truth evidence names (the first failure surfaces as ErrImagePull, so
+  # waiting on the event alone would race with the required status evidence).
+  type: all
+  timeout_seconds: 240
+  conditions:
+    - type: event_message_contains
+      path: Failed
+      value: manifest unknown
+    - type: jsonpath_equals
+      path: status.containerStatuses[0].state.waiting.reason
+      value: ImagePullBackOff
 ground_truth:
   accepted_root_cause_codes: [IMAGE_NOT_FOUND]
   required_evidence:
