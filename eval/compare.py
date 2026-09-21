@@ -53,7 +53,16 @@ def compare_runs(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
 
     b_rep = b["report"]
     c_rep = c["report"]
+    def _pair(key: str, *, b_rep=b_rep, c_rep=c_rep) -> dict[str, Any]:
+        return {"baseline": b_rep.get(key), "candidate": c_rep.get(key),
+                "delta": _delta(b_rep.get(key), c_rep.get(key))}
+
     agg = {
+        "end_to_end_correct_rate": _pair("end_to_end_correct_rate"),
+        "answerable_coverage": _pair("answerable_coverage"),
+        "abstention_recall": _pair("abstention_recall"),
+        "system_failed_rate": _pair("system_failed_rate"),
+        "budget_exhausted_rate": _pair("budget_exhausted_rate"),
         "root_cause_accuracy": {"baseline": b_rep["root_cause_accuracy"], "candidate": c_rep["root_cause_accuracy"],
                                 "delta": _delta(b_rep["root_cause_accuracy"], c_rep["root_cause_accuracy"])},
         "wrong_root_cause_rate": {"baseline": b_rep["wrong_root_cause_rate"], "candidate": c_rep["wrong_root_cause_rate"],
@@ -136,7 +145,9 @@ def compare_runs(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
             metric["delta"] = None
         for case in per_case.values():
             case["root_cause_accuracy"]["delta"] = None
-    gates = _evaluate_gates(agg) if comparable else []
+    critical = sorted(set(b["run"].get("critical_cases") or [])
+                      | set(c["run"].get("critical_cases") or []))
+    gates = _evaluate_gates(agg, per_case, critical) if comparable else []
     return {"aggregate": agg, "per_case": per_case, "gates": gates,
             "comparable": comparable, "incomparable_reason": reason,
             "baseline_run": b["run"].get("run_id"), "candidate_run": c["run"].get("run_id")}
@@ -212,21 +223,51 @@ def _case_accuracy(rows: list[dict[str, Any]]) -> Optional[float]:
     return round(sum(1 for r in valid if r["verdict"] == VERDICT_CORRECT) / len(valid), 3)
 
 
-def _evaluate_gates(agg: dict[str, Any]) -> list[dict[str, Any]]:
-    gates: list[dict[str, Any]] = []
-    # wrong root cause rate must not rise
-    wrr = agg["wrong_root_cause_rate"]
+def _gate(name: str, metric: dict[str, Any], *, direction: str) -> dict[str, Any]:
+    """A directional regression gate: not_down or not_up (small tolerance)."""
+    delta = metric.get("delta")
+    if delta is None:
+        passed = True  # nothing to compare (missing metric on one side)
+    elif direction == "not_down":
+        passed = delta >= -0.001
+    else:
+        passed = delta <= 0.001
+    return {"name": name, "pass": passed,
+            "detail": (f"baseline={metric.get('baseline')} candidate={metric.get('candidate')} "
+                       f"delta={delta}")}
+
+
+def _evaluate_gates(agg: dict[str, Any], per_case: dict[str, Any],
+                    critical_cases: list[str]) -> list[dict[str, Any]]:
+    gates = [
+        _gate("end_to_end_correct_rate_not_down", agg["end_to_end_correct_rate"],
+              direction="not_down"),
+        _gate("wrong_root_cause_rate_not_up", agg["wrong_root_cause_rate"],
+              direction="not_up"),
+        _gate("answerable_coverage_not_down", agg["answerable_coverage"],
+              direction="not_down"),
+        _gate("abstention_recall_not_down", agg["abstention_recall"], direction="not_down"),
+        _gate("system_failed_rate_not_up", agg["system_failed_rate"], direction="not_up"),
+        _gate("budget_exhausted_rate_not_up", agg["budget_exhausted_rate"],
+              direction="not_up"),
+        _gate("schema_valid_rate_not_down", agg["schema_valid_rate"], direction="not_down"),
+    ]
+    # Declared critical cases must not regress (no weighted score, just a gate).
+    regressed = []
+    for key in critical_cases:
+        case = per_case.get(key)
+        if not case:
+            regressed.append(f"{key}:missing")
+            continue
+        delta = case["root_cause_accuracy"]["delta"]
+        if delta is not None and delta < -0.001:
+            regressed.append(f"{key}:{delta}")
     gates.append({
-        "name": "wrong_root_cause_rate_not_up",
-        "pass": wrr["delta"] is None or wrr["delta"] <= 0.001,
-        "detail": f"baseline={wrr['baseline']} candidate={wrr['candidate']} delta={wrr['delta']}",
-    })
-    # schema valid rate must not drop
-    svr = agg["schema_valid_rate"]
-    gates.append({
-        "name": "schema_valid_rate_not_down",
-        "pass": svr["delta"] is None or svr["delta"] >= -0.001,
-        "detail": f"baseline={svr['baseline']} candidate={svr['candidate']} delta={svr['delta']}",
+        "name": "critical_cases_no_regression",
+        "pass": not regressed,
+        "detail": ("no critical cases declared" if not critical_cases
+                   else ("ok: " + ",".join(critical_cases) if not regressed
+                         else "regressed: " + ", ".join(regressed))),
     })
     return gates
 

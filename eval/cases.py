@@ -153,6 +153,23 @@ def load_case_entry(cases_dir: Path, entry: str) -> Case:
     return case
 
 
+def critical_case_keys(suite: dict[str, Any], cases: list[Case]) -> list[str]:
+    """Expand a suite's `critical_cases` ids to `id@version` keys.
+
+    Bare ids match every loaded version of that case so a pinned suite works
+    without repeating versions in the suite file.
+    """
+    declared = list(suite.get("critical_cases") or [])
+    keys: list[str] = []
+    for entry in declared:
+        entry = str(entry).strip()
+        if "@" in entry:
+            keys.append(entry)
+            continue
+        keys.extend(case.key() for case in cases if case.id == entry)
+    return sorted(dict.fromkeys(keys))
+
+
 def case_hashes(cases: list[Case], paths: list[Path]) -> dict[str, dict[str, Any]]:
     """Content proof for a run: definition + fixture hashes per case@version."""
     import hashlib

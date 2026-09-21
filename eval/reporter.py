@@ -88,6 +88,26 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     tokens = [r["token_usage"] for r in scored if r.get("token_usage") is not None]
     llm_durations = [r["llm_duration_ms"] for r in scored if r.get("llm_duration_ms") is not None]
     tool_durations = [r["tool_duration_ms"] for r in scored if r.get("tool_duration_ms") is not None]
+    # --- cost, two explicit denominators (handoff §3.3) ---
+    # Operational cost covers EVERY fixture-ready run with known usage, including
+    # system_failed / schema_failed / budget_exhausted: a model that fails a lot
+    # still spends tokens, and hiding that rewards failure.
+    operational = [r for r in fixture_ok
+                   if r.get("token_usage") is not None or (r.get("llm_calls") or 0) > 0]
+    op_tokens = [r["token_usage"] for r in operational if r.get("token_usage") is not None]
+    op_tool_calls = sum(int(r.get("tool_calls") or 0) for r in operational)
+    op_llm_calls = sum(int(r.get("llm_calls") or 0) for r in operational)
+    op_durations = [r["duration_ms"] for r in operational if r.get("duration_ms") is not None]
+    correct_rows = [r for r in fixture_ok if r["verdict"] == VERDICT_CORRECT]
+    correct_answerable = [r for r in correct_rows if not r.get("abstention_expected")]
+
+    def _per_correct(total: Optional[float], rows: list[dict[str, Any]]) -> Optional[float]:
+        if total is None or not rows:
+            return None
+        return round(total / len(rows), 3)
+
+    op_token_total = sum(op_tokens) if op_tokens else None
+
     ev_total = sum(int(r.get("evidence_total_entries") or 0) for r in scored)
     ev_extra = sum(int(r.get("evidence_extra_entries") or 0) for r in scored)
     ev_unsupported = sum(int(r.get("evidence_unsupported_entries") or 0) for r in scored)
@@ -131,6 +151,27 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "abstention_accuracy": _rate(abstention_correct, len(abstention)),
         "schema_valid_rate": _rate(len(scored), total),
         # --- evidence ---
+        # --- cost: operational vs success-normalised (no weighted score) ---
+        "operational_cost": {
+            "rows": len(operational),
+            "token_usage_total": op_token_total,
+            "token_usage_mean": _mean(op_tokens),
+            "tool_calls_total": op_tool_calls,
+            "llm_calls_total": op_llm_calls,
+            "diagnosis_duration_ms_mean": _mean(op_durations),
+        },
+        "cost_per_correct_diagnosis": {
+            "correct_count": len(correct_rows),
+            "token_usage": _per_correct(op_token_total, correct_rows),
+            "tool_calls": _per_correct(op_tool_calls, correct_rows),
+            "llm_calls": _per_correct(op_llm_calls, correct_rows),
+        },
+        "cost_per_correct_answerable_diagnosis": {
+            "correct_count": len(correct_answerable),
+            "token_usage": _per_correct(op_token_total, correct_answerable),
+            "tool_calls": _per_correct(op_tool_calls, correct_answerable),
+            "llm_calls": _per_correct(op_llm_calls, correct_answerable),
+        },
         "evidence_recall_avg": _mean([r.get("evidence_recall") for r in scored]),
         "required_evidence_match_ratio_avg": _mean(
             [r.get("required_evidence_match_ratio") for r in scored]

@@ -59,43 +59,37 @@ def _resolve_path(doc: Any, path: str) -> tuple[bool, Any]:
     return True, current
 
 
-# Path-based evidence is also restricted: a path may only address the source's
-# business facts, never transport metadata (target/namespace/pod/container/
-# metric name/capability/window_*). The first path segment must be an allowed
-# root, and for events the leaf must be one of the documented fact fields.
-_PATH_ROOTS: dict[str, tuple[str, ...]] = {
-    "kubernetes.status": ("desired_state", "actual_state", "conditions", "anomalies"),
-    "kubernetes.events": ("events",),
-    "kubernetes.logs": ("data",),
-    "loki.logs": ("evidence",),
-    "prometheus.metrics": ("summary", "series"),
+# Path-based evidence is restricted to *path patterns*: a path may only address
+# the source's business facts, never transport/label metadata. Patterns are
+# matched with fullmatch against the whole path (indexes included), so
+# `series[0].labels.container`, `events[0]` (the whole event object) or
+# `target.*` can never be cited as evidence.
+_PATH_PATTERNS: dict[str, tuple[str, ...]] = {
+    "kubernetes.status": (
+        r"desired_state\..+",
+        r"actual_state\..+",
+        r"conditions\[\d+\](\..+)?",
+        r"anomalies(\[\d+\])?",
+    ),
+    "kubernetes.events": (
+        r"events\[\d+\]\.(reason|message|type)",
+    ),
+    "kubernetes.logs": (r"data",),
+    "loki.logs": (r"evidence", r"evidence\[\d+\]"),
+    "prometheus.metrics": (
+        r"summary\.(latest|max|avg)",
+        r"series\[\d+\]\.points\[\d+\]\.value",
+    ),
 }
-_PATH_LEAF_FIELDS: dict[str, tuple[str, ...]] = {
-    "kubernetes.events": ("reason", "message", "type"),
-}
-
-
-def _path_segments(path: str) -> list[str]:
-    """Top-level keys of a path, ignoring list indexes.
-
-    `_PATH_TOKEN` yields a match per key AND per index; index matches carry an
-    empty name and must be dropped, otherwise `events[0].reason` would look like
-    ['events', '', 'reason'] and be rejected.
-    """
-    return [name for name, _index in _PATH_TOKEN.findall(path) if name]
 
 
 def _path_allowed(source: str, path: str) -> bool:
-    roots = _PATH_ROOTS.get(source)
-    if roots is None:
+    """True when `path` matches one of the source's allowed fact patterns."""
+    patterns = _PATH_PATTERNS.get(source)
+    if not patterns:
         return False
-    segments = _path_segments(path)
-    if not segments or segments[0] not in roots:
-        return False
-    leaves = _PATH_LEAF_FIELDS.get(source)
-    if leaves and len(segments) > 1 and segments[1] not in leaves:
-        return False
-    return True
+    candidate = str(path).strip()
+    return any(re.fullmatch(pattern, candidate) for pattern in patterns)
 
 
 def _parse(text: Optional[str]) -> Any:

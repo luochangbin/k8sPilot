@@ -1363,3 +1363,179 @@ def test_benchmark_meta_records_case_hashes():
     entry = hashes["pod-crashloop-001@1"]
     assert len(entry["definition"]) == 64
     assert entry["manifests"], "fixture hashes must be recorded"
+
+
+def test_benchmark_detects_budget_drift_within_one_model():
+    """Same model + same case with different budgets across repetitions must not
+    be hidden by a last-value-wins dict."""
+    from eval.benchmark import build_benchmark_report
+
+    base = {**_row(_case(), verdict="diagnosis_correct"),
+            "identity_ok": True, "llm_request_attempts": 1, "provider": "test",
+            "protocol": "openai_chat_completions", "config_fingerprint": "fp-1",
+            "effective_parameters": {}, "case_id": "c-1", "case_version": "1",
+            "effective_max_agent_rounds": 12, "max_finalization_attempts": 1}
+
+    def rows_for(budgets_by_model):
+        out = []
+        for model, budgets in budgets_by_model.items():
+            for budget in budgets:
+                out.append({**base, "model_profile": model,
+                            "effective_max_tool_calls": budget})
+        return out
+
+    drifted = build_benchmark_report(
+        "b", {"models": ["m1", "m2"], "case_budgets": {}},
+        rows_for({"m1": [12, 6, 12], "m2": [12, 12, 12]}), None)
+    assert drifted["comparable"] is False
+    assert "effective_budget_varies_within_model" in drifted["incomparable_reason"]
+
+    clean = build_benchmark_report(
+        "b2", {"models": ["m1", "m2"], "case_budgets": {}},
+        rows_for({"m1": [12, 12, 12], "m2": [12, 12, 12]}), None)
+    assert clean["comparable"] is True
+
+
+def test_path_patterns_block_nested_metadata_and_whole_objects():
+    """Path evidence must match a fact pattern, not a metadata sub-path."""
+    from app.validation import UNVERIFIABLE, VERIFIED, validate_submission
+
+    def submission(source, path, value, operator="equals"):
+        return {"root_cause_code": "CRASH_LOOP_BACKOFF", "root_cause": "rc",
+                "insufficient_evidence": False,
+                "evidence": [{"source": source, "path": path, "operator": operator,
+                              "value": value}]}
+
+    metrics = [{"tool": "query_metrics", "tool_call_id": "c1", "kind": "realtime",
+                "args": {"namespace": "payment", "name": "p", "uid": "u1"},
+                "output": json.dumps({
+                    "metric": "memory", "summary": {"latest": 1.0, "max": 3.0, "avg": 2.0},
+                    "series": [{"labels": {"container": "app", "pod": "p"},
+                                "points": [{"timestamp": 1700000000, "value": 3.0}]}]})}]
+    for bad_path in ("series[0].labels.container", "series[0].points[0].timestamp",
+                     "series[0].labels", "metric"):
+        ok, _, report = validate_submission(
+            submission("prometheus.metrics", bad_path, "app"), metrics)
+        assert not ok and report[0]["status"] == UNVERIFIABLE, bad_path
+    for good_path in ("summary.max", "series[0].points[0].value"):
+        ok, _, report = validate_submission(
+            submission("prometheus.metrics", good_path, "3.0"), metrics)
+        assert ok and report[0]["status"] == VERIFIED, good_path
+
+    events = [{"tool": "events", "tool_call_id": "c2", "kind": "realtime",
+               "args": {"kind": "Pod", "namespace": "payment", "name": "p", "uid": "u1"},
+               "output": json.dumps({"count": 2, "events": [
+                   {"type": "Warning", "reason": "BackOff", "message": "Back-off"}]})}]
+    ok, _, report = validate_submission(
+        submission("kubernetes.events", "events[0]", "BackOff", operator="contains"), events)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+    ok, _, report = validate_submission(
+        submission("kubernetes.events", "events[0].message", "Back-off", operator="contains"),
+        events)
+    assert ok and report[0]["status"] == VERIFIED
+
+    status = [{"tool": "inspect", "tool_call_id": "c3", "kind": "realtime",
+               "args": {"kind": "Pod", "namespace": "payment", "name": "p", "uid": "u1"},
+               "output": json.dumps({"target": {"name": "p"},
+                                     "desired_state": {"containers": [{"image": "img:v1"}]},
+                                     "actual_state": {"phase": "Pending"},
+                                     "conditions": [{"reason": "PodScheduled", "status": "False"}],
+                                     "anomalies": ["pod is Pending"]})}]
+    for good_path, value in (("actual_state.phase", "Pending"),
+                             ("desired_state.containers[0].image", "img:v1"),
+                             ("conditions[0].reason", "PodScheduled"),
+                             ("anomalies[0]", "pod is Pending")):
+        ok, _, report = validate_submission(
+            submission("kubernetes.status", good_path, value), status)
+        assert ok and report[0]["status"] == VERIFIED, good_path
+    for bad_path in ("actual_state", "desired_state", "target.name", "conditions"):
+        ok, _, report = validate_submission(
+            submission("kubernetes.status", bad_path, "Pending"), status)
+        assert not ok and report[0]["status"] == UNVERIFIABLE, bad_path
+
+
+def test_regression_gates_cover_quality_coverage_and_cost():
+    from eval.compare import _evaluate_gates
+
+    def metric(baseline, candidate):
+        return {"baseline": baseline, "candidate": candidate,
+                "delta": None if baseline is None or candidate is None
+                else round(candidate - baseline, 3)}
+
+    agg = {
+        "end_to_end_correct_rate": metric(0.9, 0.6),
+        "wrong_root_cause_rate": metric(0.0, 0.0),
+        "answerable_coverage": metric(0.9, 0.5),
+        "abstention_recall": metric(1.0, 0.4),
+        "system_failed_rate": metric(0.0, 0.2),
+        "budget_exhausted_rate": metric(0.0, 0.25),
+        "schema_valid_rate": metric(1.0, 1.0),
+        "root_cause_accuracy": metric(0.9, 0.6),
+    }
+    gates = {g["name"]: g["pass"] for g in _evaluate_gates(agg, {}, [])}
+    # The old gate set would have passed this candidate; the new one must not.
+    assert gates["wrong_root_cause_rate_not_up"] is True
+    assert gates["schema_valid_rate_not_down"] is True
+    assert gates["end_to_end_correct_rate_not_down"] is False
+    assert gates["answerable_coverage_not_down"] is False
+    assert gates["abstention_recall_not_down"] is False
+    assert gates["system_failed_rate_not_up"] is False
+    assert gates["budget_exhausted_rate_not_up"] is False
+
+    per_case = {"pod-crashloop-001@2": {"root_cause_accuracy": metric(1.0, 0.0)}}
+    gates = {g["name"]: (g["pass"], g["detail"])
+             for g in _evaluate_gates(agg, per_case, ["pod-crashloop-001@2"])}
+    assert gates["critical_cases_no_regression"][0] is False
+    assert "pod-crashloop-001@2" in gates["critical_cases_no_regression"][1]
+
+
+def test_reporter_operational_cost_charges_failed_runs():
+    """Cost must include failures, and per-correct cost must absorb them."""
+    from eval.reporter import build_report
+
+    base = _row(_case(), verdict="diagnosis_correct")
+    rows = [
+        {**base, "token_usage": 1000, "tool_calls": 2, "llm_calls": 3, "duration_ms": 10.0},
+        {**base, "verdict": "system_failed", "token_usage": 900, "tool_calls": 1,
+         "llm_calls": 2, "duration_ms": 5.0},
+        {**base, "verdict": "system_failed", "token_usage": 900, "tool_calls": 1,
+         "llm_calls": 2, "duration_ms": 5.0},
+    ]
+    report = build_report(rows)
+
+    assert report["operational_cost"]["rows"] == 3
+    assert report["operational_cost"]["token_usage_total"] == 2800
+    # One correct diagnosis carries the whole operational spend.
+    assert report["cost_per_correct_diagnosis"]["correct_count"] == 1
+    assert report["cost_per_correct_diagnosis"]["token_usage"] == 2800
+    assert report["cost_per_correct_diagnosis"]["tool_calls"] == 4
+    # Abstention-expected correct rows are excluded from the answerable variant.
+    abstained = {**base, "abstention_expected": True, "abstention_correct": True}
+    report2 = build_report([abstained])
+    assert report2["cost_per_correct_diagnosis"]["correct_count"] == 1
+    assert report2["cost_per_correct_answerable_diagnosis"]["correct_count"] == 0
+    assert report2["cost_per_correct_answerable_diagnosis"]["token_usage"] is None
+
+
+def test_case_ground_truth_paths_are_allowed_by_the_runtime_allowlist():
+    """Ground-truth evidence paths must be citable under the runtime rules,
+    otherwise a case would be unwinnable."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "agent-service"))
+    from app.validation import _path_allowed, _SOURCE_TOOL
+
+    root = Path(__file__).resolve().parents[1]
+    checked = 0
+    for case_file in sorted((root / "cases").glob("*.yaml")) + \
+            sorted((root / "cases" / "versions").glob("*.yaml")):
+        try:
+            case = load_case(case_file)
+        except Exception:
+            continue
+        for req in case.ground_truth.required_evidence:
+            assert req.source in _SOURCE_TOOL, f"{case_file.name}: {req.source}"
+            if req.path:
+                assert _path_allowed(req.source, req.path), \
+                    f"{case_file.name}: GT path not citable: {req.source} {req.path}"
+                checked += 1
+    assert checked >= 5, "expected several path-based ground-truth facts"

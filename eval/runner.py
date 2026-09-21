@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 import httpx
 
-from .cases import (Case, CaseError, case_hashes, load_case_entry, load_suite,
+from .cases import (Case, CaseError, case_hashes, critical_case_keys, load_case_entry, load_suite,
                     resolve_and_load_case_entry)
 from .injector import Injector, InjectorError
 from .reporter import build_report, render_markdown, report_by_case, write_json, write_jsonl
@@ -67,6 +67,7 @@ class Runner:
             "root_cause_vocabulary_version": ROOT_CAUSE_VOCABULARY_VERSION,
             # Audit trail: prove the pinned definition and fixture bytes are the
             # ones this run measured (compare refuses drift when both sides have it).
+            "critical_cases": critical_case_keys(suite_raw, cases),
             "case_hashes": case_hashes(cases, case_paths),
         }
         write_json(run_dir / "run.json", meta)
