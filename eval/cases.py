@@ -105,6 +105,51 @@ def resolve_case_entry(cases_dir: Path, entry: str) -> Path:
     return cases_dir / f"{entry}.yaml"
 
 
+def case_key(row: dict[str, Any]) -> str:
+    """Report/aggregate key for a scored row: `case-id@case_version`.
+
+    Two versions of the same case are different measurements and must never be
+    merged into one bucket.
+    """
+    return f"{row.get('case_id')}@{row.get('case_version')}"
+
+
+def load_case_entry(cases_dir: Path, entry: str) -> Case:
+    """Resolve + load a suite entry, verifying the pinned file really is that
+    case and version (a mis-copied file must not silently pass).
+
+    `case-id@version` prefers the pinned copy under `versions/`; when there is no
+    pinned copy it accepts the current definition if that definition *is* that
+    version (so `@<current>` keeps working without duplicating files).
+    """
+    entry = str(entry).strip()
+    try:
+        path = resolve_case_entry(cases_dir, entry)
+    except CaseError:
+        if "@" not in entry:
+            raise
+        case_id, _, version = entry.partition("@")
+        path = cases_dir / f"{case_id}.yaml"
+        if not path.is_file():
+            raise CaseError(f"case not found for suite entry {entry!r}: {path}")
+        current = load_case(path)
+        if current.id != case_id or current.case_version != version:
+            raise CaseError(
+                f"suite entry {entry!r} has no pinned definition and the current "
+                f"file is {current.id}@{current.case_version}")
+        return current
+    case = load_case(path)
+    if "@" in entry:
+        case_id, _, version = entry.partition("@")
+        if case.id != case_id or case.case_version != version:
+            raise CaseError(
+                f"suite entry {entry!r} resolved to {case.id}@{case.case_version} "
+                f"({resolve_case_entry(cases_dir, entry)})")
+    elif case.id != entry:
+        raise CaseError(f"suite entry {entry!r} resolved to case id {case.id!r}")
+    return case
+
+
 def load_case(path: Path) -> Case:
     """Parse and validate a single case YAML file."""
     if not path.is_file():

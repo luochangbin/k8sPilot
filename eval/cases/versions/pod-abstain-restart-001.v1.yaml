@@ -9,7 +9,7 @@ target:
   name: abstain-restart-demo
 setup:
   manifests:
-    - manifests/pod-abstain-restart-001.yaml
+    - manifests/pod-abstain-restart-001.v1.yaml
 inject:
   action: apply
 ready_when:

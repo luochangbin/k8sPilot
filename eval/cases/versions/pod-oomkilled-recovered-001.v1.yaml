@@ -9,7 +9,7 @@ target:
   name: oom-recovered-demo
 setup:
   manifests:
-    - manifests/pod-oomkilled-recovered-001.yaml
+    - manifests/pod-oomkilled-recovered-001.v1.yaml
 inject:
   action: apply
 ready_when:

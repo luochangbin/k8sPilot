@@ -13,6 +13,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from .cases import case_key
 from .scorer import (
     SCORER_VERSION,
     VERDICT_CORRECT,
@@ -179,7 +180,8 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def report_by_case(rows: list[dict[str, Any]]) -> dict[str, Any]:
     by_case: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
-        by_case.setdefault(r["case_id"], []).append(r)
+        # id@version: two versions of one case are separate measurements.
+        by_case.setdefault(case_key(r), []).append(r)
     out: dict[str, Any] = {}
     for case_id, case_rows in by_case.items():
         out[case_id] = build_report(case_rows)

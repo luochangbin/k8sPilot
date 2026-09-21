@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .cases import resolve_case_entry, Case, load_case, load_suite
+from .cases import Case, case_key, load_case_entry, load_suite
 from .reporter import build_report, write_json, write_jsonl, _pct
 from .runner import REPO_ROOT, Runner, file_hash
 from .scorer import ROOT_CAUSE_VOCABULARY_VERSION, SCORER_VERSION
@@ -121,7 +121,7 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
                   enable_incidents: Optional[bool] = None) -> tuple[str, Path]:
     suite_raw = load_suite(suite_path)
     cases_dir = Path(__file__).resolve().parent / "cases"
-    cases = [load_case(resolve_case_entry(cases_dir, cid)) for cid in case_ids]
+    cases = [load_case_entry(cases_dir, cid) for cid in case_ids]
 
     benchmark_id = f"benchmark-{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
     run_dir = Path(reports_dir) / benchmark_id
@@ -160,8 +160,8 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
         # Declared Case budgets (the per-attempt *effective* values are recorded
         # on each row from the trace root span).
         "case_budgets": {
-            c.id: {"max_tool_calls": c.budgets.max_tool_calls,
-                   "max_agent_rounds": c.budgets.max_agent_rounds}
+            c.key(): {"max_tool_calls": c.budgets.max_tool_calls,
+                      "max_agent_rounds": c.budgets.max_agent_rounds}
             for c in cases
         },
         "plan": plan,
@@ -276,7 +276,7 @@ def build_benchmark_report(benchmark_id: str, meta: dict[str, Any],
     # 2. Only identical, non-empty case coverage can be compared. Coverage is
     #    the set of cases actually executed (a timeout/failure still ran it),
     #    not only the successfully scored ones.
-    model_cases = {m: {r["case_id"] for r in model_rows_of(m)} for m in models}
+    model_cases = {m: {case_key(r) for r in model_rows_of(m)} for m in models}
     covered = {m: cs for m, cs in model_cases.items() if cs}
     missing_models = [m for m in models if not covered.get(m)]
     if missing_models:
@@ -317,7 +317,7 @@ def build_benchmark_report(benchmark_id: str, meta: dict[str, Any],
     per_model: dict[str, Any] = {}
     for model in models:
         all_model_rows = model_rows_of(model)
-        compared = [r for r in all_model_rows if r["case_id"] in common_cases]
+        compared = [r for r in all_model_rows if case_key(r) in common_cases]
         per_model[model] = {
             "report": build_report(compared) if compared else None,
             "attempt_count": len(all_model_rows),
@@ -330,9 +330,9 @@ def build_benchmark_report(benchmark_id: str, meta: dict[str, Any],
                                              if r.get("identity_ok") is None),
         }
     per_case: dict[str, Any] = {}
-    for case_id in sorted(common_cases):
-        per_case[case_id] = {
-            model: _case_summary([r for r in model_rows_of(model) if r["case_id"] == case_id])
+    for key in sorted(common_cases):
+        per_case[key] = {
+            model: _case_summary([r for r in model_rows_of(model) if case_key(r) == key])
             for model in models
         }
 

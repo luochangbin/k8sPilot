@@ -9,7 +9,7 @@ target:
   name: oom-demo
 setup:
   manifests:
-    - manifests/pod-oomkilled-001.yaml
+    - manifests/pod-oomkilled-001.v1.yaml
 inject:
   action: apply
 ready_when:

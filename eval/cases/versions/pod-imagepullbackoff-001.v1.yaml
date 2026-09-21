@@ -10,7 +10,7 @@ target:
   name: imagepull-demo
 setup:
   manifests:
-    - manifests/pod-imagepullbackoff-001.yaml
+    - manifests/pod-imagepullbackoff-001.v1.yaml
 inject:
   action: apply
 ready_when:

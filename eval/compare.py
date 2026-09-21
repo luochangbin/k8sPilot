@@ -10,7 +10,9 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
-from .scorer import VERDICT_CORRECT, VERDICT_FIXTURE_FAILED, VERDICT_INCORRECT, VERDICT_SCHEMA_FAILED, VERDICT_SYSTEM_FAILED
+from .cases import case_key
+from .scorer import (VERDICT_CORRECT, VERDICT_FIXTURE_FAILED, VERDICT_INCORRECT,
+                     VERDICT_SCHEMA_FAILED, VERDICT_SYSTEM_FAILED)
 
 
 class CompareError(Exception):
@@ -31,7 +33,7 @@ def _load_rows(run_dir: Path) -> dict[str, list[dict[str, Any]]]:
     by_case: dict[str, list[dict[str, Any]]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         row = json.loads(line)
-        by_case.setdefault(row["case_id"], []).append(row)
+        by_case.setdefault(case_key(row), []).append(row)
     return by_case
 
 
@@ -96,7 +98,12 @@ def compare_runs(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
         reasons.append(
             "case_set mismatch: only differing ids are listed "
             f"baseline_only={sorted(b_set - c_set)} candidate_only={sorted(c_set - b_set)}")
-    if b_vocab and c_vocab and b_vocab != c_vocab:
+    if not b_vocab or not c_vocab:
+        # "Unknown" must never be treated as "same": without a recorded
+        # vocabulary version the comparison cannot be proven valid.
+        reasons.append(
+            f"root_cause_vocabulary_version missing: baseline={b_vocab} candidate={c_vocab}")
+    elif b_vocab != c_vocab:
         reasons.append(
             f"root_cause_vocabulary mismatch: baseline={b_vocab} candidate={c_vocab}")
     comparable = not reasons

@@ -10,7 +10,7 @@ target:
   name: failedmount-pvc-demo
 setup:
   manifests:
-    - manifests/pod-failedmount-pvc-001.yaml
+    - manifests/pod-failedmount-pvc-001.v1.yaml
 inject:
   action: apply
 ready_when:

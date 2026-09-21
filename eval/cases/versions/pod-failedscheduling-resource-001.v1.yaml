@@ -10,7 +10,7 @@ target:
   name: sched-resource-demo
 setup:
   manifests:
-    - manifests/pod-failedscheduling-resource-001.yaml
+    - manifests/pod-failedscheduling-resource-001.v1.yaml
 inject:
   action: apply
 ready_when:

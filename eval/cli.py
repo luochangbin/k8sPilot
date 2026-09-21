@@ -30,11 +30,26 @@ def _load_case_ids(suite_path: Path, restrict: list[str]) -> list[str]:
     suite_raw = load_suite(suite_path)
     case_ids = suite_raw.get("cases") or []
     if restrict:
-        allowed = set(restrict)
-        case_ids = [c for c in case_ids if c in allowed]
-        missing = allowed - set(case_ids)
-        if missing:
-            raise CaseError(f"case(s) not in suite: {sorted(missing)}")
+        chosen: list[str] = []
+        unmatched: list[str] = []
+        for requested in restrict:
+            if requested in case_ids:
+                chosen.append(requested)
+                continue
+            # A bare case id is accepted when the suite has exactly one version
+            # of it (`--case pod-crashloop-001` -> `pod-crashloop-001@1`).
+            versions = [c for c in case_ids if c.split("@")[0] == requested]
+            if len(versions) == 1:
+                chosen.append(versions[0])
+            elif versions:
+                raise CaseError(
+                    f"case {requested!r} has several versions in the suite: {sorted(versions)}; "
+                    "pass an explicit case-id@version")
+            else:
+                unmatched.append(requested)
+        if unmatched:
+            raise CaseError(f"case(s) not in suite: {sorted(unmatched)}")
+        case_ids = [c for c in case_ids if c in set(chosen)]
     if not case_ids:
         raise CaseError(f"suite {suite_path} declares no cases")
     return case_ids

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eval-pod-configerror-env-001
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: configerror-env-demo
+  namespace: eval-pod-configerror-env-001
+  labels:
+    app: configerror-env-demo
+spec:
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      envFrom:
+        - configMapRef:
+            name: does-not-exist-cm

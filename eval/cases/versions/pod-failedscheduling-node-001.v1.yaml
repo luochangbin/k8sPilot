@@ -10,7 +10,7 @@ target:
   name: sched-node-demo
 setup:
   manifests:
-    - manifests/pod-failedscheduling-node-001.yaml
+    - manifests/pod-failedscheduling-node-001.v1.yaml
 inject:
   action: apply
 ready_when:

@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eval-pod-oomkilled-recovered-001
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oom-recovered-demo
+  namespace: eval-pod-oomkilled-recovered-001
+  labels:
+    app: oom-recovered-demo
+spec:
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: python:3-alpine
+      # PID 1 is python: first run allocates 256Mi against a 128Mi limit ->
+      # the cgroup OOM-kills the container (reason OOMKilled, restartCount=1);
+      # on restart the marker exists so it sleeps forever (Running again).
+      command: ["python3", "-c", "import os,time; f='/tmp/crashed'; (open(f,'w').close(), bytearray(256*1024*1024)) if not os.path.exists(f) else None; time.sleep(3600)"]
+      resources:
+        limits:
+          memory: 128Mi

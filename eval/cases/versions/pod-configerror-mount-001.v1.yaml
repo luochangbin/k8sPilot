@@ -10,7 +10,7 @@ target:
   name: configerror-mount-demo
 setup:
   manifests:
-    - manifests/pod-configerror-mount-001.yaml
+    - manifests/pod-configerror-mount-001.v1.yaml
 inject:
   action: apply
 ready_when:

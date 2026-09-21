@@ -9,7 +9,7 @@ target:
   name: healthy-demo
 setup:
   manifests:
-    - manifests/pod-healthy-001.yaml
+    - manifests/pod-healthy-001.v1.yaml
 inject:
   action: apply
 ready_when:

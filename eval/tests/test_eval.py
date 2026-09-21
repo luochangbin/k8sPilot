@@ -1,6 +1,7 @@
 """Unit tests for eval: loader, jsonpath, scorer, reporter reproducibility."""
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -890,3 +891,125 @@ def test_compare_refuses_case_set_and_vocabulary_drift(tmp_path):
                          make_run("c3", ["pod-crashloop-001@1"], "v2"))
     assert vocab["comparable"] is False
     assert "root_cause_vocabulary mismatch" in vocab["incomparable_reason"]
+
+
+def test_reports_keep_case_versions_separate():
+    """id@version must not be merged: v1 and v2 are different measurements."""
+    from eval.reporter import report_by_case
+
+    base = _row(_case(), verdict="diagnosis_correct")
+    rows = [
+        {**base, "case_id": "c-1", "case_version": "1", "model_profile": "m1"},
+        {**base, "case_id": "c-1", "case_version": "2", "model_profile": "m1",
+         "verdict": "diagnosis_incorrect"},
+        {**base, "case_id": "c-1", "case_version": "1", "model_profile": "m2"},
+        {**base, "case_id": "c-1", "case_version": "2", "model_profile": "m2",
+         "verdict": "diagnosis_incorrect"},
+    ]
+    by_case = report_by_case(rows)
+    assert set(by_case) == {"c-1@1", "c-1@2"}
+    assert by_case["c-1@1"]["n"] == 2
+    assert by_case["c-1@2"]["n"] == 2
+
+    from eval.benchmark import build_benchmark_report
+    report = build_benchmark_report("bench-1",
+                                    {"models": ["m1", "m2"], "case_budgets": {}}, rows, None)
+    assert set(report["per_case_common"]) == {"c-1@1", "c-1@2"}
+
+
+def test_build_plan_and_budgets_use_case_version_keys():
+    from eval.benchmark import build_plan
+    from eval.cases import load_case_entry
+
+    cases_dir = Path(__file__).resolve().parents[1] / "cases"
+    cases = [load_case_entry(cases_dir, "pod-crashloop-001@1"),
+             load_case_entry(cases_dir, "pod-crashloop-001@2")]
+    plan = build_plan(cases, ["m"], 1, seed=42)
+    assert {p["case_version"] for p in plan} == {"1", "2"}
+    assert {p["attempt_id"].split("__")[0] for p in plan} == {
+        "pod-crashloop-001@1", "pod-crashloop-001@2"}
+
+
+def test_pinned_cases_use_frozen_manifests():
+    """A pinned case must keep its own fixture: editing the current manifest
+    cannot change what phase1 injects."""
+    from eval.cases import load_case_entry
+
+    cases_dir = Path(__file__).resolve().parents[1] / "cases"
+    pinned = load_case_entry(cases_dir, "pod-crashloop-001@1")
+    current = load_case_entry(cases_dir, "pod-crashloop-001")
+
+    pinned_manifest = pinned.setup_manifests[0]
+    assert pinned_manifest.parent.name == "manifests"
+    assert pinned_manifest.parent.parent.name == "versions"
+    assert pinned_manifest != current.setup_manifests[0]
+    assert pinned_manifest.is_file()
+    # Same failure mechanism, frozen copy: the exit-1 command is in the pinned file.
+    assert "exit 1" in pinned_manifest.read_text(encoding="utf-8")
+
+
+def test_load_case_entry_rejects_a_mislabelled_pinned_file(tmp_path):
+    """A file whose name says v1 but whose content says v2 must not load."""
+    from eval.cases import CaseError, load_case_entry
+    from eval.cases import load_case
+
+    cases_dir = Path(__file__).resolve().parents[1] / "cases"
+    source = (cases_dir / "pod-crashloop-001.yaml").read_text(encoding="utf-8")
+    bogus_dir = tmp_path / "cases" / "versions"
+    bogus_dir.mkdir(parents=True)
+    (bogus_dir / "pod-crashloop-001.v1.yaml").write_text(source, encoding="utf-8")
+    # Provide the manifest so the *only* problem is the mislabelled version.
+    manifest_dir = tmp_path / "cases" / "manifests"
+    manifest_dir.mkdir(parents=True)
+    shutil.copy(cases_dir / "manifests" / "pod-crashloop-001.yaml",
+                manifest_dir / "pod-crashloop-001.yaml")
+
+    with pytest.raises(CaseError):
+        load_case_entry(tmp_path / "cases", "pod-crashloop-001@1")
+    # The file itself is fine; only the suite entry was mislabelled.
+    assert load_case(bogus_dir / "pod-crashloop-001.v1.yaml").case_version == "2"
+
+
+def test_compare_requires_vocabulary_version_on_both_sides(tmp_path):
+    from eval.compare import compare_runs
+    from eval.reporter import write_json, write_jsonl
+
+    def make_run(name, vocab):
+        run_dir = tmp_path / name
+        run_dir.mkdir()
+        write_jsonl(run_dir / "case-results.jsonl", [
+            {"case_id": "pod-crashloop-001", "case_version": "1",
+             "verdict": "diagnosis_correct", "fixture_ready": True,
+             "abstention_expected": False}])
+        write_json(run_dir / "report.json", {
+            "run": {"run_id": name, "cases": ["pod-crashloop-001@1"],
+                    "scorer_version": "5", "root_cause_vocabulary_version": vocab},
+            "report": {"scorer_version": "5", "root_cause_accuracy": 1.0,
+                       "wrong_root_cause_rate": 0.0, "schema_valid_rate": 1.0,
+                       "evidence_recall_avg": None, "diagnosis_duration_ms": {"p50": None},
+                       "token_usage": {"p50": None}},
+            "by_case": {},
+        })
+        return run_dir
+
+    missing = compare_runs(make_run("b-missing", None), make_run("c-known", "v2"))
+    assert missing["comparable"] is False
+    assert "root_cause_vocabulary_version missing" in missing["incomparable_reason"]
+
+
+def test_cli_accepts_a_bare_case_id_when_the_suite_has_one_version(tmp_path):
+    from eval.cli import _load_case_ids
+
+    suite = tmp_path / "suite.yaml"
+    suite.write_text("id: t\ncases:\n  - pod-crashloop-001@1\n  - pod-oomkilled-001@1\n",
+                     encoding="utf-8")
+    assert _load_case_ids(suite, ["pod-crashloop-001"]) == ["pod-crashloop-001@1"]
+    assert _load_case_ids(suite, ["pod-crashloop-001@1"]) == ["pod-crashloop-001@1"]
+
+    # Two versions of the same id require an explicit version.
+    suite2 = tmp_path / "suite2.yaml"
+    suite2.write_text("id: t2\ncases:\n  - pod-crashloop-001@1\n  - pod-crashloop-001@2\n",
+                      encoding="utf-8")
+    with pytest.raises(Exception):
+        _load_case_ids(suite2, ["pod-crashloop-001"])
+    assert _load_case_ids(suite2, ["pod-crashloop-001@2"]) == ["pod-crashloop-001@2"]

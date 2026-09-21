@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 import httpx
 
-from .cases import Case, CaseError, load_case, load_suite, resolve_case_entry
+from .cases import Case, CaseError, load_case_entry, load_suite
 from .injector import Injector, InjectorError
 from .reporter import build_report, render_markdown, report_by_case, write_json, write_jsonl
 from .scorer import ROOT_CAUSE_VOCABULARY_VERSION, score_case, summarize_trace
@@ -94,8 +94,9 @@ class Runner:
                               model_profile=model_profile)
 
     def _load_case(self, case_id: str) -> Case:
-        # `case-id` or `case-id@version` (pinned historical definition).
-        return load_case(resolve_case_entry(self._cases_dir(), case_id))
+        # `case-id` or `case-id@version` (pinned historical definition); the
+        # loader verifies the file really is that case and version.
+        return load_case_entry(self._cases_dir(), case_id)
 
     def _cases_dir(self) -> Path:
         return Path(__file__).resolve().parent / "cases"

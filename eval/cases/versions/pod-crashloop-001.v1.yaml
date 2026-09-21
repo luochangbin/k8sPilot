@@ -10,7 +10,7 @@ target:
   name: crashloop-demo
 setup:
   manifests:
-    - manifests/pod-crashloop-001.yaml
+    - manifests/pod-crashloop-001.v1.yaml
 inject:
   action: apply
 ready_when:

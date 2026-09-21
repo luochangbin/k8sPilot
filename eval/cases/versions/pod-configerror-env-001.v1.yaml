@@ -10,7 +10,7 @@ target:
   name: configerror-env-demo
 setup:
   manifests:
-    - manifests/pod-configerror-env-001.yaml
+    - manifests/pod-configerror-env-001.v1.yaml
 inject:
   action: apply
 ready_when:
