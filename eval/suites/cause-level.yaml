@@ -1,0 +1,23 @@
+id: cause-level
+description: Cause-level suite (root cause vocabulary v2). Every Pod case moved
+  from failure-mode to cause-level ground truth and Deployment / Node / PVC
+  targets were added, so results are NOT comparable with the frozen 12-case Pod
+  baseline in phase1.yaml.
+cases:
+  - pod-oomkilled-001
+  - pod-oomkilled-recovered-001
+  - pod-imagepullbackoff-001
+  - pod-imagepullauth-001
+  - pod-image-notfound-001
+  - pod-failedscheduling-node-001
+  - pod-failedscheduling-resource-001
+  - pod-crashloop-001
+  - pod-configerror-env-001
+  - pod-configerror-mount-001
+  - pod-failedmount-pvc-001
+  - pod-healthy-001
+  - pod-abstain-restart-001
+  - deploy-configerror-001
+  - deploy-nodeselector-001
+  - pvc-missing-pv-001
+  - node-notready-synthetic-001

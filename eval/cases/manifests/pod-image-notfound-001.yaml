@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eval-pod-image-notfound-001
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: imagenotfound-demo
+  namespace: eval-pod-image-notfound-001
+  labels:
+    app: imagenotfound-demo
+spec:
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: docker.io/library/busybox:k8spilot-missing-tag-001

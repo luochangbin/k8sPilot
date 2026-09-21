@@ -27,9 +27,18 @@ VERIFIED = "verified"
 MISMATCH = "mismatch"
 UNVERIFIABLE = "unverifiable"
 
-# Realtime evidence sources: knowledge base / historical incidents are explicitly
-# *not* real-time evidence and can never satisfy the final gate.
-_REALTIME_PREFIX = ("kubernetes.", "prometheus.", "loki.")
+# Strict evidence-source -> tool mapping. A claim's source must name the tool
+# that could actually have produced it: "kubernetes.status" can only come from
+# inspect, "kubernetes.events" only from events, and so on. No startswith()
+# families: a value that merely happens to appear in another tool's output must
+# not verify a mis-attributed source.
+_SOURCE_TOOL = {
+    "kubernetes.status": "inspect",
+    "kubernetes.events": "events",
+    "kubernetes.logs": "logs",
+    "prometheus.metrics": "query_metrics",
+    "loki.logs": "query_logs",
+}
 
 _PATH_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\]")
 
@@ -57,29 +66,28 @@ def _parse(text: Optional[str]) -> Any:
         return None
 
 
-def _source_matches(source: str, result: dict[str, Any]) -> bool:
-    tool = result.get("tool")
-    if source.startswith("kubernetes."):
-        return tool in {"inspect", "events", "logs"}
-    if source.startswith("prometheus."):
-        return tool == "query_metrics"
-    if source.startswith("loki."):
-        return tool == "query_logs"
-    return False
-
-
 def verify_evidence(evidence: dict[str, Any],
                     tool_results: list[dict[str, Any]]) -> dict[str, Any]:
     """Mechanically verify one evidence claim against this run's tool results."""
     source = str(evidence.get("source") or "")
     declared = evidence.get("value")
     path = evidence.get("path")
-    relevant = [r for r in tool_results
-                if r.get("kind") == "realtime" and source.startswith(_REALTIME_PREFIX)
-                and _source_matches(source, r)]
-    if not relevant:
+    tool = _SOURCE_TOOL.get(source)
+    if tool is None:
         return {"status": UNVERIFIABLE,
-                "reason": "no matching real-time tool result in this run"}
+                "reason": f"unknown evidence source {source!r}"}
+    relevant = [r for r in tool_results
+                if r.get("kind") == "realtime" and r.get("tool") == tool]
+    # Resource attribution: when the claim names a resource, only that resource's
+    # tool result may verify it (otherwise Pod B could verify a claim about Pod A).
+    uid = evidence.get("resource_uid")
+    if uid:
+        relevant = [r for r in relevant if (r.get("args") or {}).get("uid") == uid]
+        if not relevant:
+            return {"status": UNVERIFIABLE,
+                    "reason": f"no {tool} result for resource_uid {uid!r} in this run"}
+    if not relevant:
+        return {"status": UNVERIFIABLE, "reason": f"no {tool} result in this run"}
 
     if path:
         mismatch: Optional[dict[str, Any]] = None

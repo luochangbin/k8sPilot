@@ -2,7 +2,7 @@ schema_version: eval.k8spilot.io/v1alpha1
 id: pod-imagepullbackoff-001
 case_version: "2"
 suite: phase1
-description: Image tag does not exist in the registry (needs registry egress; ImagePullBackOff is the symptom)
+description: COARSE by design - the registry may be unreachable, so only the pull failure itself is deterministically injectable (see pod-image-notfound-001 for the preflight-gated strict case)
 target:
   apiVersion: v1
   kind: Pod
@@ -19,15 +19,12 @@ ready_when:
   value: "ImagePullBackOff"
   timeout_seconds: 120
 ground_truth:
-  accepted_root_cause_codes: [IMAGE_NOT_FOUND]
+  accepted_root_cause_codes: [IMAGE_PULL_FAILED]
   required_evidence:
     - source: kubernetes.status
       path: actual_state.container_states[0].reason
       operator: equals
       value: ImagePullBackOff
-    - source: kubernetes.events
-      operator: contains
-      value: manifest unknown
   abstention_expected: false
 budgets:
   diagnosis_timeout_seconds: 180

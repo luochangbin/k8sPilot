@@ -1189,6 +1189,46 @@ def test_evidence_assertion_validator_reports_mismatch_and_unverifiable():
     assert report2[0]["status"] == UNVERIFIABLE
 
 
+def test_evidence_source_is_attributed_to_the_tool_that_produced_it():
+    """A value that merely appears in another tool's output must not verify a
+    mis-attributed source (e.g. claiming kubernetes.events after only inspect)."""
+    from app.validation import MISMATCH, UNVERIFIABLE, VERIFIED, validate_submission
+
+    inspect_only = [{
+        "tool": "inspect", "kind": "realtime",
+        "args": {"kind": "Pod", "namespace": "payment", "name": "p", "uid": "uid-1"},
+        "output": json.dumps({"actual_state": {"container_states": [
+            {"name": "app", "state": "waiting", "reason": "ImagePullBackOff"}]}}),
+    }]
+
+    def submission(evidence):
+        return {"root_cause_code": "IMAGE_PULL_FAILED", "root_cause": "rc",
+                "insufficient_evidence": False, "evidence": [evidence]}
+
+    # Wrong source: the string exists in the inspect output, but events never ran.
+    ok, problems, report = validate_submission(
+        submission({"source": "kubernetes.events", "value": "ImagePullBackOff"}),
+        inspect_only)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+
+    # Wrong resource: the uid does not match the tool result's target.
+    ok, _, report = validate_submission(
+        submission({"source": "kubernetes.status", "resource_uid": "uid-other",
+                    "path": "actual_state.container_states[0].reason",
+                    "operator": "equals", "value": "ImagePullBackOff"}),
+        inspect_only)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+
+    # Correct source + resource + path/value verifies.
+    ok, _, report = validate_submission(
+        submission({"source": "kubernetes.status", "resource_uid": "uid-1",
+                    "path": "actual_state.container_states[0].reason",
+                    "operator": "equals", "value": "ImagePullBackOff"}),
+        inspect_only)
+    assert ok and report[0]["status"] == VERIFIED
+    assert MISMATCH not in {item["status"] for item in report}
+
+
 def test_explicit_root_cause_without_verifiable_evidence_is_rejected():
     seen: list[list[dict]] = []
 
@@ -1397,3 +1437,170 @@ def test_root_cause_vocabulary_has_two_levels_and_exposes_both():
     assert "SCHEDULING_FAILED" in FAILURE_MODE_CODES
     assert "HEALTHY" not in FAILURE_MODE_CODES
     assert "NODE_SELECTOR_MISMATCH" not in FAILURE_MODE_CODES
+
+
+def test_finalization_round_exposes_only_submit_result():
+    seen: list[list[str]] = []
+
+    class RecordingLLM(ScriptedLLM):
+        def chat(self, messages, tools, tool_choice):
+            seen.append([t["function"]["name"] for t in tools])
+            return super().chat(messages, tools, tool_choice)
+
+    llm = RecordingLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        _abstain_result(),
+    ])
+    d = run(make_agent(llm, max_calls=1))
+
+    assert d.status == "completed"
+    # Round 1 saw the investigation tools; the terminal-only round saw exactly one.
+    assert len(seen[0]) > 1
+    assert seen[1] == ["submit_result"]
+
+
+def test_finalization_answers_extra_tool_calls_without_investigating():
+    """A provider that returns submit_result + another tool call in the
+    terminal-only round must not leave a dangling tool_call_id, and the extra
+    call must never reach the connector."""
+    seen: list[list[dict]] = []
+
+    class RecordingLLM(ScriptedLLM):
+        def chat(self, messages, tools, tool_choice):
+            seen.append([dict(m) for m in messages])
+            return super().chat(messages, tools, tool_choice)
+
+    mixed = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content=None,
+        tool_calls=[
+            SimpleNamespace(id="call_submit", type="function", function=SimpleNamespace(
+                name="submit_result", arguments=json.dumps({
+                    "symptom": "s", "root_cause_code": "CONTAINER_OOMKILLED",
+                    "insufficient_evidence": False, "evidence": [],
+                    "root_cause": "rc", "confidence": "high", "recommendations": []}))),
+            SimpleNamespace(id="call_events", type="function", function=SimpleNamespace(
+                name="events", arguments=json.dumps(
+                    {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}))),
+        ],
+    ))])
+
+    connector = StubConnector()
+    agent = make_agent(RecordingLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        mixed,
+        _abstain_result(),
+    ]), connector)
+    agent.cfg.max_tool_calls = 1
+    agent.cfg.max_finalization_attempts = 2
+    store = SessionStore()
+    d = store.create(make_request())
+    agent.run(make_request(), store, d.diagnosis_id)
+
+    assert store.get(d.diagnosis_id).status == "completed"
+    # Only the investigation round reached the connector.
+    assert connector.call_log == ["inspect"]
+    # Both ids from the mixed response were answered before the next LLM call.
+    third_request = seen[2]
+    answered = {m.get("tool_call_id") for m in third_request if m.get("role") == "tool"}
+    assert {"call_submit", "call_events"} <= answered
+
+
+def test_finalization_attempts_are_bounded_and_recorded(tmp_path):
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        ScriptedLLM.text_response("no conclusion"),
+    ])
+    agent = make_agent(llm, max_calls=1)
+    agent.cfg.max_finalization_attempts = 1
+    agent.cfg.trace_dir = str(tmp_path / "trace")
+    store = SessionStore()
+    d = store.create(make_request())
+    agent.run(make_request(), store, d.diagnosis_id)
+
+    row = store.get(d.diagnosis_id)
+    assert row.status == "failed" and row.failure_reason == "budget_exhausted"
+    assert len(llm.calls) == 2  # investigation round + exactly one finalization call
+    root = _trace_root(str(tmp_path / "trace"), d.diagnosis_id)
+    assert root["attributes"]["max_finalization_attempts"] == 1
+
+
+def test_failure_traces_carry_the_budget_snapshot(tmp_path):
+    """budget_exhausted / cancelled / connector failure must all record the
+    budget counters, so failed runs stay analysable."""
+    from app.connector import ToolError
+    from app.validation import VERIFIED  # noqa: F401 - documents the gate exists
+
+    required = {"max_tool_calls", "max_agent_rounds", "rounds_used",
+                "tool_calls_used", "multi_tool_rejected_rounds"}
+
+    def run_failure(label, connector, script, configure=None):
+        agent = make_agent(ScriptedLLM(script), connector)
+        agent.cfg.trace_dir = str(tmp_path / label)
+        if configure:
+            configure(agent)
+        store = SessionStore()
+        d = store.create(make_request())
+        agent.run(make_request(), store, d.diagnosis_id)
+        row = store.get(d.diagnosis_id)
+        root = _trace_root(str(tmp_path / label), d.diagnosis_id)
+        assert required <= set(root["attributes"]), f"{label}: missing budget attrs"
+        return row, root
+
+    class RecreatedConnector(StubConnector):
+        def logs(self, target, **kwargs):
+            raise ToolError("uid_mismatch", "target resource was recreated (uid mismatch)")
+
+    budget_row, budget_root = run_failure(
+        "budget", StubConnector(),
+        [ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                               "name": "payment-api-7b8c9"}),
+         ScriptedLLM.text_response("no conclusion")],
+        lambda agent: setattr(agent.cfg, "max_tool_calls", 1))
+    assert budget_row.failure_reason == "budget_exhausted"
+    assert budget_root["attributes"]["tool_calls_used"] == 1
+
+    # Eval-side summarisation of a FAILED run must not come back empty.
+    from eval.scorer import summarize_trace
+
+    path = Path(tmp_path / "budget" / f"{budget_row.diagnosis_id}.jsonl")
+    spans = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    summary = summarize_trace({"spans": spans})
+    assert summary["rounds_used"] is not None
+    assert summary["effective_max_tool_calls"] == 1
+    assert summary["effective_max_agent_rounds"] == 12
+    assert summary["multi_tool_rejected_rounds"] == 0
+
+    uid_row, _ = run_failure(
+        "uid", RecreatedConnector(),
+        [ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                               "name": "payment-api-7b8c9"}),
+         ScriptedLLM.tool_response("logs", {"namespace": "payment",
+                                            "name": "payment-api-7b8c9"})])
+    assert uid_row.status == "failed" and "recreated" in (uid_row.error or "")
+
+    class CancellingConnector(StubConnector):
+        def inspect(self, target):
+            self._maybe_raise("inspect")
+            store_holder["store"].request_cancel(store_holder["id"])
+            return self._inspect_response or {
+                "target": target, "exists": True, "uid_mismatch": False,
+                "desired_state": {}, "conditions": [], "anomalies": [],
+                "actual_state": {"phase": "Running", "restart_count": 0}}
+
+    store_holder = {}
+    cancel_agent = make_agent(ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        _submit_ok(),
+    ]), CancellingConnector())
+    cancel_agent.cfg.trace_dir = str(tmp_path / "cancel")
+    store = SessionStore()
+    d = store.create(make_request())
+    store_holder.update(store=store, id=d.diagnosis_id)
+    cancel_agent.run(make_request(), store, d.diagnosis_id)
+    cancel_root = _trace_root(str(tmp_path / "cancel"), d.diagnosis_id)
+    assert required <= set(cancel_root["attributes"])
+    assert cancel_root["attributes"]["rounds_used"] >= 1

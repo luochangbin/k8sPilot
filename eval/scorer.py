@@ -10,7 +10,9 @@ required-evidence match ratio over de-duplicated output entries.
 v3 adds the versioned root-cause vocabulary linkage and budget/policy
 observability. v4 adds the `contains` evidence operator (event/log messages are
 not exact strings) and lets evidence omit the operator instead of forcing an
-exact echo of it.
+exact echo of it. v5 makes `contains` symmetric with `equals`: an evidence item
+that declares a conflicting operator no longer matches, so the runtime gate and
+the scorer agree on operator semantics.
 """
 
 import sys
@@ -21,7 +23,7 @@ from .cases import Case
 
 # Bump when scoring semantics change. Results produced by different versions
 # must not be diffed directly; recompute from raw results with one scorer.
-SCORER_VERSION = "4"
+SCORER_VERSION = "5"
 
 # Share the versioned root cause vocabulary with the agent service.
 _AGENT_SERVICE = Path(__file__).resolve().parents[1] / "agent-service"
@@ -60,11 +62,16 @@ def _matches_required(evidence: dict[str, Any], req) -> bool:
     if req.path and evidence.get("path") != req.path:
         return False
     declared = evidence.get("value")
+    stated = evidence.get("operator")
     if req.operator == "contains":
+        # Omitting the operator is allowed, declaring `contains` is allowed;
+        # declaring anything else (e.g. equals) is a different claim.
+        if stated not in (None, "contains"):
+            return False
         return declared is not None and str(req.value) in str(declared)
     # `equals` stays strict: the evidence must declare the same operator, so a
     # looser claim (e.g. contains) cannot masquerade as an exact fact.
-    if req.operator and evidence.get("operator") != req.operator:
+    if req.operator and stated != req.operator:
         return False
     return str(declared) == str(req.value)
 

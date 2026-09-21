@@ -50,6 +50,10 @@ class Config:
         # requests cannot spawn unbounded LLM/connector load. Requests beyond the
         # limit stay "queued" until a worker frees up.
         self.max_concurrent_diagnoses: int = int(_env("MAX_CONCURRENT_DIAGNOSES", "4"))
+        # Terminal-only finalization after the investigation budgets run out: how
+        # many submit_result-only rounds the model gets (default 1). Recorded in
+        # the trace so a benchmark run is reproducible.
+        self.max_finalization_attempts: int = int(_env("AGENT_FINALIZATION_ATTEMPTS", "1"))
 
         # Phase 2 eval trace: when set, per-diagnosis JSONL trace files are
         # written to this directory. Empty disables tracing (product default).

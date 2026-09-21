@@ -52,6 +52,12 @@ _TOOL_SCOPE: dict[str, tuple[Optional[str], str, str]] = {
     "query_logs": (None, "namespace", "name"),
 }
 
+FINALIZATION_ONLY_SUBMIT = (
+    "Investigation budgets are exhausted: only submit_result is available now. "
+    "Submit your conclusion from the evidence already gathered, or a valid "
+    "abstention (insufficient_evidence=true + missing_evidence)."
+)
+
 SCOPE_VIOLATION = (
     "resource is outside the current diagnosis scope: {kind}/{namespace}/{name}. "
     "Only the diagnosis target and resources discovered through relations() may "
@@ -118,6 +124,7 @@ class Agent:
         # Observable budget/policy accounting, surfaced on the root span.
         budget: dict[str, Any] = {
             **budgets,
+            "max_finalization_attempts": max(1, self.cfg.max_finalization_attempts),
             "rounds_used": 0,
             "tool_calls_used": 0,
             "multi_tool_rejected_rounds": 0,
@@ -127,19 +134,23 @@ class Agent:
             self._run_inner(req, store, diagnosis_id, steps, trace, retrieved, llm, execution,
                             budget)
         except UIDMismatchError as exc:
-            self._fail(store, diagnosis_id, str(exc), steps, trace, KUBERNETES_API)
+            self._fail(store, diagnosis_id, str(exc), steps, trace, KUBERNETES_API,
+                       trace_attributes=dict(budget))
         except DiagnosisCancelled as exc:
             self._fail(store, diagnosis_id, str(exc), steps, trace, AGENT_PLANNING,
-                       failure_reason="cancelled")
+                       failure_reason="cancelled", trace_attributes=dict(budget))
         except BudgetExhaustedError as exc:
             self._fail(store, diagnosis_id, str(exc), steps, trace, AGENT_PLANNING,
-                       failure_reason=BUDGET_EXHAUSTED)
+                       failure_reason=BUDGET_EXHAUSTED, trace_attributes=dict(budget))
         except ConnectorError as exc:
-            self._fail(store, diagnosis_id, str(exc), steps, trace, CONNECTOR)
+            self._fail(store, diagnosis_id, str(exc), steps, trace, CONNECTOR,
+                       trace_attributes=dict(budget))
         except LLMError as exc:
-            self._fail(store, diagnosis_id, str(exc), steps, trace, LLM_TRANSPORT)
+            self._fail(store, diagnosis_id, str(exc), steps, trace, LLM_TRANSPORT,
+                       trace_attributes=dict(budget))
         except Exception as exc:  # noqa: BLE001 - fail loudly, never crash silently
-            self._fail(store, diagnosis_id, f"unexpected error: {exc}", steps, trace, AGENT_PLANNING)
+            self._fail(store, diagnosis_id, f"unexpected error: {exc}", steps, trace,
+                       AGENT_PLANNING, trace_attributes=dict(budget))
         else:
             d = store.get(diagnosis_id)
             if trace is not None:
@@ -229,12 +240,16 @@ class Agent:
     @staticmethod
     def _fail(store: SessionStore, diagnosis_id: str, message: str,
               steps: list[str], trace: Optional[DiagnosisTrace], layer: str,
-              failure_reason: Optional[str] = None) -> None:
+              failure_reason: Optional[str] = None,
+              trace_attributes: Optional[dict[str, Any]] = None) -> None:
         store.update(diagnosis_id, status="failed", error=message,
                      result=DiagnosisResult(investigation_steps=steps),
                      failure_reason=failure_reason)
         if trace is not None:
-            trace.finish("failed", error=message, failure_layer=layer)
+            # Failed runs are the ones we most need to analyse: the budget
+            # snapshot must be on the root span for every exit path.
+            trace.finish("failed", error=message, failure_layer=layer,
+                          attributes=trace_attributes)
 
     @staticmethod
     def _tool_failure_layer(exc: Exception) -> str:
@@ -267,8 +282,10 @@ class Agent:
         tools = tool_definitions(capabilities, retrieval)
 
         if budget is None:
-            budget = {**self.effective_budgets(req), "rounds_used": 0,
-                      "tool_calls_used": 0, "multi_tool_rejected_rounds": 0}
+            budget = {**self.effective_budgets(req),
+                      "max_finalization_attempts": max(1, self.cfg.max_finalization_attempts),
+                      "rounds_used": 0, "tool_calls_used": 0,
+                      "multi_tool_rejected_rounds": 0}
         tool_results = tool_results if tool_results is not None else []
         allowed: set[tuple[str, str, str]] = set()
         if req.resource is not None:
@@ -278,18 +295,23 @@ class Agent:
         def _finalize_only() -> None:
             """Terminal-only round after the investigation budgets ran out.
 
-            The model may still submit a valid conclusion or a valid abstention
-            from the evidence it already gathered. If it cannot, the session
-            fails with failure_reason=budget_exhausted (a planning failure, never
-            silently converted into an abstention).
+            Only `submit_result` is exposed, so the model cannot keep
+            investigating and the connector is never called again. The model may
+            still submit a valid conclusion or a valid abstention from the
+            evidence it already gathered; if it cannot, the session fails with
+            failure_reason=budget_exhausted (a planning failure, never silently
+            converted into an abstention).
             """
+            finalization_tools = [d for d in tools
+                                  if d["function"]["name"] == "submit_result"]
             forced: Any = {"type": "function", "function": {"name": "submit_result"}}
-            for attempt in range(2):
+            attempts = max(1, int(budget.get("max_finalization_attempts", 1)))
+            for _attempt in range(attempts):
                 if store.is_cancelled(diagnosis_id):
                     raise DiagnosisCancelled("diagnosis cancelled")
                 t0 = time.time()
                 try:
-                    resp = llm.chat(messages, tools, forced)
+                    resp = llm.chat(messages, finalization_tools, forced)
                 except LLMError as exc:
                     if trace is not None:
                         trace.llm_call(duration_ms=(time.time() - t0) * 1000.0,
@@ -297,11 +319,11 @@ class Agent:
                                        error="LLM request failed")
                     raise
                 if trace is not None:
-                    attempts = int(getattr(llm, "last_attempt_count", 1) or 1)
+                    attempts_used = int(getattr(llm, "last_attempt_count", 1) or 1)
                     usage = getattr(resp, "usage", None)
                     trace.llm_call(
                         duration_ms=(time.time() - t0) * 1000.0,
-                        retries=max(0, attempts - 1), attempts=attempts,
+                        retries=max(0, attempts_used - 1), attempts=attempts_used,
                         finish_reason=(getattr(resp.choices[0], "finish_reason", None)
                                        if resp.choices else None),
                         prompt_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
@@ -314,8 +336,17 @@ class Agent:
                 if calls:
                     assistant_msg["tool_calls"] = [self._tool_call_payload(tc) for tc in calls]
                 messages.append(assistant_msg)
-                submit_tc = next((tc for tc in calls
-                                  if tc.function.name == "submit_result"), None)
+
+                # Every tool_call_id must be answered (strict providers reject a
+                # dangling id). Only submit_result is acted on; anything else the
+                # provider invented gets a terminal-only notice.
+                submit_tc = None
+                for tc in calls:
+                    if tc.function.name == "submit_result":
+                        submit_tc = tc
+                    else:
+                        messages.append({"role": "tool", "tool_call_id": tc.id,
+                                         "content": FINALIZATION_ONLY_SUBMIT})
                 if submit_tc is None:
                     messages.append({
                         "role": "user",
@@ -333,14 +364,14 @@ class Agent:
                     ok, problems, verification = validate_submission(
                         parsed.model_dump(), tool_results)
                     if ok:
-                        result = parsed
                         if trace is not None:
-                            schema_valid = (result.root_cause_code is None
-                                            or is_valid_root_cause_code(result.root_cause_code))
-                            trace.llm_final(root_cause_code=result.root_cause_code,
+                            schema_valid = (
+                                parsed.root_cause_code is None
+                                or is_valid_root_cause_code(parsed.root_cause_code))
+                            trace.llm_final(root_cause_code=parsed.root_cause_code,
                                             schema_valid=schema_valid,
-                                            confidence=result.confidence)
-                        store.update(diagnosis_id, status="completed", result=result)
+                                            confidence=parsed.confidence)
+                        store.update(diagnosis_id, status="completed", result=parsed)
                         return
                     messages.append({
                         "role": "tool", "tool_call_id": submit_tc.id,

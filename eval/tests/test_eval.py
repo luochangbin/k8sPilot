@@ -77,7 +77,7 @@ def _row(case, *, verdict=VERDICT_CORRECT, abstention_expected=False, **kw):
 def test_load_real_cases():
     cases_dir = Path(__file__).resolve().parents[1] / "cases"
     files = sorted(cases_dir.glob("*.yaml"))
-    assert len(files) == 16, f"expected 16 cases, got {len(files)}"
+    assert len(files) == 17, f"expected 17 cases, got {len(files)}"
     supported = {"Pod", "Deployment", "ReplicaSet", "StatefulSet", "DaemonSet",
                  "Service", "Node", "PersistentVolumeClaim", "Namespace"}
     for f in files:
@@ -525,7 +525,7 @@ def test_required_evidence_contains_operator_matches_event_messages():
 
     req = EvidenceRequirement(source="kubernetes.events", path="", operator="contains",
                               value="didn't match")
-    assert SCORER_VERSION == "4"
+    assert SCORER_VERSION == "5"
     assert _matches_required(
         {"source": "kubernetes.events",
          "value": "0/2 nodes are available: 2 node(s) didn't match Pod's node affinity/selector."},
@@ -543,6 +543,12 @@ def test_required_evidence_contains_operator_matches_event_messages():
     assert not _matches_required({"source": "kubernetes.status", "path": "actual_state.phase",
                                   "operator": "contains", "value": "Pending"}, exact)
 
+    # contains is symmetric with equals: a conflicting declared operator fails.
+    assert _matches_required({"source": "kubernetes.events", "operator": "contains",
+                              "value": "didn't match"}, req)
+    assert not _matches_required({"source": "kubernetes.events", "operator": "equals",
+                                  "value": "didn't match"}, req)
+
 
 def test_case_suite_is_well_formed_and_cause_level():
     """The suite must express causes, not Kubernetes failure modes, and cover
@@ -553,7 +559,7 @@ def test_case_suite_is_well_formed_and_cause_level():
     cases_dir = Path(__file__).resolve().parents[1] / "cases"
     # Cases that can only inject a coarse failure in this environment, with the
     # reason recorded in their description.
-    coarse_allowed = {"pod-imagepullauth-001"}
+    coarse_allowed = {"pod-imagepullauth-001", "pod-imagepullbackoff-001"}
 
     ids, kinds = set(), set()
     cause_level = 0
@@ -584,3 +590,97 @@ def test_case_suite_is_well_formed_and_cause_level():
     assert {"INSUFFICIENT_NODE_RESOURCES"} in scheduling
     # The suite is dominated by cause-level ground truth.
     assert cause_level >= 12
+
+
+def test_cause_level_suite_declares_multi_kind_coverage():
+    """Benchmark coverage must come from the *suite*, not from whatever files
+    happen to sit in eval/cases/."""
+    from eval.cases import load_case, load_suite
+
+    suites_dir = Path(__file__).resolve().parents[1] / "suites"
+    cases_dir = Path(__file__).resolve().parents[1] / "cases"
+    suite = load_suite(suites_dir / "cause-level.yaml")
+    declared = suite["cases"]
+    assert len(declared) >= 16
+
+    kinds = set()
+    for case_id in declared:
+        found = load_case(cases_dir / f"{case_id}.yaml")
+        assert found.id == case_id
+        kinds.add(found.target.kind)
+    assert {"Pod", "Deployment", "Node", "PersistentVolumeClaim"} <= kinds
+
+    # The frozen baseline suite stays untouched and remains a Pod-only baseline.
+    phase1 = load_suite(suites_dir / "phase1.yaml")
+    phase1_kinds = {load_case(cases_dir / f"{cid}.yaml").target.kind
+                    for cid in phase1["cases"]}
+    assert phase1_kinds == {"Pod"}
+
+
+def test_registry_preflight_fails_closed(monkeypatch):
+    """IMAGE_NOT_FOUND cases are only allowed to run when the registry is
+    reachable and the tag is truly absent."""
+    import eval.injector as injector
+
+    class Resp:
+        def __init__(self, status, headers=None, payload=None):
+            self.status_code = status
+            self.headers = headers or {}
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise injector.httpx.HTTPStatusError("bad", request=None, response=None)
+
+    # 404 (tag absent) -> preflight passes.
+    monkeypatch.setattr(injector.httpx, "get",
+                        lambda *a, **k: Resp(404))
+    injector.check_registry_tag_absent("docker.io/library/busybox:missing-tag-001")
+
+    # Any other status -> the case must fail closed.
+    monkeypatch.setattr(injector.httpx, "get", lambda *a, **k: Resp(500))
+    with pytest.raises(injector.InjectorError):
+        injector.check_registry_tag_absent("docker.io/library/busybox:missing-tag-001")
+
+    # Unreachable registry -> fail closed.
+    def _boom(*a, **k):
+        raise injector.httpx.ConnectError("no route")
+
+    monkeypatch.setattr(injector.httpx, "get", _boom)
+    with pytest.raises(injector.InjectorError):
+        injector.check_registry_tag_absent("docker.io/library/busybox:missing-tag-001")
+
+
+def test_registry_preflight_handles_bearer_challenge(monkeypatch):
+    import eval.injector as injector
+
+    calls = []
+
+    class Resp:
+        def __init__(self, status, headers=None, payload=None):
+            self.status_code = status
+            self.headers = headers or {}
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise AssertionError("unexpected raise_for_status")
+
+    def fake_get(url, headers=None, timeout=None, trust_env=False):
+        calls.append(url)
+        if url.startswith("https://auth.example"):
+            return Resp(200, payload={"token": "tok"})
+        if headers and headers.get("Authorization") == "Bearer tok":
+            return Resp(404)
+        return Resp(401, headers={"WWW-Authenticate":
+                                  'Bearer realm="https://auth.example/token",service="reg",scope="repository:x/y:pull"'})
+
+    monkeypatch.setattr(injector.httpx, "get", fake_get)
+    injector.check_registry_tag_absent("registry.example/x/y:missing-tag", timeout=1)
+    assert any(u.startswith("https://auth.example") for u in calls)
