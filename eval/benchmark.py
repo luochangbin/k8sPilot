@@ -121,7 +121,8 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
                   time_limit_seconds: Optional[float] = None,
                   model_label: str = "", runner: Any = None,
                   enable_knowledge: Optional[bool] = None,
-                  enable_incidents: Optional[bool] = None) -> tuple[str, Path]:
+                  enable_incidents: Optional[bool] = None,
+                  pace_seconds: float = 0.0) -> tuple[str, Path]:
     suite_raw = load_suite(suite_path)
     cases_dir = Path(__file__).resolve().parent / "cases"
     loaded = [resolve_and_load_case_entry(cases_dir, cid) for cid in case_ids]
@@ -180,10 +181,15 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
     stop_reason: Optional[str] = None
     started = time.monotonic()
 
-    for attempt in plan:
+    for index, attempt in enumerate(plan):
         if time_limit_seconds is not None and (time.monotonic() - started) >= time_limit_seconds:
             stop_reason = "time_limit_reached"
             break
+        # Pace the batch: an unpaced sweep makes ~10 LLM calls per minute and
+        # trips provider 429s, which would show up as system_failed and poison
+        # every downstream comparison.
+        if pace_seconds > 0 and index > 0:
+            time.sleep(pace_seconds)
         case = cases_by_id[f"{attempt['case_id']}@{attempt['case_version']}"]
         t0 = _now_iso()
         row = runner.run_case_attempt(

@@ -68,6 +68,8 @@ def main(argv=None) -> int:
                        help="dir the agent writes TRACE_DIR to (must match the running agent)")
     run_p.add_argument("--kubeconfig", default=None)
     run_p.add_argument("--reports-dir", default="reports")
+    run_p.add_argument("--pace-seconds", type=float, default=0.0,
+                       help="sleep between attempts to avoid provider rate limits")
     run_p.add_argument("--model", default="")
     run_p.add_argument("--case", action="append", default=None)
     run_p.add_argument("--enable-knowledge", choices=("auto", "on", "off"), default="auto",
@@ -87,6 +89,8 @@ def main(argv=None) -> int:
     bench_p.add_argument("--trace-dir", default=None)
     bench_p.add_argument("--kubeconfig", default=None)
     bench_p.add_argument("--reports-dir", default="reports")
+    bench_p.add_argument("--pace-seconds", type=float, default=0.0,
+                       help="sleep between attempts to avoid provider rate limits")
     bench_p.add_argument("--max-diagnoses", type=int, default=None)
     bench_p.add_argument("--time-limit-seconds", type=float, default=None)
     bench_p.add_argument("--model", default="", help="declared label only; not proof of model")
@@ -114,6 +118,7 @@ def main(argv=None) -> int:
                 enable_knowledge=_tri_state(args.enable_knowledge),
                 enable_incidents=_tri_state(args.enable_incidents),
                 model_profile=args.model_profile,
+                pace_seconds=args.pace_seconds,
             )
             print(f"run {run_id} finished: {run_dir}")
             print(f"report: {(run_dir / 'report.md')}")
@@ -134,6 +139,7 @@ def main(argv=None) -> int:
                 time_limit_seconds=args.time_limit_seconds, model_label=args.model,
                 enable_knowledge=_tri_state(args.enable_knowledge),
                 enable_incidents=_tri_state(args.enable_incidents),
+                pace_seconds=args.pace_seconds,
             )
             print(f"benchmark {benchmark_id} finished: {run_dir}")
             print(f"report: {(run_dir / 'model-benchmark.md')}")

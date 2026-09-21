@@ -1,6 +1,7 @@
 """Model profile resolution tests (handoff §4)."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -126,7 +127,6 @@ class _FakeCompletions:
 
 
 def _fake_llm(max_retries, fail_times):
-    from types import SimpleNamespace
     from app.llm import OpenAILLM
     obj = OpenAILLM.__new__(OpenAILLM)
     obj._init(base_url="http://x", api_key="k", model="m", timeout=5,
@@ -153,3 +153,81 @@ def test_chat_failure_carries_attempts():
     except LLMError as exc:
         assert exc.attempts == 2
     assert llm.last_attempt_count == 2
+
+
+def test_retryable_classification():
+    from app.llm import is_retryable
+
+    class RateLimited(Exception):
+        status_code = 429
+
+    class BadRequest(Exception):
+        status_code = 400
+
+    class Timeout(Exception):
+        pass
+    Timeout.__name__ = "APITimeoutError"
+
+    class Unauthorized(Exception):
+        status_code = 401
+
+    assert is_retryable(RateLimited())
+    assert is_retryable(Timeout())
+    assert not is_retryable(BadRequest())
+    assert not is_retryable(Unauthorized())
+
+
+def test_client_backs_off_between_retries_and_fails_fast_on_400(monkeypatch):
+    import app.llm as llm_module
+    from app.config import Config
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(llm_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    class FlakyClient:
+        def __init__(self, exc):
+            self._exc = exc
+            self.calls = 0
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def _create(self, **kwargs):
+            self.calls += 1
+            raise self._exc
+
+    class RateLimited(Exception):
+        status_code = 429
+
+    cfg = Config()
+    client = llm_module.OpenAILLM.__new__(llm_module.OpenAILLM)
+    flaky = FlakyClient(RateLimited("upstream unavailable"))
+    client._init(base_url="http://x", api_key="k", model="m", timeout=5.0,
+                 max_retries=3, max_tokens=10, temperature=None, default_headers=None,
+                 backoff_seconds=2.0)
+    client._client = flaky
+
+    with pytest.raises(llm_module.LLMError) as excinfo:
+        client.chat([{"role": "user", "content": "hi"}], [], "auto")
+    assert flaky.calls == 4                     # 1 + 3 retries
+    assert excinfo.value.attempts == 4
+    # Exponential, jittered, capped: 2, 4, 8 (+ up to 25% jitter).
+    assert len(sleeps) == 3
+    assert sleeps[0] >= 2.0 and sleeps[1] >= 4.0 and sleeps[2] >= 8.0
+    assert all(s <= 10.0 * 1.25 for s in sleeps)
+
+    # A non-retryable 400 fails immediately: no retries, no sleeping.
+    sleeps.clear()
+    bad = FlakyClient(type("BadRequest", (Exception,), {"status_code": 400})("bad"))
+
+    class Unauthorized(Exception):
+        status_code = 401
+
+    client2 = llm_module.OpenAILLM.__new__(llm_module.OpenAILLM)
+    client2._init(base_url="http://x", api_key="k", model="m", timeout=5.0,
+                  max_retries=3, max_tokens=10, temperature=None, default_headers=None,
+                  backoff_seconds=2.0)
+    client2._client = bad
+    with pytest.raises(llm_module.LLMError) as excinfo2:
+        client2.chat([{"role": "user", "content": "hi"}], [], "auto")
+    assert bad.calls == 1
+    assert excinfo2.value.attempts == 1
+    assert sleeps == []

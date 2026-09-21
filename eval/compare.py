@@ -157,8 +157,10 @@ def _budget_mismatch(b_rows: dict[str, list[dict[str, Any]]],
                      c_rows: dict[str, list[dict[str, Any]]]) -> Optional[str]:
     """Per-case effective budgets must be identical (and known) on both sides."""
     def budgets(rows_by_case: dict[str, list[dict[str, Any]]]) -> dict[str, set]:
+        # A fixture failure means no investigation ran, so it has no effective
+        # budget to compare (the case is reported separately as fixture_failed).
         return {
-            key: {budget_signature(r) for r in rows}
+            key: {budget_signature(r) for r in rows if r.get("fixture_ready")}
             for key, rows in rows_by_case.items()
         }
 
@@ -172,7 +174,7 @@ def _budget_mismatch(b_rows: dict[str, list[dict[str, Any]]],
     # Check BOTH sides (merging would hide one side) and every element of the
     # signature, including the finalization budget.
     unknown = sorted(
-        key for key in set(b_budgets) | set(c_budgets)
+        key for key in (set(b_budgets) | set(c_budgets)) if b_budgets.get(key) or c_budgets.get(key)
         if any(budget_signature_unknown(signature)
                for signature in (b_budgets.get(key, set()) | c_budgets.get(key, set())))
     )

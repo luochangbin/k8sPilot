@@ -1555,3 +1555,37 @@ def test_case_ground_truth_paths_are_allowed_by_the_runtime_allowlist():
                     f"{case_file.name}: GT path not citable: {req.source} {req.path}"
                 checked += 1
     assert checked >= 5, "expected several path-based ground-truth facts"
+
+
+def test_compare_ignores_fixture_failed_rows_for_budget_consistency(tmp_path):
+    """A case that cannot run here must not make every comparison incomparable:
+    fixture failures have no effective budget, only their count matters."""
+    from eval.compare import compare_runs
+    from eval.reporter import write_json, write_jsonl
+
+    def make_run(name):
+        run_dir = tmp_path / name
+        run_dir.mkdir()
+        write_jsonl(run_dir / "case-results.jsonl", [
+            {"case_id": "pod-image-notfound-001", "case_version": "1",
+             "verdict": "fixture_failed", "fixture_ready": False,
+             "abstention_expected": False},
+            {"case_id": "pod-crashloop-001", "case_version": "1",
+             "verdict": "diagnosis_correct", "fixture_ready": True,
+             "abstention_expected": False, "effective_max_tool_calls": 12,
+             "effective_max_agent_rounds": 12, "max_finalization_attempts": 1},
+        ])
+        write_json(run_dir / "report.json", {
+            "run": {"run_id": name,
+                    "cases": ["pod-image-notfound-001@1", "pod-crashloop-001@1"],
+                    "scorer_version": "5", "root_cause_vocabulary_version": "v2"},
+            "report": {"scorer_version": "5", "root_cause_accuracy": 1.0,
+                       "wrong_root_cause_rate": 0.0, "schema_valid_rate": 1.0,
+                       "evidence_recall_avg": None, "diagnosis_duration_ms": {"p50": None},
+                       "token_usage": {"p50": None}},
+            "by_case": {},
+        })
+        return run_dir
+
+    result = compare_runs(make_run("b-fx"), make_run("c-fx"))
+    assert result["comparable"] is True, result["incomparable_reason"]

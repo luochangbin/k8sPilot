@@ -41,7 +41,8 @@ class Runner:
     def run(self, suite_path: Path, case_ids: list[str], runs_per_case: int,
             profile: str, *, enable_knowledge: Optional[bool] = None,
             enable_incidents: Optional[bool] = None,
-            model_profile: Optional[str] = None) -> tuple[str, Path]:
+            model_profile: Optional[str] = None,
+            pace_seconds: float = 0.0) -> tuple[str, Path]:
         suite_raw = load_suite(suite_path)
         loaded = [resolve_and_load_case_entry(self._cases_dir(), cid) for cid in case_ids]
         cases = [case for case, _path in loaded]
@@ -75,8 +76,14 @@ class Runner:
         write_json(run_dir / "run.json", meta)
 
         rows: list[dict[str, Any]] = []
+        attempt_index = 0
         for case in cases:
             for attempt in range(runs_per_case):
+                # Pace the sweep: unpaced bursts trip provider rate limits, which
+                # would surface as system_failed and poison the batch.
+                if pace_seconds > 0 and attempt_index > 0:
+                    time.sleep(pace_seconds)
+                attempt_index += 1
                 row = self._run_case(case, run_id, attempt, enable_knowledge=enable_knowledge,
                                      enable_incidents=enable_incidents,
                                      model_profile=model_profile)

@@ -24,7 +24,10 @@ models:
     parameters:
       max_tokens: 2048
     timeout_seconds: 120
-    max_retries: 2
+    # Retry budget for transient provider failures (429/5xx/timeouts). Retries
+    # use exponential backoff with jitter; a 400/401 fails immediately.
+    max_retries: 4
+    backoff_seconds: 2
 
   candidate-a:
     provider: commandcode

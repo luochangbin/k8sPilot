@@ -10,6 +10,8 @@ the ``default`` profile, preserving prior behavior.
 from __future__ import annotations
 
 import hashlib
+import random
+import time
 import json
 import os
 from dataclasses import dataclass
@@ -23,6 +25,32 @@ SUPPORTED_PROTOCOLS = (PROTOCOL_OPENAI,)
 # Explicitly allowed request parameters. Anything else is rejected rather than
 # silently ignored (handoff §4).
 ALLOWED_PARAMETERS = ("max_tokens", "temperature")
+
+
+# Transient provider failures worth retrying with backoff. Everything else
+# (invalid request, auth, unknown model) fails fast: retrying a 400 just burns
+# time and hides the real error.
+RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+
+def _status_of(exc: Exception) -> Optional[int]:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def is_retryable(exc: Exception) -> bool:
+    """Retry transient failures; never retry a known non-retryable status.
+
+    Unknown exceptions keep the historical behaviour (retry) because a transport
+    failure usually arrives without a status code; a 400/401/403/404/422 is
+    deterministic and must fail fast instead of burning the retry budget.
+    """
+    status = _status_of(exc)
+    if status is None:
+        return True
+    return status in RETRYABLE_STATUS
 
 
 class ProfileError(Exception):
@@ -69,6 +97,8 @@ class ResolvedModel:
     timeout_seconds: float
     max_retries: int
     headers: dict[str, str]
+    # Base delay for the exponential backoff between retryable attempts.
+    backoff_seconds: float = 1.0
 
     def public_metadata(self) -> dict[str, Any]:
         """Reproducibility metadata. Never includes secrets or header values."""
@@ -80,6 +110,7 @@ class ResolvedModel:
             "effective_parameters": dict(self.parameters),
             "timeout_seconds": self.timeout_seconds,
             "max_retries": self.max_retries,
+            "backoff_seconds": self.backoff_seconds,
         }
 
     def config_fingerprint(self) -> str:
@@ -171,6 +202,7 @@ def _resolve_from_file(raw: dict[str, Any], name: Optional[str]) -> ResolvedMode
         parameters=_validate_parameters(profile, model_cfg.get("parameters")),
         timeout_seconds=float(model_cfg.get("timeout_seconds", 120)),
         max_retries=int(model_cfg.get("max_retries", 2)),
+        backoff_seconds=float(model_cfg.get("backoff_seconds", 1.0)),
         headers={str(k): str(v) for k, v in headers.items()},
     )
 
@@ -210,6 +242,7 @@ class OpenAILLM:
             model=cfg.llm_model,
             timeout=cfg.llm_timeout,
             max_retries=cfg.llm_max_retries,
+            backoff_seconds=float(getattr(cfg, "llm_backoff_seconds", 1.0)),
             max_tokens=cfg.llm_max_tokens,
             temperature=None,
             default_headers=None,
@@ -224,6 +257,7 @@ class OpenAILLM:
             model=resolved.remote_model_id,
             timeout=resolved.timeout_seconds,
             max_retries=resolved.max_retries,
+            backoff_seconds=resolved.backoff_seconds,
             max_tokens=int(resolved.parameters.get("max_tokens", 2048)),
             temperature=resolved.parameters.get("temperature"),
             default_headers=resolved.headers or None,
@@ -232,7 +266,8 @@ class OpenAILLM:
 
     def _init(self, *, base_url: str, api_key: str, model: str, timeout: float,
               max_retries: int, max_tokens: int, temperature: Optional[float],
-              default_headers: Optional[dict[str, str]]) -> None:
+              default_headers: Optional[dict[str, str]],
+              backoff_seconds: float = 1.0) -> None:
         from openai import OpenAI
 
         self._client = OpenAI(base_url=base_url, api_key=api_key or "sk-not-needed",
@@ -243,6 +278,10 @@ class OpenAILLM:
         self._max_tokens = max_tokens
         self._temperature = temperature
         self._last_attempt_count = 1
+        self._backoff = max(0.0, float(backoff_seconds))
+        # Cap a single backoff step so a long outage cannot stall a diagnosis
+        # beyond the profile timeout budget.
+        self._max_backoff = 10.0
 
     @property
     def model_id(self) -> str:
@@ -279,8 +318,15 @@ class OpenAILLM:
                 return response
             except Exception as exc:  # noqa: BLE001 - surface any provider failure
                 last_exc = exc
-                if attempt == self._max_retries:
+                if attempt == self._max_retries or not is_retryable(exc):
                     break
+                # Transient upstream failures ("temporarily unavailable", 429,
+                # 5xx, timeouts) need real spacing: instant retries all land
+                # inside the same outage window.
+                if self._backoff > 0:
+                    delay = min(self._backoff * (2 ** attempt), self._max_backoff)
+                    delay += random.uniform(0, delay * 0.25)
+                    time.sleep(delay)
         self._last_attempt_count = attempts
         raise LLMError(f"LLM request failed after {attempts} attempts: {last_exc}",
                        attempts=attempts)

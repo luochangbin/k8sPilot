@@ -259,3 +259,63 @@ def test_failed_attempt_config_drift_is_detected():
     rep = _build(rows, ["m1", "m2"])
     assert rep["comparable"] is False
     assert "m1:config_fingerprint_varies" in rep["incomparable_reason"]
+
+
+class _RecordingTime:
+    """Delegates to the real time module but records sleeps."""
+
+    def __init__(self, real):
+        self._real = real
+        self.sleeps = []
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+
+    def __getattr__(self, item):
+        return getattr(self._real, item)
+
+
+def test_benchmark_paces_between_attempts(monkeypatch, tmp_path):
+    import time as real_time
+
+    import eval.benchmark as benchmark_module
+
+    clock = _RecordingTime(real_time)
+    monkeypatch.setattr(benchmark_module, "time", clock)
+
+    runner = FakeRunner()
+    _run(tmp_path, runner=runner, pace_seconds=30)
+    # 8 attempts -> one sleep between each consecutive pair, never before the first.
+    assert clock.sleeps == [30] * (len(runner.calls) - 1)
+
+
+def test_single_profile_run_paces_between_attempts(monkeypatch, tmp_path):
+    import time as real_time
+
+    import eval.runner as runner_module
+    from eval.cases import load_case_entry, load_suite, resolve_case_entry
+
+    clock = _RecordingTime(real_time)
+    monkeypatch.setattr(runner_module, "time", clock)
+    # The test's subject is pacing, not report rendering.
+    monkeypatch.setattr(runner_module, "build_report", lambda rows: {"scorer_version": "5"})
+    monkeypatch.setattr(runner_module, "report_by_case", lambda rows: {})
+    monkeypatch.setattr(runner_module, "render_markdown", lambda *a, **k: "# test")
+
+    root = Path(__file__).resolve().parents[1]
+    suite_path = root / "suites" / "cause-level-v1.yaml"
+    suite = load_suite(suite_path)
+    case_ids = suite["cases"][:2]
+    runner = runner_module.Runner(agent_url="http://x", trace_dir=None, kubeconfig=None,
+                                 reports_dir=str(tmp_path))
+    runner._load_case = lambda cid: load_case_entry(root / "cases", cid)
+    runner._run_case = lambda case, run_id, attempt, **kw: {
+        "case_id": case.id, "case_version": case.case_version, "verdict": "diagnosis_correct",
+        "fixture_ready": True, "abstention_expected": False, "duration_ms": 1.0,
+        "tool_calls": 1, "llm_calls": 1, "token_usage": 10,
+        "effective_max_tool_calls": 12, "effective_max_agent_rounds": 12,
+        "max_finalization_attempts": 1,
+    }
+    runner.run(suite_path, case_ids, 2, "paced", pace_seconds=15)
+    # 2 cases x 2 runs = 4 attempts -> 3 sleeps.
+    assert clock.sleeps == [15, 15, 15]

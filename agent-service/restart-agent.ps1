@@ -19,6 +19,16 @@
 # handles, which can keep the caller's pipeline open and make the invocation
 # look like it hung. If you need a log, redirect the whole invocation to a file:
 #   pwsh -File restart-agent.ps1 *> restart.log
+#
+# From automation (CI, an agent harness, any caller that reads this command's
+# stdout/stderr through a pipe): the started Agent process keeps those pipe
+# handles open, so the caller waits for EOF until its own timeout even though
+# this script finished in ~3s. Launch it detached and verify by polling instead:
+#   Start-Process pwsh -ArgumentList '-NoProfile','-File','<abs path>\restart-agent.ps1' -WindowStyle Hidden
+#   Get-Content <abs path>\agent-service\.agent.pid     # pid changed => restarted
+#   Invoke-RestMethod http://localhost:8000/healthz     # status = ok
+# The same rule applies to any long-running process started from a piped shell:
+# redirect to a file and poll a artifact, never wait on the pipe.
 
 param(
     [int]$Port = 8000,
