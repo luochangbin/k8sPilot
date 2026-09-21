@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -78,6 +79,19 @@ func (t *Tools) QueryLogs(ctx context.Context, target Target, params LokiLogsPar
 	resp.WindowStart = window.Start.Format(time.RFC3339)
 	resp.WindowEnd = window.End.Format(time.RFC3339)
 	resp.WindowAnchor = window.Anchor
+
+	// The data sources have no UID label: confirm the target itself has not
+	// been recreated before querying, so we never attach new-object data to an
+	// old diagnosis.
+	if err := t.VerifyTargetUID(ctx, target); err != nil {
+		var recreated ErrTargetRecreated
+		if errors.As(err, &recreated) {
+			resp.DegradedReason = err.Error()
+			return resp, nil
+		}
+		resp.DegradedReason = fmt.Sprintf("cannot verify target uid: %v", err)
+		return resp, nil
+	}
 
 	query := fmt.Sprintf(`{namespace=%q, pod=%q}`, target.Namespace, target.Name)
 	if f := strings.TrimSpace(params.Filter); f != "" {

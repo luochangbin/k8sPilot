@@ -69,6 +69,10 @@ func (t *Tools) Events(ctx context.Context, target Target, params EventsParams) 
 		if last.IsZero() || last.Before(since) {
 			continue
 		}
+		// A recreated object under the same name must not contribute events.
+		if target.UID != "" && string(ev.InvolvedObject.UID) != target.UID {
+			continue
+		}
 		first := ev.FirstTimestamp.Time
 		resp.Events = append(resp.Events, Event{
 			Type:           ev.Type,

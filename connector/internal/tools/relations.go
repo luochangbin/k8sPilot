@@ -50,10 +50,6 @@ func (t *Tools) relationsPod(ctx context.Context, target Target, resp *Relations
 	if pod.Spec.NodeName != "" {
 		resp.Relations = append(resp.Relations, ResourceRef{Role: "scheduler", Kind: "Node", Name: pod.Spec.NodeName})
 	}
-	if pod.Spec.ServiceAccountName != "" {
-		resp.Relations = append(resp.Relations, ResourceRef{Role: "service_account", Kind: "ServiceAccount", Namespace: pod.Namespace, Name: pod.Spec.ServiceAccountName})
-	}
-
 	// PVCs referenced by the pod's volumes.
 	for _, v := range pod.Spec.Volumes {
 		if v.PersistentVolumeClaim != nil {
@@ -86,6 +82,10 @@ func (t *Tools) relationsPod(ctx context.Context, target Target, resp *Relations
 }
 
 func (t *Tools) relationsWorkload(ctx context.Context, target Target, resp *RelationsResponse) (*RelationsResponse, error) {
+	if target.Kind == "Deployment" {
+		return t.relationsDeployment(ctx, target, resp)
+	}
+	// StatefulSet/DaemonSet own their Pods directly; ReplicaSet owns its Pods too.
 	uid, err := t.workloadUID(ctx, target)
 	if err != nil {
 		return nil, err
@@ -96,16 +96,66 @@ func (t *Tools) relationsWorkload(ctx context.Context, target Target, resp *Rela
 	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		if hasOwnerUID(pod.OwnerReferences, uid) {
+			resp.Relations = append(resp.Relations, childRef("Pod", pod.Namespace, pod.Name))
+		}
+	}
+	return resp, nil
+}
+
+// relationsDeployment walks the real ownership chain
+// Deployment -> ReplicaSet -> Pod: Pods reference the ReplicaSet, never the
+// Deployment, so matching Pods against the Deployment UID (the previous
+// behaviour) returned nothing.
+func (t *Tools) relationsDeployment(ctx context.Context, target Target, resp *RelationsResponse) (*RelationsResponse, error) {
+	d, err := t.Kube.AppsV1().Deployments(target.Namespace).Get(ctx, target.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	rsList, err := t.Kube.AppsV1().ReplicaSets(target.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	rsUIDs := map[types.UID]bool{}
+	for i := range rsList.Items {
+		rs := &rsList.Items[i]
+		if !hasOwnerUID(rs.OwnerReferences, d.UID) {
+			continue
+		}
+		rsUIDs[rs.UID] = true
+		resp.Relations = append(resp.Relations, childRef("ReplicaSet", rs.Namespace, rs.Name))
+	}
+	if len(rsUIDs) == 0 {
+		return resp, nil
+	}
+	pods, err := t.Kube.CoreV1().Pods(target.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
 		for _, or := range pod.OwnerReferences {
-			if string(or.UID) == string(uid) {
-				resp.Relations = append(resp.Relations, ResourceRef{
-					Role: "child", Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name, APIVersion: "v1",
-				})
+			if rsUIDs[or.UID] {
+				resp.Relations = append(resp.Relations, childRef("Pod", pod.Namespace, pod.Name))
 				break
 			}
 		}
 	}
 	return resp, nil
+}
+
+func hasOwnerUID(refs []metav1.OwnerReference, uid types.UID) bool {
+	for _, or := range refs {
+		if or.UID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+func childRef(kind, namespace, name string) ResourceRef {
+	return ResourceRef{Role: "child", Kind: kind, Namespace: namespace, Name: name,
+		APIVersion: APIVersionForKind(kind)}
 }
 
 func (t *Tools) workloadUID(ctx context.Context, target Target) (types.UID, error) {
@@ -205,3 +255,16 @@ var (
 	_ = (*appsv1.Deployment)(nil)
 	_ = (*corev1.Pod)(nil)
 )
+
+// APIVersionForKind returns the canonical API group/version for a kind we
+// expose, so callers never have to guess (a Deployment is apps/v1, not v1).
+func APIVersionForKind(kind string) string {
+	switch kind {
+	case "Deployment", "ReplicaSet", "StatefulSet", "DaemonSet":
+		return "apps/v1"
+	case "Job", "CronJob":
+		return "batch/v1"
+	default:
+		return "v1"
+	}
+}

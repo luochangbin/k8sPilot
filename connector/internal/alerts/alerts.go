@@ -50,9 +50,9 @@ type Inspector interface {
 
 // Forwarder resolves, snapshots and forwards alerts to the Agent Service.
 type Forwarder struct {
-	AgentURL  string
-	Client    *http.Client
-	Inspector Inspector
+	AgentURL   string
+	Client     *http.Client
+	Inspector  Inspector
 	EventLimit int
 }
 
@@ -148,7 +148,7 @@ func (f *Forwarder) Handle(ctx context.Context, wh Webhook) Summary {
 				target.UID = t.UID
 			}
 			payload["resource"] = map[string]any{
-				"apiVersion": "v1", "kind": target.Kind,
+				"apiVersion": tools.APIVersionForKind(target.Kind), "kind": target.Kind,
 				"namespace": target.Namespace, "name": target.Name, "uid": target.UID,
 			}
 			alert["snapshot"] = snapshot

@@ -458,3 +458,26 @@ func TestQueryLogsResponseSerializesSnakeCaseWindowSeconds(t *testing.T) {
 	}
 	assertSnakeCaseWindowSeconds(t, body)
 }
+
+func TestToolEndpointReportsUidMismatch(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns", UID: types.UID("uid-new")},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+	}
+	s := testServer(pod)
+	defer s.Close()
+
+	resp := do(t, s, "POST", "/tools/logs", map[string]any{
+		"target": map[string]any{"kind": "Pod", "namespace": "ns", "name": "p", "uid": "uid-old"},
+	})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 for a recreated target, got %d", resp.StatusCode)
+	}
+	var e toolError
+	if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Code != "uid_mismatch" {
+		t.Fatalf("expected code uid_mismatch, got %q", e.Code)
+	}
+}

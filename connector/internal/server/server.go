@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -61,8 +62,8 @@ func (s *Server) Run() error {
 type toolRequest struct {
 	Target tools.Target `json:"target"`
 
-	Limit      *int   `json:"limit,omitempty"`
-	SinceHours *int   `json:"since_hours,omitempty"`
+	Limit      *int `json:"limit,omitempty"`
+	SinceHours *int `json:"since_hours,omitempty"`
 
 	Container string `json:"container,omitempty"`
 	Previous  bool   `json:"previous,omitempty"`
@@ -270,7 +271,10 @@ func (s *Server) decode(w http.ResponseWriter, r *http.Request) (*toolRequest, b
 }
 
 func (s *Server) writeToolError(w http.ResponseWriter, err error) {
+	var recreated tools.ErrTargetRecreated
 	switch {
+	case errors.As(err, &recreated):
+		writeJSON(w, http.StatusConflict, toolError{Code: "uid_mismatch", Error: err.Error()})
 	case k8serrors.IsNotFound(err):
 		writeJSON(w, http.StatusNotFound, toolError{Code: "not_found", Error: err.Error()})
 	case k8serrors.IsForbidden(err):

@@ -47,6 +47,9 @@ func (t *Tools) Logs(ctx context.Context, target Target, params LogsParams) (*Lo
 	if err != nil {
 		return nil, err
 	}
+	if target.UID != "" && string(pod.UID) != target.UID {
+		return nil, ErrTargetRecreated{Kind: target.Kind, Namespace: target.Namespace, Name: target.Name}
+	}
 	container := params.Container
 	if container == "" && len(pod.Spec.Containers) > 0 {
 		container = pod.Spec.Containers[0].Name
