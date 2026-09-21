@@ -595,7 +595,7 @@ def test_case_suite_is_well_formed_and_cause_level():
 def test_cause_level_suite_declares_multi_kind_coverage():
     """Benchmark coverage must come from the *suite*, not from whatever files
     happen to sit in eval/cases/."""
-    from eval.cases import load_case, load_suite
+    from eval.cases import load_case, load_suite, resolve_case_entry
 
     suites_dir = Path(__file__).resolve().parents[1] / "suites"
     cases_dir = Path(__file__).resolve().parents[1] / "cases"
@@ -608,16 +608,24 @@ def test_cause_level_suite_declares_multi_kind_coverage():
 
     kinds = set()
     for case_id in declared:
-        found = load_case(cases_dir / f"{case_id}.yaml")
-        assert found.id == case_id
+        found = load_case(resolve_case_entry(cases_dir, case_id))
+        assert found.id == case_id.split("@")[0]
         kinds.add(found.target.kind)
     assert {"Pod", "Deployment", "Node", "PersistentVolumeClaim"} <= kinds
 
     # The frozen baseline suite stays untouched and remains a Pod-only baseline.
     phase1 = load_suite(suites_dir / "phase1.yaml")
-    phase1_kinds = {load_case(cases_dir / f"{cid}.yaml").target.kind
-                    for cid in phase1["cases"]}
-    assert phase1_kinds == {"Pod"}
+    phase1_cases = [load_case(resolve_case_entry(cases_dir, cid)) for cid in phase1["cases"]]
+    assert {c.target.kind for c in phase1_cases} == {"Pod"}
+    # The frozen baseline pins the historical definitions...
+    assert all(cid.endswith("@1") for cid in phase1["cases"])
+    # ...and the pinned ground truth is the old failure-mode vocabulary, not the
+    # current cause-level one, so re-running phase1 reproduces the old numbers.
+    crashloop = next(c for c in phase1_cases if c.id == "pod-crashloop-001")
+    assert crashloop.case_version == "1"
+    assert crashloop.ground_truth.accepted_root_cause_codes == ["CRASH_LOOP_BACKOFF"]
+    current = load_case(cases_dir / "pod-crashloop-001.yaml")
+    assert current.ground_truth.accepted_root_cause_codes == ["APPLICATION_EXIT_NONZERO"]
 
 
 def test_registry_preflight_fails_closed(monkeypatch):
@@ -843,3 +851,42 @@ def test_composite_ready_needs_both_event_and_status(monkeypatch):
 
     statuses["reason"] = "ImagePullBackOff"
     assert injector_instance.wait_ready(case) is True
+
+
+def test_compare_refuses_case_set_and_vocabulary_drift(tmp_path):
+    """A re-pointed suite or a changed vocabulary is not a comparable delta."""
+    from eval.compare import compare_runs
+    from eval.reporter import write_json, write_jsonl
+
+    def make_run(name, cases, vocab, scorer="5"):
+        run_dir = tmp_path / name
+        run_dir.mkdir()
+        row = {"case_id": cases[0].split("@")[0], "case_version": cases[0].split("@")[1],
+               "verdict": "diagnosis_correct", "fixture_ready": True,
+               "abstention_expected": False, "root_cause_correct": True}
+        write_jsonl(run_dir / "case-results.jsonl", [row])
+        write_json(run_dir / "report.json", {
+            "run": {"run_id": name, "cases": cases, "scorer_version": scorer,
+                    "root_cause_vocabulary_version": vocab},
+            "report": {"scorer_version": scorer, "root_cause_accuracy": 1.0,
+                       "wrong_root_cause_rate": 0.0, "schema_valid_rate": 1.0,
+                       "evidence_recall_avg": None, "diagnosis_duration_ms": {"p50": None},
+                       "token_usage": {"p50": None}},
+            "by_case": {},
+        })
+        return run_dir
+
+    same = compare_runs(make_run("b1", ["pod-crashloop-001@1"], "v2"),
+                        make_run("c1", ["pod-crashloop-001@1"], "v2"))
+    assert same["comparable"] is True
+
+    drift = compare_runs(make_run("b2", ["pod-crashloop-001@1"], "v2"),
+                         make_run("c2", ["pod-crashloop-001@2"], "v2"))
+    assert drift["comparable"] is False
+    assert "case_set mismatch" in drift["incomparable_reason"]
+    assert all(metric["delta"] is None for metric in drift["aggregate"].values())
+
+    vocab = compare_runs(make_run("b3", ["pod-crashloop-001@1"], "v1"),
+                         make_run("c3", ["pod-crashloop-001@1"], "v2"))
+    assert vocab["comparable"] is False
+    assert "root_cause_vocabulary mismatch" in vocab["incomparable_reason"]

@@ -123,6 +123,13 @@ def verify_evidence(evidence: dict[str, Any],
     else:
         relevant = [r for r in tool_results
                     if r.get("kind") == "realtime" and r.get("tool") == tool]
+        # Single candidate is unambiguous; several candidates require the claim to
+        # say where it came from (tool_call_id or resource_uid), otherwise the
+        # right value could be found in the wrong resource's result.
+        if len(relevant) > 1 and not evidence.get("resource_uid"):
+            return {"status": UNVERIFIABLE,
+                    "reason": (f"ambiguous provenance: {len(relevant)} {tool} results in "
+                               "this run; declare tool_call_id or resource_uid")}
     # Resource attribution is an AND, not an OR: a pinned tool call must still
     # point at the resource the claim names (tool_call_id + source + resource +
     # fact), so a claim cannot merge one call's provenance with another
@@ -187,6 +194,12 @@ def validate_submission(result: dict[str, Any], tool_results: list[dict[str, Any
     insufficient = bool(result.get("insufficient_evidence"))
 
     problems: list[str] = []
+    if not explicit and not insufficient:
+        # Third "shape" is illegal: a submission must either state a root cause
+        # or formally abstain. "Neither answered nor abstained" is not a result.
+        problems.append(
+            "最终结果必须明确给出根因（root_cause_code/root_cause），"
+            "或设置 insufficient_evidence=true 正式弃权；两者皆无的提交不被接受")
     if insufficient and explicit:
         problems.append(
             "insufficient_evidence=true 时不得给出 root_cause / root_cause_code")

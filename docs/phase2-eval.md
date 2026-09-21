@@ -8,7 +8,7 @@ Phase 2 不扩展生产诊断能力，而是把 Phase 1 的 Kubernetes-only Agen
 |---|---|
 | `agent-service` | 契约对齐（移除 `cluster_id`）+ 可评分字段（`root_cause_code`、结构化证据）+ 轻量 JSONL Trace |
 | `eval/` | Eval Harness：Case Loader、Fault Injector、Runner、Scorer、Reporter、Compare CLI |
-| `eval/cases/` | 12 个首批 Case（OOM、ImagePull、调度失败、CrashLoop、配置错误、FailedMount、健康、证据不足拒答） |
+| `eval/cases/` | 首批 Case（OOM、ImagePull、调度失败、CrashLoop、配置错误、FailedMount、健康、证据不足拒答）；`eval/cases/versions/` 存放**按版本存档**的历史定义 |
 | `eval/suites/phase1.yaml` | Kubernetes-only Benchmark 套件 |
 
 ## 运行前准备
@@ -20,17 +20,27 @@ Phase 2 不扩展生产诊断能力，而是把 Phase 1 的 Kubernetes-only Agen
    ```
 3. 保持 Agent Service 运行（默认 `http://localhost:8000`）。
 
-## 冻结基线
+## 冻结基线（`phase1`）
+
+> `phase1.yaml` 的条目现在写成 `case-id@case_version`，解析到 `eval/cases/versions/<id>.v<version>.yaml`
+> 的**存档定义**，因此重跑 `--suite phase1` 复现的是当年那份 Ground Truth（例如
+> `pod-crashloop-001@1` 仍然是 `CRASH_LOOP_BACKOFF`，而当前工作区里的
+> `pod-crashloop-001.yaml` 已升为 `@2` / `APPLICATION_EXIT_NONZERO`）。
+>
+> 注意两点限制：
+> 1. 历史 **报告** 是用当时的 `scorer_version`（v3）与 prompt/tool hash 产生的；`eval compare`
+>    会因 scorer 版本不同直接判 `comparable=false`（现在还有 case 集合与根因词表版本校验）。
+>    要对比旧结果，需用当前 scorer 从原始 `case-results.jsonl` 重新打分。
+> 2. 当前的原因级评测请用 `--suite cause-level`（15 个用例，覆盖 Pod/Deployment/Node/PVC），
+>    它与 `phase1` 不可直接比较。
 
 ```powershell
 cd D:\AI\k8sPilot
 python -m eval run --suite phase1 --runs 5 --profile baseline --trace-dir D:\AI\k8sPilot\eval-reports\trace
 ```
 
-输出到 `reports/baseline-<ts>/`：
-- `run.json` — 运行元数据（model、prompt_hash、tool_schema_hash、k8s 版本、suite、case 版本）
-- `case-results.jsonl` — 逐次不可变结果（可离线复算报告）
-- `report.json` + `report.md` — 汇总（按故障类型分组，含 Fixture/System/Incorrect 分层）
+结果落在 `reports/baseline-<ts>/`（`run.json` 里记录 `cases: [id@version]`、
+`scorer_version` 与 `root_cause_vocabulary_version`）。
 
 ## 候选版本对照
 

@@ -1,15 +1,18 @@
 id: phase1
-description: Phase 1 Kubernetes-only benchmark (frozen Kubernetes-only baseline for Phase 2)
+description: Frozen Phase 1 Kubernetes-only baseline. Entries are pinned to
+  `case-id@case_version` and resolve to eval/cases/versions/<id>.v<version>.yaml,
+  so re-running this suite reproduces the ground truth those reports were
+  measured with (compare still refuses cross-scorer-version deltas).
 cases:
-  - pod-oomkilled-001
-  - pod-oomkilled-recovered-001
-  - pod-imagepullbackoff-001
-  - pod-imagepullauth-001
-  - pod-failedscheduling-node-001
-  - pod-failedscheduling-resource-001
-  - pod-crashloop-001
-  - pod-configerror-env-001
-  - pod-configerror-mount-001
-  - pod-failedmount-pvc-001
-  - pod-healthy-001
-  - pod-abstain-restart-001
+  - pod-oomkilled-001@1
+  - pod-oomkilled-recovered-001@1
+  - pod-imagepullbackoff-001@1
+  - pod-imagepullauth-001@1
+  - pod-failedscheduling-node-001@1
+  - pod-failedscheduling-resource-001@1
+  - pod-crashloop-001@1
+  - pod-configerror-env-001@1
+  - pod-configerror-mount-001@1
+  - pod-failedmount-pvc-001@1
+  - pod-healthy-001@1
+  - pod-abstain-restart-001@1

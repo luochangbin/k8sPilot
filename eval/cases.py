@@ -87,6 +87,24 @@ class Case:
         return f"{self.id}@{self.case_version}"
 
 
+def resolve_case_entry(cases_dir: Path, entry: str) -> Path:
+    """Resolve a suite entry to a case file.
+
+    `case-id` resolves to the current definition (`<cases_dir>/<id>.yaml`);
+    `case-id@version` resolves to a pinned historical definition under
+    `<cases_dir>/versions/<id>.v<version>.yaml`, so a "frozen baseline" suite
+    keeps pointing at the ground truth it was measured with.
+    """
+    entry = str(entry).strip()
+    if "@" in entry:
+        case_id, _, version = entry.partition("@")
+        pinned = cases_dir / "versions" / f"{case_id}.v{version}.yaml"
+        if not pinned.is_file():
+            raise CaseError(f"pinned case not found for suite entry {entry!r}: {pinned}")
+        return pinned
+    return cases_dir / f"{entry}.yaml"
+
+
 def load_case(path: Path) -> Case:
     """Parse and validate a single case YAML file."""
     if not path.is_file():
@@ -125,10 +143,16 @@ def load_case(path: Path) -> Case:
 
     setup = raw.get("setup") or {}
     base_dir = path.parent
-    manifests = [base_dir / m for m in (setup.get("manifests") or [])]
-    for m in manifests:
-        if not m.is_file():
-            raise CaseError(f"case {path}: setup manifest not found: {m}")
+    manifests: list[Path] = []
+    for rel in (setup.get("manifests") or []):
+        # Pinned cases live in a subdirectory but keep referencing the shared
+        # manifests/ folder next to the current cases.
+        candidate = base_dir / rel
+        if not candidate.is_file() and (base_dir.parent / rel).is_file():
+            candidate = base_dir.parent / rel
+        if not candidate.is_file():
+            raise CaseError(f"case {path}: setup manifest not found: {candidate}")
+        manifests.append(candidate)
 
     rw = raw.get("ready_when") or {}
     ready = ReadyWhen(

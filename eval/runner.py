@@ -13,10 +13,10 @@ from typing import Any, Optional
 
 import httpx
 
-from .cases import Case, CaseError, load_case, load_suite
+from .cases import Case, CaseError, load_case, load_suite, resolve_case_entry
 from .injector import Injector, InjectorError
 from .reporter import build_report, render_markdown, report_by_case, write_json, write_jsonl
-from .scorer import score_case, summarize_trace
+from .scorer import ROOT_CAUSE_VOCABULARY_VERSION, score_case, summarize_trace
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,6 +61,7 @@ class Runner:
             "enable_incidents": enable_incidents,
             "model_profile": model_profile,
             "cases": [c.key() for c in cases],
+            "root_cause_vocabulary_version": ROOT_CAUSE_VOCABULARY_VERSION,
         }
         write_json(run_dir / "run.json", meta)
 
@@ -93,8 +94,8 @@ class Runner:
                               model_profile=model_profile)
 
     def _load_case(self, case_id: str) -> Case:
-        path = self._cases_dir() / f"{case_id}.yaml"
-        return load_case(path)
+        # `case-id` or `case-id@version` (pinned historical definition).
+        return load_case(resolve_case_entry(self._cases_dir(), case_id))
 
     def _cases_dir(self) -> Path:
         return Path(__file__).resolve().parent / "cases"

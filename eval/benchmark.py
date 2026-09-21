@@ -16,10 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .cases import Case, load_case, load_suite
+from .cases import resolve_case_entry, Case, load_case, load_suite
 from .reporter import build_report, write_json, write_jsonl, _pct
 from .runner import REPO_ROOT, Runner, file_hash
-from .scorer import SCORER_VERSION
+from .scorer import ROOT_CAUSE_VOCABULARY_VERSION, SCORER_VERSION
 
 
 def _now_iso() -> str:
@@ -120,7 +120,8 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
                   enable_knowledge: Optional[bool] = None,
                   enable_incidents: Optional[bool] = None) -> tuple[str, Path]:
     suite_raw = load_suite(suite_path)
-    cases = [load_case(Path(__file__).resolve().parent / "cases" / f"{cid}.yaml") for cid in case_ids]
+    cases_dir = Path(__file__).resolve().parent / "cases"
+    cases = [load_case(resolve_case_entry(cases_dir, cid)) for cid in case_ids]
 
     benchmark_id = f"benchmark-{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
     run_dir = Path(reports_dir) / benchmark_id
@@ -133,7 +134,9 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
 
     runner = runner or Runner(agent_url=agent_url, trace_dir=trace_dir,
                               kubeconfig=kubeconfig, reports_dir=reports_dir, model=model_label)
-    cases_by_id = {c.id: c for c in cases}
+    # Keyed by id@version: a suite may legitimately mix pinned and current
+    # definitions of the same case id.
+    cases_by_id = {c.key(): c for c in cases}
 
     meta = {
         "benchmark_id": benchmark_id,
@@ -146,6 +149,7 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
         "tool_schema_hash": file_hash(REPO_ROOT / "agent-service/app/tools.py"),
         "k8s_version": runner._k8s_version(),  # reuse existing probe
         "scorer_version": SCORER_VERSION,
+        "root_cause_vocabulary_version": ROOT_CAUSE_VOCABULARY_VERSION,
         "planned_total": planned_total,
         "effective_total": len(plan),
         "max_diagnoses": max_diagnoses,
@@ -172,7 +176,7 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
         if time_limit_seconds is not None and (time.monotonic() - started) >= time_limit_seconds:
             stop_reason = "time_limit_reached"
             break
-        case = cases_by_id[attempt["case_id"]]
+        case = cases_by_id[f"{attempt['case_id']}@{attempt['case_version']}"]
         t0 = _now_iso()
         row = runner.run_case_attempt(
             case, benchmark_id, attempt["execution_order"],

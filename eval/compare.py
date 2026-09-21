@@ -82,8 +82,25 @@ def compare_runs(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
 
     b_ver = b_rep.get("scorer_version")
     c_ver = c_rep.get("scorer_version")
-    comparable = b_ver == c_ver
-    reason = None if comparable else f"scorer_version mismatch: baseline={b_ver} candidate={c_ver}"
+    b_set = _case_set(b["run"], _flat_rows(b_rows))
+    c_set = _case_set(c["run"], _flat_rows(c_rows))
+    b_vocab = b["run"].get("root_cause_vocabulary_version")
+    c_vocab = c["run"].get("root_cause_vocabulary_version")
+
+    reasons: list[str] = []
+    if b_ver != c_ver:
+        reasons.append(f"scorer_version mismatch: baseline={b_ver} candidate={c_ver}")
+    # Same scorer is not enough: a suite re-pointed at new case definitions (or a
+    # changed root-cause vocabulary) measures something different.
+    if b_set != c_set:
+        reasons.append(
+            "case_set mismatch: only differing ids are listed "
+            f"baseline_only={sorted(b_set - c_set)} candidate_only={sorted(c_set - b_set)}")
+    if b_vocab and c_vocab and b_vocab != c_vocab:
+        reasons.append(
+            f"root_cause_vocabulary mismatch: baseline={b_vocab} candidate={c_vocab}")
+    comparable = not reasons
+    reason = None if comparable else "; ".join(reasons)
     if not comparable:
         # Results scored under different semantics must not be diffed silently.
         for metric in agg.values():
@@ -92,6 +109,19 @@ def compare_runs(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
     return {"aggregate": agg, "per_case": per_case, "gates": gates,
             "comparable": comparable, "incomparable_reason": reason,
             "baseline_run": b["run"].get("run_id"), "candidate_run": c["run"].get("run_id")}
+
+
+def _flat_rows(rows_by_case: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [row for rows in rows_by_case.values() for row in rows]
+
+
+def _case_set(run_meta: dict[str, Any], rows: list[dict[str, Any]]) -> set[str]:
+    """The measured case set as `id@version` (declared by run.json, or derived
+    from the scored rows for runs written before that field existed)."""
+    declared = run_meta.get("cases")
+    if declared:
+        return {str(item) for item in declared}
+    return {f"{r.get('case_id')}@{r.get('case_version')}" for r in rows}
 
 
 def _count_verdicts(rows: list[dict[str, Any]]) -> dict[str, int]:

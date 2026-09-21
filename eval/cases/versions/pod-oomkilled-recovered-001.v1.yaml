@@ -1,0 +1,32 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pod-oomkilled-recovered-001
+case_version: "1"
+description: Container was OOMKilled once, then restarted and is now running; last termination still shows OOMKilled
+target:
+  apiVersion: v1
+  kind: Pod
+  namespace: eval-pod-oomkilled-recovered-001
+  name: oom-recovered-demo
+setup:
+  manifests:
+    - manifests/pod-oomkilled-recovered-001.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_gte
+  path: status.containerStatuses[0].restartCount
+  value: "1"
+  timeout_seconds: 120
+ground_truth:
+  accepted_root_cause_codes: [CONTAINER_OOMKILLED]
+  required_evidence:
+    - source: kubernetes.status
+      path: actual_state.container_states[0].last_termination.reason
+      operator: equals
+      value: OOMKilled
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

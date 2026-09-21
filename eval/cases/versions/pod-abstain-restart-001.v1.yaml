@@ -1,0 +1,27 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pod-abstain-restart-001
+case_version: "1"
+description: Pod restarted once with no diagnosable signal; agent must abstain (insufficient evidence)
+target:
+  apiVersion: v1
+  kind: Pod
+  namespace: eval-pod-abstain-restart-001
+  name: abstain-restart-demo
+setup:
+  manifests:
+    - manifests/pod-abstain-restart-001.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_gte
+  path: status.containerStatuses[0].restartCount
+  value: "1"
+  timeout_seconds: 120
+ground_truth:
+  accepted_root_cause_codes: []
+  abstention_expected: true
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

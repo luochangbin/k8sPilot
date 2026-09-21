@@ -1,0 +1,33 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pod-configerror-env-001
+case_version: "1"
+suite: phase1
+description: Container envFrom references a missing ConfigMap, kubelet cannot start the container
+target:
+  apiVersion: v1
+  kind: Pod
+  namespace: eval-pod-configerror-env-001
+  name: configerror-env-demo
+setup:
+  manifests:
+    - manifests/pod-configerror-env-001.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_equals
+  path: status.containerStatuses[0].state.waiting.reason
+  value: CreateContainerConfigError
+  timeout_seconds: 120
+ground_truth:
+  accepted_root_cause_codes: [CONFIG_ERROR]
+  required_evidence:
+    - source: kubernetes.status
+      path: actual_state.container_states[0].reason
+      operator: equals
+      value: CreateContainerConfigError
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

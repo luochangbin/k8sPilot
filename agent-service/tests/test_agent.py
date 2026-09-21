@@ -239,6 +239,8 @@ def test_insufficient_evidence_is_completed_not_failed():
         ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}),
         ScriptedLLM.tool_response("submit_result", {
             "symptom": "Pod Pending",
+            "root_cause_code": "",
+            "insufficient_evidence": True,
             "evidence": [{"source": "kubernetes.status", "summary": "pod is Pending"}],
             "root_cause": "",
             "confidence": "low",
@@ -411,7 +413,7 @@ def test_eval_budget_can_only_shrink_the_service_budget():
         # The model would happily keep investigating, but the Case budget is 2:
         # the third call must be the terminal-only finalization.
         ScriptedLLM.tool_response("submit_result", {
-            "symptom": "s", "evidence": [_verified_evidence("x")],
+            "symptom": "s", "evidence": [_verified_evidence("x", resource_uid="uid-1")],
             "root_cause": "r", "root_cause_code": "CRASH_LOOP_BACKOFF",
             "confidence": "high", "recommendations": [],
         }),
@@ -1320,7 +1322,13 @@ def test_tools_outside_the_diagnosis_scope_are_blocked():
                                               "name": "coredns-abc"}),
         ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
                                               "name": "payment-api-7b8c9"}),
-        _submit_ok(),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "s", "root_cause_code": "CONTAINER_OOMKILLED",
+            "root_cause": "rc", "insufficient_evidence": False, "confidence": "high",
+            "recommendations": [],
+            # Two inspects of the target: name the resource to stay unambiguous.
+            "evidence": [_verified_evidence("x", resource_uid="uid-1")],
+        }),
     ])
     d = run(make_agent(llm, connector))
 
@@ -1855,3 +1863,57 @@ def test_final_gate_requires_every_published_evidence_to_verify():
     # The rejected attempt never reached the result; the corrected one did.
     assert len(d.result.evidence) == 1
     assert d.result.evidence[0].summary == "OOMKilled"
+
+
+def test_submission_that_neither_concludes_nor_abstains_is_rejected():
+    """The only legal terminal shapes are "explicit conclusion" and "formal
+    abstention"; a symptom-only payload is refused."""
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("submit_result", {
+            "symptom": "Pod abnormal",
+            "root_cause_code": "",
+            "root_cause": "",
+            "insufficient_evidence": False,
+            "evidence": [],
+            "confidence": "low",
+            "recommendations": [],
+        }),
+        _submit_ok(),
+    ])
+    d = run(make_agent(llm))
+
+    assert d.status == "completed"
+    # The neither/nor attempt was refused; the corrected submission was stored.
+    assert d.result.root_cause_code == "CONTAINER_OOMKILLED"
+    assert d.result.evidence[0].summary == "OOMKilled"
+
+
+def test_ambiguous_provenance_requires_a_pin():
+    from app.validation import UNVERIFIABLE, VERIFIED, validate_submission
+
+    results = [
+        {"tool": "inspect", "tool_call_id": "call_a", "kind": "realtime",
+         "args": {"kind": "Pod", "namespace": "payment", "name": "pod-a", "uid": "uid-a"},
+         "output": json.dumps({"actual_state": {"phase": "Pending"}})},
+        {"tool": "inspect", "tool_call_id": "call_b", "kind": "realtime",
+         "args": {"kind": "Pod", "namespace": "payment", "name": "pod-b", "uid": "uid-b"},
+         "output": json.dumps({"actual_state": {"phase": "Running"}})},
+    ]
+    submission = {
+        "root_cause_code": "SCHEDULING_FAILED", "root_cause": "rc",
+        "insufficient_evidence": False,
+        "evidence": [{"source": "kubernetes.status", "path": "actual_state.phase",
+                      "operator": "equals", "value": "Pending", "summary": "pending"}],
+    }
+
+    # Two candidates, no provenance: fail closed instead of guessing.
+    ok, _, report = validate_submission(submission, results)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+
+    # Pinned to the right call: verified.
+    pinned = {**submission,
+              "evidence": [{**submission["evidence"][0], "tool_call_id": "call_a"}]}
+    ok, _, report = validate_submission(pinned, results)
+    assert ok and report[0]["status"] == VERIFIED

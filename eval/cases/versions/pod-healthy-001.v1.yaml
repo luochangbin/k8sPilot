@@ -1,0 +1,32 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pod-healthy-001
+case_version: "1"
+description: Pod is running and healthy; agent must report HEALTHY, not invent a fault
+target:
+  apiVersion: v1
+  kind: Pod
+  namespace: eval-pod-healthy-001
+  name: healthy-demo
+setup:
+  manifests:
+    - manifests/pod-healthy-001.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_equals
+  path: status.phase
+  value: Running
+  timeout_seconds: 90
+ground_truth:
+  accepted_root_cause_codes: [HEALTHY]
+  required_evidence:
+    - source: kubernetes.status
+      path: actual_state.phase
+      operator: equals
+      value: Running
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

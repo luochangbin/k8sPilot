@@ -1,0 +1,33 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: pod-imagepullauth-001
+case_version: "1"
+suite: phase1
+description: Private registry image pulled without credentials fails authentication
+target:
+  apiVersion: v1
+  kind: Pod
+  namespace: eval-pod-imagepullauth-001
+  name: imagepullauth-demo
+setup:
+  manifests:
+    - manifests/pod-imagepullauth-001.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_equals
+  path: status.containerStatuses[0].state.waiting.reason
+  value: ImagePullBackOff
+  timeout_seconds: 120
+ground_truth:
+  accepted_root_cause_codes: [IMAGE_PULL_FAILED]
+  required_evidence:
+    - source: kubernetes.status
+      path: actual_state.container_states[0].reason
+      operator: equals
+      value: ImagePullBackOff
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

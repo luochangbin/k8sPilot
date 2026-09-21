@@ -29,7 +29,10 @@ SCORER_VERSION = "5"
 _AGENT_SERVICE = Path(__file__).resolve().parents[1] / "agent-service"
 if str(_AGENT_SERVICE) not in sys.path:
     sys.path.insert(0, str(_AGENT_SERVICE))
-from app.root_causes import ROOT_CAUSE_CODES  # noqa: E402
+from app.root_causes import (  # noqa: E402
+    ROOT_CAUSE_CODE_VERSION as ROOT_CAUSE_VOCABULARY_VERSION,
+    ROOT_CAUSE_CODES,
+)
 
 VERDICT_FIXTURE_FAILED = "fixture_failed"
 VERDICT_SYSTEM_FAILED = "system_failed"
