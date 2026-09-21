@@ -196,9 +196,19 @@ def _pull_token(registry: str, repository: str, challenge: str,
     if not realm:
         raise InjectorError("registry challenge without a realm")
     query = f"?service={params.get('service', '')}&scope={params.get('scope', '')}"
-    resp = httpx.get(realm + query, timeout=timeout, trust_env=False)
+    resp = httpx.get(realm + query, timeout=timeout, trust_env=False,
+                     follow_redirects=True)
     resp.raise_for_status()
-    return str(resp.json().get("token") or resp.json().get("access_token") or "")
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise InjectorError(
+            f"registry auth endpoint {realm} did not return JSON "
+            f"(HTTP {resp.status_code})") from exc
+    token = payload.get("token") or payload.get("access_token")
+    if not token:
+        raise InjectorError(f"registry auth endpoint {realm} returned no token")
+    return str(token)
 
 
 def check_registry_tag_absent(image: str, timeout: int = 15) -> None:
@@ -213,13 +223,16 @@ def check_registry_tag_absent(image: str, timeout: int = 15) -> None:
     ]))
     url = f"https://{registry}/v2/{repository}/manifests/{reference}"
     try:
-        resp = httpx.get(url, headers={"Accept": accept}, timeout=timeout, trust_env=False)
+        # Registries (and any proxy in front of them) may redirect; the status we
+        # must evaluate is the final one.
+        resp = httpx.get(url, headers={"Accept": accept}, timeout=timeout,
+                         trust_env=False, follow_redirects=True)
         if resp.status_code == 401:
             token = _pull_token(registry, repository,
                                 resp.headers.get("WWW-Authenticate", ""), timeout)
             resp = httpx.get(url, headers={"Accept": accept,
                                            "Authorization": f"Bearer {token}"},
-                             timeout=timeout, trust_env=False)
+                             timeout=timeout, trust_env=False, follow_redirects=True)
     except httpx.HTTPError as exc:
         raise InjectorError(f"registry {registry} unreachable: {exc}") from exc
     if resp.status_code == 404:

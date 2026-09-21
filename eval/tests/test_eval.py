@@ -662,6 +662,22 @@ def test_registry_preflight_fails_closed(monkeypatch):
     with pytest.raises(injector.InjectorError):
         injector.check_registry_tag_absent("docker.io/library/busybox:missing-tag-001")
 
+    # A 302 that redirects to a non-JSON auth page must fail closed.
+    class RedirectResp:
+        status_code = 302
+        headers = {"WWW-Authenticate":
+                   'Bearer realm="https://auth.example/token",service="reg",scope="repository:x/y:pull"'}
+
+        def json(self):
+            raise ValueError("not json")
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(injector.httpx, "get", lambda *a, **k: RedirectResp())
+    with pytest.raises(injector.InjectorError):
+        injector.check_registry_tag_absent("registry.example/x/y:missing")
+
     # Unreachable registry -> fail closed.
     def _boom(*a, **k):
         raise injector.httpx.ConnectError("no route")
@@ -689,7 +705,7 @@ def test_registry_preflight_handles_bearer_challenge(monkeypatch):
             if self.status_code >= 400:
                 raise AssertionError("unexpected raise_for_status")
 
-    def fake_get(url, headers=None, timeout=None, trust_env=False):
+    def fake_get(url, headers=None, timeout=None, trust_env=False, **kwargs):
         calls.append(url)
         if url.startswith("https://auth.example"):
             return Resp(200, payload={"token": "tok"})

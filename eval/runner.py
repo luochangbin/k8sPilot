@@ -17,7 +17,8 @@ from .cases import (Case, CaseError, case_hashes, critical_case_keys, load_case_
                     resolve_and_load_case_entry)
 from .injector import Injector, InjectorError
 from .reporter import build_report, render_markdown, report_by_case, write_json, write_jsonl
-from .scorer import ROOT_CAUSE_VOCABULARY_VERSION, score_case, summarize_trace
+from .scorer import (ROOT_CAUSE_VOCABULARY_VERSION, SCORER_VERSION, score_case,
+                     summarize_trace)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,6 +65,7 @@ class Runner:
             "enable_incidents": enable_incidents,
             "model_profile": model_profile,
             "cases": [c.key() for c in cases],
+            "scorer_version": SCORER_VERSION,
             "root_cause_vocabulary_version": ROOT_CAUSE_VOCABULARY_VERSION,
             # Audit trail: prove the pinned definition and fixture bytes are the
             # ones this run measured (compare refuses drift when both sides have it).

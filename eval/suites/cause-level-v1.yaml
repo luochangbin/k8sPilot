@@ -3,6 +3,14 @@ description: Pinned cause-level baseline (root cause vocabulary v2). Every entry
   resolves to eval/cases/versions/<id>.v<version>.yaml with a frozen fixture, so
   this suite can be replayed as the cause-level baseline. Use cause-level.yaml
   while iterating (it tracks the current definitions).
+# Critical cases: a wrong root cause here is not averaged away by easy cases.
+critical_cases:
+  - pod-oomkilled-001@1
+  - pod-failedscheduling-node-001@2
+  - pod-failedscheduling-resource-001@2
+  - pod-configerror-env-001@2
+  - pod-image-notfound-001@1
+  - pvc-missing-pv-001@1
 cases:
   - deploy-configerror-001@1
   - deploy-nodeselector-001@1

@@ -310,7 +310,12 @@ class Agent:
             """
             finalization_tools = [d for d in tools
                                   if d["function"]["name"] == "submit_result"]
-            forced: Any = {"type": "function", "function": {"name": "submit_result"}}
+            # Terminal-only is enforced by the TOOL LIST, not by a forced
+            # tool_choice: reasoning/thinking providers reject a forced function
+            # choice with HTTP 400 ("Thinking mode does not support this
+            # tool_choice"), which would turn a budget-limited run into a system
+            # failure instead of a final answer.
+            forced: Any = "auto"
             attempts = max(1, int(budget.get("max_finalization_attempts", 1)))
             for _attempt in range(attempts):
                 if store.is_cancelled(diagnosis_id):
