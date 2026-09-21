@@ -1,8 +1,8 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-imagepullauth-001
-case_version: "1"
+case_version: "2"
 suite: phase1
-description: Private registry image pulled without credentials fails authentication
+description: Image pull fails against an unreachable/unauthorised private registry path; only the pull failure itself is deterministically injectable here (coarse code by design)
 target:
   apiVersion: v1
   kind: Pod
@@ -16,7 +16,7 @@ inject:
 ready_when:
   type: jsonpath_equals
   path: status.containerStatuses[0].state.waiting.reason
-  value: ImagePullBackOff
+  value: "ImagePullBackOff"
   timeout_seconds: 120
 ground_truth:
   accepted_root_cause_codes: [IMAGE_PULL_FAILED]

@@ -1,8 +1,8 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-failedscheduling-node-001
-case_version: "1"
+case_version: "2"
 suite: phase1
-description: Pod cannot be scheduled because no node matches its nodeSelector
+description: No node matches the pod's nodeSelector (FailedScheduling is the symptom)
 target:
   apiVersion: v1
   kind: Pod
@@ -16,14 +16,18 @@ inject:
 ready_when:
   type: jsonpath_equals
   path: status.phase
-  value: Pending
+  value: "Pending"
   timeout_seconds: 90
 ground_truth:
-  accepted_root_cause_codes: [SCHEDULING_FAILED]
+  accepted_root_cause_codes: [NODE_SELECTOR_MISMATCH]
   required_evidence:
     - source: kubernetes.events
+      operator: contains
+      value: didn't match
+    - source: kubernetes.status
+      path: actual_state.phase
       operator: equals
-      value: FailedScheduling
+      value: Pending
   abstention_expected: false
 budgets:
   diagnosis_timeout_seconds: 180

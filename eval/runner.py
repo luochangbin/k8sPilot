@@ -120,7 +120,8 @@ class Runner:
             # status=failed (so system_failed rows are diagnosable).
             if error is None and diagnosis and diagnosis.get("status") == "failed":
                 error = diagnosis.get("error") or "diagnosis failed (agent)"
-            row = {**base, "fixture_ready": fixture_ready, "error": error}
+            row = {**base, "fixture_ready": fixture_ready, "error": error,
+                   "failure_reason": (diagnosis or {}).get("failure_reason")}
             if diagnosis:
                 row["diagnosis_id"] = diagnosis.get("diagnosis_id")
             status = (diagnosis or {}).get("status", "failed")
@@ -128,6 +129,8 @@ class Runner:
             row.update(score_case(case, fixture_ready=fixture_ready, diagnosis_status=status,
                                   result=result, error=error, trace=trace))
             row.update(summarize_trace(trace))
+            # A budget-exhausted session is a planning failure, never an abstention.
+            row["budget_exhausted"] = row.get("failure_reason") == "budget_exhausted"
             if cleanup_failed:
                 row["cleanup_failed"] = cleanup_failed
             return row
@@ -174,6 +177,10 @@ class Runner:
             "case_id": base["case_id"],
             "case_version": base["case_version"],
             "attempt_index": base["attempt_index"],
+            # Case budgets (eval-only on the agent side; frozen at session
+            # creation). The trace reports the *effective* values actually used.
+            "eval_max_tool_calls": case.budgets.max_tool_calls,
+            "eval_max_agent_rounds": case.budgets.max_agent_rounds,
         }
         # Phase 4 four-group ablation: retrieval gates. Omitted (None) keeps the
         # agent default (enabled when the knowledge module is configured).
@@ -204,7 +211,32 @@ class Runner:
             except (httpx.HTTPError, KeyError, ValueError) as exc:
                 return None, f"poll diagnosis failed: {exc}"
             time.sleep(1)
+        # Timeout: stop the worker instead of letting it keep burning tokens
+        # against a fixture that is about to be deleted. The stop is
+        # cooperative (checked before every LLM call / tool execution); we poll
+        # briefly so the caller can report the terminal state.
+        self._cancel(diagnosis_id)
+        grace_deadline = time.monotonic() + 5
+        while time.monotonic() < grace_deadline:
+            try:
+                resp = httpx.get(f"{self._agent_url}/api/v1/diagnoses/{diagnosis_id}",
+                                 timeout=5, trust_env=False)
+                resp.raise_for_status()
+                d = resp.json()
+                if d["status"] in ("completed", "failed"):
+                    return d, f"diagnosis timed out after {timeout}s (cancelled)"
+            except (httpx.HTTPError, KeyError, ValueError):
+                break
+            time.sleep(0.5)
         return None, f"diagnosis timed out after {timeout}s"
+
+    def _cancel(self, diagnosis_id: str) -> None:
+        """Best-effort cooperative cancel; failures must not mask the timeout."""
+        try:
+            httpx.post(f"{self._agent_url}/api/v1/diagnoses/{diagnosis_id}/cancel",
+                       timeout=10, trust_env=False)
+        except httpx.HTTPError:
+            pass
 
     def _collect_trace(self, diagnosis_id: Optional[str]) -> Optional[dict[str, Any]]:
         if not self._trace_dir or not diagnosis_id:

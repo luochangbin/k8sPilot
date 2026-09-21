@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Node
+metadata:
+  name: eval-node-notready-001
+  labels:
+    k8spilot.dev/eval-synthetic: "true"
+    kubernetes.io/hostname: eval-node-notready-001

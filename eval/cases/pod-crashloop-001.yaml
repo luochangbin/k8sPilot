@@ -1,8 +1,8 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-crashloop-001
-case_version: "1"
+case_version: "2"
 suite: phase1
-description: Application exits immediately on start, kubelet enters CrashLoopBackOff
+description: Application exits immediately with code 1 on start (CrashLoopBackOff is the symptom)
 target:
   apiVersion: v1
   kind: Pod
@@ -16,15 +16,19 @@ inject:
 ready_when:
   type: jsonpath_equals
   path: status.containerStatuses[0].state.waiting.reason
-  value: CrashLoopBackOff
+  value: "CrashLoopBackOff"
   timeout_seconds: 120
 ground_truth:
-  accepted_root_cause_codes: [CRASH_LOOP_BACKOFF]
+  accepted_root_cause_codes: [APPLICATION_EXIT_NONZERO]
   required_evidence:
     - source: kubernetes.status
       path: actual_state.container_states[0].reason
       operator: equals
       value: CrashLoopBackOff
+    - source: kubernetes.status
+      path: actual_state.container_states[0].last_termination.exit_code
+      operator: equals
+      value: 1
   abstention_expected: false
 budgets:
   diagnosis_timeout_seconds: 180

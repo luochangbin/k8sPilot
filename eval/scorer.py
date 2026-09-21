@@ -6,6 +6,11 @@ No LLM judging, no free-text inference.
 v2 clarifies the result taxonomy so failure categories are not silently
 counted as abstention, and makes the evidence metric an explicit
 required-evidence match ratio over de-duplicated output entries.
+
+v3 adds the versioned root-cause vocabulary linkage and budget/policy
+observability. v4 adds the `contains` evidence operator (event/log messages are
+not exact strings) and lets evidence omit the operator instead of forcing an
+exact echo of it.
 """
 
 import sys
@@ -16,7 +21,7 @@ from .cases import Case
 
 # Bump when scoring semantics change. Results produced by different versions
 # must not be diffed directly; recompute from raw results with one scorer.
-SCORER_VERSION = "3"
+SCORER_VERSION = "4"
 
 # Share the versioned root cause vocabulary with the agent service.
 _AGENT_SERVICE = Path(__file__).resolve().parents[1] / "agent-service"
@@ -38,9 +43,14 @@ KNOWN_LAYERS = {
 
 
 def _matches_required(evidence: dict[str, Any], req) -> bool:
-    """A required-evidence constraint matches only when every field the ground
-    truth specifies is present and exactly equal in the output evidence.
-    Missing fields never satisfy a specified constraint."""
+    """A required-evidence constraint matches when every field the ground truth
+    specifies is present in the output evidence and the value satisfies the
+    declared operator (default: exact equality).
+
+    Event/log messages are not exact strings, so ground truth may use
+    `operator: contains` (substring). The evidence's own operator, when present,
+    must agree with the requirement; omitting it is allowed.
+    """
     if req.resource_uid is not None and evidence.get("resource_uid") != req.resource_uid:
         return False
     if evidence.get("source") != req.source:
@@ -49,9 +59,14 @@ def _matches_required(evidence: dict[str, Any], req) -> bool:
     # facts). Events-based evidence is matched on source + value.
     if req.path and evidence.get("path") != req.path:
         return False
+    declared = evidence.get("value")
+    if req.operator == "contains":
+        return declared is not None and str(req.value) in str(declared)
+    # `equals` stays strict: the evidence must declare the same operator, so a
+    # looser claim (e.g. contains) cannot masquerade as an exact fact.
     if req.operator and evidence.get("operator") != req.operator:
         return False
-    return str(evidence.get("value")) == str(req.value)
+    return str(declared) == str(req.value)
 
 
 def _dedup_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -214,6 +229,11 @@ def summarize_trace(trace: Optional[dict[str, Any]]) -> dict[str, Any]:
         "duration_ms": None,
         "trace_failure_layer": None,
         "truncated_logs": False,
+        "multi_tool_rejected_rounds": 0,
+        "rounds_used": None,
+        "budget_exhausted": False,
+        "effective_max_tool_calls": None,
+        "effective_max_agent_rounds": None,
     }
     if not trace:
         return out
@@ -248,6 +268,11 @@ def summarize_trace(trace: Optional[dict[str, Any]]) -> dict[str, Any]:
                    and "duration_ms" in (s.get("attributes") or {})), None)
     if finish:
         out["duration_ms"] = finish["attributes"].get("duration_ms")
+        out["rounds_used"] = finish["attributes"].get("rounds_used")
+        out["multi_tool_rejected_rounds"] = finish["attributes"].get(
+            "multi_tool_rejected_rounds", 0) or 0
+        out["effective_max_tool_calls"] = finish["attributes"].get("max_tool_calls")
+        out["effective_max_agent_rounds"] = finish["attributes"].get("max_agent_rounds")
     layer = next((s.get("failure_layer") for s in spans if s.get("failure_layer")), None)
     if layer and layer in KNOWN_LAYERS:
         out["trace_failure_layer"] = layer

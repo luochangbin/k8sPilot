@@ -1,16 +1,16 @@
 schema_version: eval.k8spilot.io/v1alpha1
-id: pod-failedscheduling-resource-001
-case_version: "2"
+id: pvc-missing-pv-001
+case_version: "1"
 suite: phase1
-description: Requested cpu exceeds every node's capacity (FailedScheduling is the symptom)
+description: PVC stays Pending because its spec.volumeName points at a PersistentVolume that does not exist (binding can never succeed)
 target:
   apiVersion: v1
-  kind: Pod
-  namespace: eval-pod-failedscheduling-resource-001
-  name: sched-resource-demo
+  kind: PersistentVolumeClaim
+  namespace: eval-pvc-missing-pv-001
+  name: missing-pv-claim
 setup:
   manifests:
-    - manifests/pod-failedscheduling-resource-001.yaml
+    - manifests/pvc-missing-pv-001.yaml
 inject:
   action: apply
 ready_when:
@@ -19,11 +19,8 @@ ready_when:
   value: "Pending"
   timeout_seconds: 90
 ground_truth:
-  accepted_root_cause_codes: [INSUFFICIENT_NODE_RESOURCES]
+  accepted_root_cause_codes: [PVC_UNBOUND]
   required_evidence:
-    - source: kubernetes.events
-      operator: contains
-      value: Insufficient cpu
     - source: kubernetes.status
       path: actual_state.phase
       operator: equals

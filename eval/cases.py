@@ -56,7 +56,10 @@ class GroundTruth:
 @dataclass
 class Budgets:
     diagnosis_timeout_seconds: int = 60
+    # Investigation budgets are enforced by the agent (rounds != tool calls) and
+    # frozen when the session is created; a Case may only shrink them.
     max_tool_calls: int = 12
+    max_agent_rounds: int = 12
 
 
 @dataclass
@@ -99,10 +102,16 @@ def load_case(path: Path) -> Case:
     suite = _require(raw, "suite", path)
 
     t = _require(raw, "target", path)
+    kind = _require(t, "kind", path)
+    # Cluster-scoped targets (Node, Namespace) have no namespace to declare.
+    namespace = _str(t.get("namespace")) if kind not in ("Node", "Namespace") \
+        else _str(t.get("namespace"))
+    if kind not in ("Node", "Namespace") and "namespace" not in t:
+        raise CaseError(f"case {path}: missing required field 'namespace'")
     target = Target(
         apiVersion=t.get("apiVersion", "v1"),
-        kind=_require(t, "kind", path),
-        namespace=_require(t, "namespace", path),
+        kind=kind,
+        namespace=namespace,
         name=_require(t, "name", path),
     )
 
@@ -138,6 +147,7 @@ def load_case(path: Path) -> Case:
     budgets = Budgets(
         diagnosis_timeout_seconds=int(b.get("diagnosis_timeout_seconds", 60)),
         max_tool_calls=int(b.get("max_tool_calls", 12)),
+        max_agent_rounds=int(b.get("max_agent_rounds", 12)),
     )
 
     return Case(

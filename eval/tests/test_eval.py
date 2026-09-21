@@ -77,11 +77,15 @@ def _row(case, *, verdict=VERDICT_CORRECT, abstention_expected=False, **kw):
 def test_load_real_cases():
     cases_dir = Path(__file__).resolve().parents[1] / "cases"
     files = sorted(cases_dir.glob("*.yaml"))
-    assert len(files) == 12, f"expected 12 cases, got {len(files)}"
+    assert len(files) == 16, f"expected 16 cases, got {len(files)}"
+    supported = {"Pod", "Deployment", "ReplicaSet", "StatefulSet", "DaemonSet",
+                 "Service", "Node", "PersistentVolumeClaim", "Namespace"}
     for f in files:
         case = load_case(f)
         assert case.id == f.stem
-        assert case.target.kind == "Pod"
+        assert case.target.kind in supported, f"{case.id}: unsupported kind"
+        if case.target.kind not in ("Node", "Namespace"):
+            assert case.target.namespace, f"{case.id}: namespaced target needs a namespace"
         assert case.setup_manifests, f"{case.id}: no setup manifests"
 
 
@@ -298,6 +302,20 @@ def test_summarize_trace_counts():
     assert out["truncated_logs"] is True
 
 
+def test_summarize_trace_reports_effective_budgets_and_policy_rejections():
+    trace = {"spans": [
+        {"name": "diagnosis", "attributes": {
+            "status": "completed", "duration_ms": 10.0,
+            "max_tool_calls": 3, "max_agent_rounds": 5,
+            "rounds_used": 4, "tool_calls_used": 3, "multi_tool_rejected_rounds": 2}},
+    ]}
+    out = summarize_trace(trace)
+    assert out["effective_max_tool_calls"] == 3
+    assert out["effective_max_agent_rounds"] == 5
+    assert out["rounds_used"] == 4
+    assert out["multi_tool_rejected_rounds"] == 2
+
+
 # ---- reporter ----
 
 def test_report_reproducible_from_jsonl(tmp_path):
@@ -332,6 +350,9 @@ class _FakeResp:
 
 def _install_fake_agent(monkeypatch, seen):
     def _post(url, json=None, timeout=None, trust_env=False):
+        if str(url).endswith("/cancel"):
+            seen["cancel"] = True
+            return _FakeResp({"diagnosis_id": "diag-1", "cancel_requested": True})
         seen["payload"] = json
         return _FakeResp({"diagnosis_id": "diag-1"})
 
@@ -441,3 +462,125 @@ def test_report_evidence_rates_and_llm_duration():
     assert rep["evidence_unsupported_rate"] == 0.25
     assert rep["llm_duration_ms"]["p50"] == 100.0
     assert rep["llm_duration_ms"]["mean"] == 200.0
+
+
+def test_report_separates_budget_exhaustion_from_abstention():
+    """Budget exhaustion is a planning failure: it must not be counted as a
+    valid abstention, and it is reported on its own."""
+    case = _case(ground_truth=_abstention_ground_truth())
+    exhausted = {
+        **_row(case, verdict=VERDICT_SYSTEM_FAILED),
+        "abstention_expected": False,
+        "budget_exhausted": True,
+        "failure_reason": "budget_exhausted",
+        "multi_tool_rejected_rounds": 2,
+    }
+    report = build_report([exhausted])
+    assert report["budget_exhausted_count"] == 1
+    assert report["budget_exhausted_rate"] == 1.0
+    assert report["multi_tool_rejected_rounds_total"] == 2
+    assert report["abstention_recall"] is None  # no abstention case was scored
+
+
+def test_run_diagnosis_forwards_case_budgets(monkeypatch, tmp_path):
+    from eval.cases import Budgets
+    case = _case(budgets=Budgets(max_tool_calls=3, max_agent_rounds=4))
+    seen = {}
+    _install_fake_agent(monkeypatch, seen)
+    base = {"eval_run_id": "r3", "case_id": case.id, "case_version": case.case_version,
+            "attempt_index": 0}
+    runner = _make_runner(tmp_path)
+
+    diagnosis, error = runner._run_diagnosis(case, uid="u-3", base=base, timeout=10)
+    assert error is None and diagnosis is not None
+    assert seen["payload"]["eval_max_tool_calls"] == 3
+    assert seen["payload"]["eval_max_agent_rounds"] == 4
+
+
+def _abstention_ground_truth():
+    from eval.cases import GroundTruth
+    return GroundTruth(accepted_root_cause_codes=[], abstention_expected=True)
+
+
+def test_timeout_cancels_the_agent_and_reports_the_terminal_state(monkeypatch, tmp_path):
+    case = _case()
+    seen = {}
+    _install_fake_agent(monkeypatch, seen)
+    base = {"eval_run_id": "r4", "case_id": case.id, "case_version": case.case_version,
+            "attempt_index": 0}
+    runner = _make_runner(tmp_path)
+
+    diagnosis, error = runner._run_diagnosis(case, uid="u-4", base=base, timeout=0)
+
+    assert seen.get("cancel") is True, "the runner must cancel on timeout"
+    assert error is not None and "timed out" in error
+    assert diagnosis is not None and diagnosis["status"] == "completed"
+
+
+def test_required_evidence_contains_operator_matches_event_messages():
+    """Event/log evidence is not an exact string: ground truth may use
+    `operator: contains`, and evidence may omit its own operator."""
+    from eval.scorer import SCORER_VERSION, _matches_required
+    from eval.cases import EvidenceRequirement
+
+    req = EvidenceRequirement(source="kubernetes.events", path="", operator="contains",
+                              value="didn't match")
+    assert SCORER_VERSION == "4"
+    assert _matches_required(
+        {"source": "kubernetes.events",
+         "value": "0/2 nodes are available: 2 node(s) didn't match Pod's node affinity/selector."},
+        req)
+    assert not _matches_required({"source": "kubernetes.events", "value": "Insufficient cpu"}, req)
+
+    # Exact equality remains the default and stays strict: the evidence must
+    # declare the same operator (a looser claim must not pass as an exact fact).
+    exact = EvidenceRequirement(source="kubernetes.status", path="actual_state.phase",
+                                operator="equals", value="Pending")
+    assert _matches_required({"source": "kubernetes.status", "path": "actual_state.phase",
+                              "operator": "equals", "value": "Pending"}, exact)
+    assert not _matches_required({"source": "kubernetes.status", "path": "actual_state.phase",
+                                  "value": "Pending"}, exact)
+    assert not _matches_required({"source": "kubernetes.status", "path": "actual_state.phase",
+                                  "operator": "contains", "value": "Pending"}, exact)
+
+
+def test_case_suite_is_well_formed_and_cause_level():
+    """The suite must express causes, not Kubernetes failure modes, and cover
+    Pod / Deployment / Node / PVC targets."""
+    import app.root_causes as rc
+    from eval.cases import load_case
+
+    cases_dir = Path(__file__).resolve().parents[1] / "cases"
+    # Cases that can only inject a coarse failure in this environment, with the
+    # reason recorded in their description.
+    coarse_allowed = {"pod-imagepullauth-001"}
+
+    ids, kinds = set(), set()
+    cause_level = 0
+    for path in sorted(cases_dir.glob("*.yaml")):
+        found = load_case(path)
+        assert found.id not in ids, f"duplicate case id {found.id}"
+        ids.add(found.id)
+        kinds.add(found.target.kind)
+        for manifest in found.setup_manifests:
+            assert manifest.exists(), f"{found.id}: missing manifest {manifest}"
+        accepted = found.ground_truth.accepted_root_cause_codes
+        assert accepted or found.ground_truth.abstention_expected, \
+            f"{found.id}: no accepted code and not an abstention case"
+        for code in accepted:
+            assert code in rc.ROOT_CAUSE_CODES, f"{found.id}: unknown code {code}"
+            if code in rc.FAILURE_MODE_CODES:
+                assert found.id in coarse_allowed, \
+                    f"{found.id} accepts a failure-mode code {code}"
+        if not (set(accepted) & rc.FAILURE_MODE_CODES):
+            cause_level += 1
+
+    assert {"Pod", "Deployment", "Node", "PersistentVolumeClaim"} <= kinds
+    # Same surface symptom, different causes: the two FailedScheduling cases must
+    # not collapse into one code.
+    scheduling = [set(load_case(p).ground_truth.accepted_root_cause_codes)
+                  for p in cases_dir.glob("pod-failedscheduling-*.yaml")]
+    assert {"NODE_SELECTOR_MISMATCH"} in scheduling
+    assert {"INSUFFICIENT_NODE_RESOURCES"} in scheduling
+    # The suite is dominated by cause-level ground truth.
+    assert cause_level >= 12

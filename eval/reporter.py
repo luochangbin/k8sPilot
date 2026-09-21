@@ -106,6 +106,13 @@ def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
             1 for r in rows if r["verdict"] == VERDICT_SCHEMA_FAILED and r.get("explicit_root_cause")
         ),
         "conflicting_abstention_count": sum(1 for r in rows if r.get("conflicting_abstention")),
+        # Planning failure: investigation budgets ran out and the terminal-only
+        # round produced no valid result. Kept separate from abstention metrics.
+        "budget_exhausted_count": sum(1 for r in fixture_ok if r.get("budget_exhausted")),
+        "budget_exhausted_rate": _rate(
+            sum(1 for r in fixture_ok if r.get("budget_exhausted")), len(fixture_ok)),
+        "multi_tool_rejected_rounds_total": sum(
+            int(r.get("multi_tool_rejected_rounds") or 0) for r in rows),
         # --- quality metrics, each with numerator / denominator ---
         "end_to_end_correct_rate": _rate(correct, len(fixture_ok)),
         "end_to_end_correct": {"numerator": correct, "denominator": len(fixture_ok)},

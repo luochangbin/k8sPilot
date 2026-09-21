@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eval-deploy-configerror-001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: configerror-deploy
+  namespace: eval-deploy-configerror-001
+  labels:
+    app: configerror-deploy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: configerror-deploy
+  template:
+    metadata:
+      labels:
+        app: configerror-deploy
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["sh", "-c", "sleep 3600"]
+          envFrom:
+            - configMapRef:
+                name: missing-cm

@@ -153,6 +153,13 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
         "enable_knowledge": enable_knowledge,
         "enable_incidents": enable_incidents,
         "declared_model_label": model_label or None,
+        # Declared Case budgets (the per-attempt *effective* values are recorded
+        # on each row from the trace root span).
+        "case_budgets": {
+            c.id: {"max_tool_calls": c.budgets.max_tool_calls,
+                   "max_agent_rounds": c.budgets.max_agent_rounds}
+            for c in cases
+        },
         "plan": plan,
     }
     write_json(run_dir / "model-benchmark.plan.json", {"benchmark_id": benchmark_id, "plan": plan})

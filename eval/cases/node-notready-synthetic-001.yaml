@@ -1,0 +1,32 @@
+schema_version: eval.k8spilot.io/v1alpha1
+id: node-notready-synthetic-001
+case_version: "1"
+suite: phase1
+description: Synthetic Node object with no kubelet registered, so the Node has no Ready condition and is NotReady (safe to inject, the real worker nodes are untouched)
+target:
+  apiVersion: v1
+  kind: Node
+  name: eval-node-notready-001
+setup:
+  manifests:
+    - manifests/node-notready-synthetic-001.yaml
+inject:
+  action: apply
+ready_when:
+  type: jsonpath_exists
+  path: metadata.uid
+  value: "true"
+  timeout_seconds: 60
+ground_truth:
+  accepted_root_cause_codes: [NODE_UNAVAILABLE]
+  required_evidence:
+    - source: kubernetes.status
+      path: actual_state.ready
+      operator: equals
+      value: False
+  abstention_expected: false
+budgets:
+  diagnosis_timeout_seconds: 180
+  max_tool_calls: 12
+cleanup:
+  action: delete_manifest

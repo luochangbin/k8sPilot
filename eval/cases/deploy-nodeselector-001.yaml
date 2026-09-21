@@ -1,29 +1,29 @@
 schema_version: eval.k8spilot.io/v1alpha1
-id: pod-configerror-mount-001
-case_version: "2"
+id: deploy-nodeselector-001
+case_version: "1"
 suite: phase1
-description: Volume references a ConfigMap that does not exist (FailedMount is the symptom)
+description: Deployment pods stay Pending because no node matches the pod template's nodeSelector
 target:
-  apiVersion: v1
-  kind: Pod
-  namespace: eval-pod-configerror-mount-001
-  name: configerror-mount-demo
+  apiVersion: apps/v1
+  kind: Deployment
+  namespace: eval-deploy-nodeselector-001
+  name: selector-deploy
 setup:
   manifests:
-    - manifests/pod-configerror-mount-001.yaml
+    - manifests/deploy-nodeselector-001.yaml
 inject:
   action: apply
 ready_when:
-  type: jsonpath_equals
-  path: status.phase
-  value: "Pending"
+  type: jsonpath_gte
+  path: status.unavailableReplicas
+  value: "1"
   timeout_seconds: 120
 ground_truth:
-  accepted_root_cause_codes: [MISSING_CONFIGMAP]
+  accepted_root_cause_codes: [NODE_SELECTOR_MISMATCH]
   required_evidence:
     - source: kubernetes.events
       operator: contains
-      value: does-not-exist-cm
+      value: didn't match
     - source: kubernetes.status
       path: actual_state.phase
       operator: equals

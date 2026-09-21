@@ -1,22 +1,22 @@
 schema_version: eval.k8spilot.io/v1alpha1
-id: pod-configerror-env-001
-case_version: "2"
+id: deploy-configerror-001
+case_version: "1"
 suite: phase1
-description: envFrom references a ConfigMap that does not exist (CreateContainerConfigError is the symptom)
+description: Deployment pods cannot start because envFrom references a missing ConfigMap; the cause is only visible after inspecting the child Pod (Deployment -> ReplicaSet -> Pod)
 target:
-  apiVersion: v1
-  kind: Pod
-  namespace: eval-pod-configerror-env-001
-  name: configerror-env-demo
+  apiVersion: apps/v1
+  kind: Deployment
+  namespace: eval-deploy-configerror-001
+  name: configerror-deploy
 setup:
   manifests:
-    - manifests/pod-configerror-env-001.yaml
+    - manifests/deploy-configerror-001.yaml
 inject:
   action: apply
 ready_when:
-  type: jsonpath_equals
-  path: status.containerStatuses[0].state.waiting.reason
-  value: "CreateContainerConfigError"
+  type: jsonpath_gte
+  path: status.unavailableReplicas
+  value: "1"
   timeout_seconds: 120
 ground_truth:
   accepted_root_cause_codes: [MISSING_CONFIGMAP]
@@ -27,7 +27,7 @@ ground_truth:
       value: CreateContainerConfigError
     - source: kubernetes.events
       operator: contains
-      value: does-not-exist-cm
+      value: missing-cm
   abstention_expected: false
 budgets:
   diagnosis_timeout_seconds: 180
