@@ -601,7 +601,10 @@ def test_cause_level_suite_declares_multi_kind_coverage():
     cases_dir = Path(__file__).resolve().parents[1] / "cases"
     suite = load_suite(suites_dir / "cause-level.yaml")
     declared = suite["cases"]
-    assert len(declared) >= 16
+    # The coarse image-pull compatibility cases stay in the frozen baseline.
+    assert "pod-imagepullauth-001" not in declared
+    assert "pod-imagepullbackoff-001" not in declared
+    assert len(declared) >= 15
 
     kinds = set()
     for case_id in declared:
@@ -684,3 +687,106 @@ def test_registry_preflight_handles_bearer_challenge(monkeypatch):
     monkeypatch.setattr(injector.httpx, "get", fake_get)
     injector.check_registry_tag_absent("registry.example/x/y:missing-tag", timeout=1)
     assert any(u.startswith("https://auth.example") for u in calls)
+
+
+def test_preflight_runs_before_manifests_and_creates_nothing(monkeypatch):
+    """A failing preflight must leave the cluster untouched."""
+    import eval.injector as injector
+    from eval.cases import Budgets, Case, GroundTruth, ReadyWhen, Target
+
+    calls = []
+    monkeypatch.setattr(injector, "run_kubectl",
+                        lambda args, **kwargs: calls.append(args) or "")
+    monkeypatch.setattr(injector, "check_registry_tag_absent",
+                        lambda image, timeout=15: (_ for _ in ()).throw(
+                            injector.InjectorError("registry unreachable")))
+
+    case = Case(schema_version="eval.k8spilot.io/v1alpha1", id="t-pre", case_version="1",
+                suite="test", description="", target=Target("v1", "Pod", "ns", "p"),
+                setup_manifests=[Path(__file__)], ready_when=ReadyWhen(type="jsonpath_exists",
+                                                                      path="status", value=""),
+                ground_truth=GroundTruth(), budgets=Budgets(),
+                preflight=[{"type": "registry_tag_absent", "image": "x/y:z"}])
+    with pytest.raises(injector.InjectorError):
+        injector.Injector().apply(case)
+    assert calls == [], "no kubectl call may happen before preflight passes"
+
+
+def test_runner_cleans_up_when_injection_fails(monkeypatch, tmp_path):
+    from eval.injector import InjectorError
+    from eval.runner import Runner
+
+    cleaned = []
+
+    class FailingInjector:
+        def apply(self, case):
+            raise InjectorError("apply exploded")
+
+        def cleanup(self, case):
+            cleaned.append(case.id)
+
+        def get_target_uid(self, case):
+            return "uid-1"
+
+        def wait_ready(self, case):
+            return True
+
+    runner = Runner(agent_url="http://agent.test", trace_dir=None, kubeconfig=None,
+                    reports_dir=str(tmp_path))
+    runner._injector = FailingInjector()
+    row = runner._run_case(_case(), "run-1", 0)
+
+    assert row["fixture_ready"] is False
+    assert "apply exploded" in row["error"]
+    assert cleaned == ["t-001"], "a failed injection must still be cleaned up"
+
+
+def test_registry_preflight_requires_manifest_unknown(monkeypatch):
+    import eval.injector as injector
+
+    class Resp:
+        def __init__(self, status, payload=None):
+            self.status_code = status
+            self.headers = {}
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    # 404 with NAME_UNKNOWN means the repository (not the tag) is unknown.
+    monkeypatch.setattr(injector.httpx, "get", lambda *a, **k: Resp(
+        404, {"errors": [{"code": "NAME_UNKNOWN"}]}))
+    with pytest.raises(injector.InjectorError):
+        injector.check_registry_tag_absent("registry.example/x/y:missing")
+
+    # 404 with MANIFEST_UNKNOWN is the deterministic IMAGE_NOT_FOUND case.
+    monkeypatch.setattr(injector.httpx, "get", lambda *a, **k: Resp(
+        404, {"errors": [{"code": "MANIFEST_UNKNOWN"}]}))
+    injector.check_registry_tag_absent("registry.example/x/y:missing")
+
+
+def test_event_ready_condition_requires_the_cluster_side_semantics(monkeypatch):
+    """`event_message_contains` only turns ready once the target's Events carry
+    the expected failure semantics, so DNS/TLS/network failures cannot pass."""
+    import eval.injector as injector
+    from eval.cases import Budgets, Case, GroundTruth, ReadyWhen, Target
+
+    events = {"items": [
+        {"reason": "Failed", "message": 'Failed to pull image "x/y:z": network timeout'},
+    ]}
+    monkeypatch.setattr(injector, "run_kubectl", lambda args, **k: json.dumps(events))
+
+    def make_case(value, reason="Failed", timeout=1):
+        return Case(schema_version="eval.k8spilot.io/v1alpha1", id="t-ev", case_version="1",
+                    suite="test", description="", target=Target("v1", "Pod", "ns", "p"),
+                    ready_when=ReadyWhen(type="event_message_contains", path=reason,
+                                         value=value, timeout_seconds=timeout),
+                    ground_truth=GroundTruth(), budgets=Budgets())
+
+    injector_instance = injector.Injector()
+    assert injector_instance._events_contain(make_case("network timeout")) is True
+    assert injector_instance._events_contain(make_case("manifest unknown")) is False
+    assert injector_instance._events_contain(make_case("network timeout",
+                                                       reason="BackOff")) is False
+    # wait_ready polls until the deadline and reports False (fixture_failed).
+    assert injector_instance.wait_ready(make_case("manifest unknown", timeout=1)) is False

@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-oomkilled-recovered-001
 case_version: "1"
-suite: phase1
 description: Container was OOMKilled once, then restarted and is now running; last termination still shows OOMKilled
 target:
   apiVersion: v1

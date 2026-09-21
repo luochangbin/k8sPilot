@@ -99,7 +99,10 @@ def load_case(path: Path) -> Case:
 
     case_id = _require(raw, "id", path)
     case_version = str(_require(raw, "case_version", path))
-    suite = _require(raw, "suite", path)
+    # Legacy field: suite membership is defined by eval/suites/*.yaml, not by
+    # the individual case file. Kept optional so a case belongs to as many
+    # suites as the suite files declare.
+    suite = _str(raw.get("suite"))
 
     t = _require(raw, "target", path)
     kind = _require(t, "kind", path)

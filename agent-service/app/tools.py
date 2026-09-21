@@ -298,7 +298,8 @@ def tool_definitions(capabilities: dict[str, Any] | None = None,
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "source": {"type": "string", "description": "e.g. kubernetes.status, kubernetes.events, kubernetes.logs"},
+                                    "source": {"type": "string", "description": "One of: kubernetes.status (inspect), kubernetes.events (events), kubernetes.logs (logs), prometheus.metrics (query_metrics), loki.logs (query_logs)."},
+                                    "tool_call_id": {"type": "string", "description": "The id of the tool call this evidence came from (strongly preferred: it pins the claim to one real tool result)."},
                                     "resource_uid": {"type": "string"},
                                     "path": {"type": "string", "description": "JSONPath/field path of the fact in the resource, e.g. status.containerStatuses[0].lastState.terminated.reason"},
                                     "operator": {"type": "string", "enum": ["equals", "contains"]},

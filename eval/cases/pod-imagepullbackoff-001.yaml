@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-imagepullbackoff-001
 case_version: "2"
-suite: phase1
 description: COARSE by design - the registry may be unreachable, so only the pull failure itself is deterministically injectable (see pod-image-notfound-001 for the preflight-gated strict case)
 target:
   apiVersion: v1

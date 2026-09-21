@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pvc-missing-pv-001
 case_version: "1"
-suite: phase1
 description: PVC stays Pending because its spec.volumeName points at a PersistentVolume that does not exist (binding can never succeed)
 target:
   apiVersion: v1

@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-failedmount-pvc-001
 case_version: "2"
-suite: phase1
 description: Pod stays Pending because its PVC never binds (no matching StorageClass); the scheduling error names the unbound claim
 target:
   apiVersion: v1

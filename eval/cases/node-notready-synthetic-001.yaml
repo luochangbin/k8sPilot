@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: node-notready-synthetic-001
 case_version: "1"
-suite: phase1
 description: Synthetic Node object with no kubelet registered, so the Node has no Ready condition and is NotReady (safe to inject, the real worker nodes are untouched)
 target:
   apiVersion: v1

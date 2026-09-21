@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-failedscheduling-resource-001
 case_version: "2"
-suite: phase1
 description: Requested cpu exceeds every node's capacity (FailedScheduling is the symptom)
 target:
   apiVersion: v1

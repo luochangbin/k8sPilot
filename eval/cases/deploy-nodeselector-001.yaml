@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: deploy-nodeselector-001
 case_version: "1"
-suite: phase1
 description: Deployment pods stay Pending because no node matches the pod template's nodeSelector
 target:
   apiVersion: apps/v1

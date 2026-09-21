@@ -211,19 +211,30 @@ def test_global_concurrency_limit_keeps_excess_sessions_queued(monkeypatch):
     entered = threading.Event()
 
     class BlockingLLM(ScriptedLLM):
+        """Blocks on the first call, then runs one real tool and abstains (an
+        abstention must be preceded by an actual investigation step)."""
+
+        def __init__(self):
+            super().__init__([])
+            self._chat_calls = 0
+
         def chat(self, messages, tools, tool_choice):
-            entered.set()
-            gate.wait(timeout=10)
+            self._chat_calls += 1
+            if self._chat_calls == 1:
+                entered.set()
+                gate.wait(timeout=10)
+                return ScriptedLLM.tool_response("inspect", {
+                    "kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"})
             return ScriptedLLM.tool_response("submit_result", {
                 "symptom": "s", "root_cause_code": "", "root_cause": "",
                 "insufficient_evidence": True, "confidence": "low",
-                "recommendations": [], "missing_evidence": [],
+                "recommendations": [], "missing_evidence": ["no logs available"],
             })
 
     cfg = Config()
     cfg.max_concurrent_diagnoses = 1
     client = make_client(cfg=cfg, execution_resolver=lambda name: ExecutionContext(
-        llm=BlockingLLM([]), metadata={"resolved_profile": name, "provider": "test"}))
+        llm=BlockingLLM(), metadata={"resolved_profile": name, "provider": "test"}))
 
     ids = []
     for _ in range(3):

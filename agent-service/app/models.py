@@ -104,6 +104,10 @@ class Evidence(BaseModel):
     the deterministic scoring inputs (design §23.4); summary is for humans."""
 
     source: str
+    # Runtime provenance: the tool_call_id this claim came from. Preferred over
+    # searching by source/uid, so a diagnosis that read several resources cannot
+    # have one resource's result verify a claim about another.
+    tool_call_id: Optional[str] = None
     observed_at: Optional[str] = None
     summary: str
     # --- Phase 2 eval fields (backward-compatible optional extensions) ---

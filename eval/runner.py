@@ -138,7 +138,10 @@ class Runner:
         try:
             self._injector.apply(case)
         except InjectorError as exc:
-            return _complete_row(False, None, f"inject failed: {exc}", None)
+            # apply() may fail after a partial kubectl apply: always try to clean
+            # up so a fixture_failed case cannot pollute later cases.
+            return _complete_row(False, None, f"inject failed: {exc}", None,
+                                 cleanup_failed=self._best_effort_cleanup(case))
 
         fixture_ready = self._injector.wait_ready(case)
         diagnosis: Optional[dict[str, Any]] = None
@@ -237,6 +240,14 @@ class Runner:
                        timeout=10, trust_env=False)
         except httpx.HTTPError:
             pass
+
+    def _best_effort_cleanup(self, case: Case) -> Optional[str]:
+        """Cleanup that must never mask the original failure."""
+        try:
+            self._injector.cleanup(case)
+            return None
+        except InjectorError as exc:
+            return str(exc)
 
     def _collect_trace(self, diagnosis_id: Optional[str]) -> Optional[dict[str, Any]]:
         if not self._trace_dir or not diagnosis_id:

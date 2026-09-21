@@ -279,6 +279,8 @@ def test_tool_not_found_is_fed_back_and_loop_continues():
     connector = StubConnector(raise_on="not_found")
     llm = ScriptedLLM([
         ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment", "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("events", {"kind": "Pod", "namespace": "payment",
+                                             "name": "payment-api-7b8c9"}),
         _abstain_result(),
     ])
     d = run(make_agent(llm, connector))
@@ -376,7 +378,9 @@ def test_tool_and_round_budgets_are_counted_separately(tmp_path):
     (submit_result excluded). Counters are recorded on the trace root span."""
     llm = ScriptedLLM([
         _two_call_round(),
-        _abstain_result(),  # no tool output exists, so only abstention is valid
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        _submit_ok(),
     ])
     connector = StubConnector()
     agent = make_agent(llm, connector)
@@ -388,10 +392,10 @@ def test_tool_and_round_budgets_are_counted_separately(tmp_path):
     row = store.get(d.diagnosis_id)
     assert row.status == "completed"
     root = _trace_root(str(tmp_path / "trace"), d.diagnosis_id)
-    assert root["attributes"]["rounds_used"] == 2  # rejected round + abstain round
-    assert root["attributes"]["tool_calls_used"] == 0  # submit_result is not a tool
+    assert root["attributes"]["rounds_used"] == 3  # rejected + inspect + submit
+    assert root["attributes"]["tool_calls_used"] == 1  # submit_result is not a tool
     assert root["attributes"]["multi_tool_rejected_rounds"] == 1
-    assert connector.call_log == []
+    assert connector.call_log == ["inspect"]
 
 
 def test_eval_budget_can_only_shrink_the_service_budget():
@@ -582,6 +586,8 @@ def test_parses_scorable_root_cause_and_structured_evidence():
 
 def test_parses_insufficient_evidence_abstention():
     llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
         ScriptedLLM.tool_response("submit_result", {
             "symptom": "Pod Pending",
             "root_cause_code": "",
@@ -708,6 +714,7 @@ def test_degraded_metrics_tool_fed_back_to_llm():
         ScriptedLLM.tool_response("submit_result", {
             "symptom": "s", "root_cause_code": "", "insufficient_evidence": True,
             "evidence": [], "root_cause": "", "confidence": "low", "recommendations": [],
+            "missing_evidence": ["prometheus unavailable"],
         }),
     ])
     connector = RecordingConnector(capabilities={"prometheus.metrics": True})
@@ -723,9 +730,12 @@ def test_non_pod_target_accepted_in_phase3():
     store = SessionStore()
     d = store.create(req)
     llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Deployment", "namespace": "payment",
+                                              "name": "payment-api"}),
         ScriptedLLM.tool_response("submit_result", {
             "symptom": "s", "root_cause_code": "", "insufficient_evidence": True,
             "evidence": [], "root_cause": "", "confidence": "low", "recommendations": [],
+            "missing_evidence": ["no pod-level evidence yet"],
         }),
     ])
     Agent(Config(), StubConnector(), llm).run(req, store, d.diagnosis_id)
@@ -888,12 +898,15 @@ def test_failed_tool_call_is_not_listed_as_an_investigation_step():
     llm = ScriptedLLM([
         ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
                                               "name": "payment-api-7b8c9"}),
+        ScriptedLLM.tool_response("events", {"kind": "Pod", "namespace": "payment",
+                                             "name": "payment-api-7b8c9"}),
         _abstain_result(),
     ])
     d = run(make_agent(llm, connector))
 
     assert d.status == "completed"
-    assert d.result.investigation_steps == []
+    # Only the successful events call is listed; the failed inspect is not.
+    assert len(d.result.investigation_steps) == 1
 
 
 def test_alert_context_is_framed_as_untrusted_external_data():
@@ -1604,3 +1617,151 @@ def test_failure_traces_carry_the_budget_snapshot(tmp_path):
     cancel_root = _trace_root(str(tmp_path / "cancel"), d.diagnosis_id)
     assert required <= set(cancel_root["attributes"])
     assert cancel_root["attributes"]["rounds_used"] >= 1
+
+
+def test_runtime_evidence_operators_match_the_scorer_semantics():
+    """equals is exact and contains is substring — for path-based and
+    field-based claims alike, and never against the serialized JSON blob."""
+    from app.validation import MISMATCH, UNVERIFIABLE, VERIFIED, validate_submission
+
+    events_output = json.dumps({"events": [
+        {"reason": "FailedScheduling",
+         "message": "0/3 nodes are available: 3 Insufficient cpu."}]})
+
+    def submission(evidence):
+        return {"root_cause_code": "INSUFFICIENT_NODE_RESOURCES", "root_cause": "rc",
+                "insufficient_evidence": False, "evidence": [evidence]}
+
+    results = [{"tool": "events", "tool_call_id": "call_ev", "kind": "realtime",
+                "args": {"kind": "Pod", "namespace": "payment", "name": "p", "uid": "uid-1"},
+                "output": events_output}]
+
+    # equals with a substring value must NOT verify (the old blob-substring path did).
+    ok, _, report = validate_submission(
+        submission({"source": "kubernetes.events", "operator": "equals",
+                    "value": "Insufficient cpu"}), results)
+    assert not ok
+    assert report[0]["status"] in (MISMATCH, UNVERIFIABLE)
+
+    # contains over a real business field verifies.
+    ok, _, report = validate_submission(
+        submission({"source": "kubernetes.events", "operator": "contains",
+                    "value": "Insufficient cpu"}), results)
+    assert ok and report[0]["status"] == VERIFIED
+
+    # equals against an exact field value verifies too.
+    ok, _, report = validate_submission(
+        submission({"source": "kubernetes.events", "operator": "equals",
+                    "value": "FailedScheduling"}), results)
+    assert ok and report[0]["status"] == VERIFIED
+
+
+def test_evidence_provenance_pins_the_tool_call():
+    """tool_call_id pins a claim to one result, so another resource's data can
+    never verify it."""
+    from app.validation import MISMATCH, UNVERIFIABLE, VERIFIED, validate_submission
+
+    results = [
+        {"tool": "inspect", "tool_call_id": "call_a", "kind": "realtime",
+         "args": {"kind": "Pod", "namespace": "payment", "name": "pending-pod", "uid": "uid-1"},
+         "output": json.dumps({"actual_state": {"phase": "Pending"}})},
+        {"tool": "inspect", "tool_call_id": "call_b", "kind": "realtime",
+         "args": {"kind": "Pod", "namespace": "payment", "name": "running-pod", "uid": "uid-2"},
+         "output": json.dumps({"actual_state": {"phase": "Running"}})},
+    ]
+
+    def submission(evidence):
+        return {"root_cause_code": "SCHEDULING_FAILED", "root_cause": "rc",
+                "insufficient_evidence": False, "evidence": [evidence]}
+
+    base = {"source": "kubernetes.status", "path": "actual_state.phase",
+            "operator": "equals", "value": "Pending"}
+
+    # Pinned to the pending pod: verified.
+    ok, _, report = validate_submission(submission({**base, "tool_call_id": "call_a"}),
+                                        results)
+    assert ok and report[0]["status"] == VERIFIED
+
+    # Pinned to the running pod: the claim does not hold there.
+    ok, _, report = validate_submission(submission({**base, "tool_call_id": "call_b"}),
+                                        results)
+    assert not ok and report[0]["status"] == MISMATCH
+
+    # Unknown provenance: fail closed instead of searching other results.
+    ok, _, report = validate_submission(submission({**base, "tool_call_id": "call_missing"}),
+                                        results)
+    assert not ok and report[0]["status"] == UNVERIFIABLE
+
+
+def test_finalization_rejects_multiple_tool_calls_in_one_round():
+    """Terminal-only is also single-tool-only: two submit_result calls in the
+    finalization round are rejected whole, with every id answered."""
+    two_submits = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content=None,
+        tool_calls=[
+            SimpleNamespace(id="call_s1", type="function", function=SimpleNamespace(
+                name="submit_result", arguments=json.dumps(
+                    {"symptom": "s", "root_cause_code": "CONTAINER_OOMKILLED",
+                     "insufficient_evidence": False, "evidence": [], "root_cause": "rc",
+                     "confidence": "high", "recommendations": []}))),
+            SimpleNamespace(id="call_s2", type="function", function=SimpleNamespace(
+                name="submit_result", arguments=json.dumps({"symptom": "s2"}))),
+        ],
+    ))])
+
+    seen: list[list[dict]] = []
+
+    class RecordingLLM(ScriptedLLM):
+        def chat(self, messages, tools, tool_choice):
+            seen.append([dict(m) for m in messages])
+            return super().chat(messages, tools, tool_choice)
+
+    connector = StubConnector()
+    agent = make_agent(RecordingLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        two_submits,
+        _abstain_result(),
+    ]), connector)
+    agent.cfg.max_tool_calls = 1
+    agent.cfg.max_finalization_attempts = 2
+    store = SessionStore()
+    d = store.create(make_request())
+    agent.run(make_request(), store, d.diagnosis_id)
+
+    assert store.get(d.diagnosis_id).status == "completed"
+    assert connector.call_log == ["inspect"]
+    # Both ids of the rejected round were answered before the next LLM call.
+    answered = {m.get("tool_call_id") for m in seen[2] if m.get("role") == "tool"}
+    assert {"call_s1", "call_s2"} <= answered
+
+
+def test_zero_investigation_abstention_is_rejected_then_corrected():
+    """An abstention that skips investigation entirely is refused; the model
+    must actually look before it may say "not enough evidence"."""
+    connector = StubConnector()
+    llm = ScriptedLLM([
+        _abstain_result(),                                    # 0 tools: rejected
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        _abstain_result(),                                    # 1 tool: accepted
+    ])
+    d = run(make_agent(llm, connector))
+
+    assert d.status == "completed"
+    assert d.result.insufficient_evidence is True
+    assert connector.call_log == ["inspect"]
+
+
+def test_abstention_without_missing_evidence_is_rejected():
+    connector = StubConnector()
+    llm = ScriptedLLM([
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "payment",
+                                              "name": "payment-api-7b8c9"}),
+        _abstain_result(missing_evidence=[]),                 # rejected
+        _abstain_result(),                                    # accepted
+    ])
+    d = run(make_agent(llm, connector))
+
+    assert d.status == "completed"
+    assert d.result.insufficient_evidence is True

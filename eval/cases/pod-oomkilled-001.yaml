@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-oomkilled-001
 case_version: "1"
-suite: phase1
 description: Container exceeds its memory limit and is repeatedly OOMKilled
 target:
   apiVersion: v1

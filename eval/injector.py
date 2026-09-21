@@ -1,7 +1,7 @@
 """Fault Injector: deterministic apply / wait / cleanup (design §23.3)."""
 
+import json
 import time
-from urllib.parse import parse_qs, urlparse
 
 import httpx
 from typing import Optional
@@ -24,11 +24,18 @@ class Injector:
         self._kubeconfig = kubeconfig
 
     def apply(self, case: Case) -> None:
+        # Preflight strictly precedes injection: it creates no resources, so a
+        # failing preflight leaves the cluster untouched (a fixture_failed case
+        # must not leak its namespace into later cases).
+        self._run_preflight(case)
         try:
             for manifest in case.setup_manifests:
                 run_kubectl(["apply", "-f", str(manifest)], kubeconfig=self._kubeconfig)
         except KubectlError as exc:
-            raise InjectorError(f"inject failed for {case.id}: {exc}") from exc
+            raise InjectorError(f"inject failed for case {case.id}: {exc}") from exc
+
+    def _run_preflight(self, case: Case) -> None:
+        """Checks that must pass before any resource exists (no side effects)."""
         for pre in case.preflight:
             pre_type = pre.get("type")
             if pre_type == "namespace_empty":
@@ -38,7 +45,8 @@ class Injector:
                 )
                 if out.strip():
                     raise InjectorError(
-                        f"namespace {case.target.namespace} not empty before case {case.id}: {out.strip()}"
+                        f"namespace {case.target.namespace} not empty before case {case.id}: "
+                        f"{out.strip()}"
                     )
             elif pre_type == "registry_tag_absent":
                 # IMAGE_NOT_FOUND can only be claimed when the registry is
@@ -50,9 +58,20 @@ class Injector:
                 raise InjectorError(f"unknown preflight type {pre_type!r}")
 
     def wait_ready(self, case: Case) -> bool:
-        """Poll the target until ready_when holds; returns success."""
+        """Poll the target until ready_when holds; returns success.
+
+        `event_message_contains` is the cluster-side counterpart of an HTTP
+        preflight: it only succeeds once the target's *Events* carry the expected
+        failure semantics, so a fixture is not marked ready when the cluster
+        failed for an unrelated reason (DNS, TLS, network timeout, ...).
+        """
         deadline = time.monotonic() + case.ready_when.timeout_seconds
         while time.monotonic() < deadline:
+            if case.ready_when.type == "event_message_contains":
+                if self._events_contain(case):
+                    return True
+                time.sleep(2)
+                continue
             try:
                 obj = get_object(case.target.kind, case.target.namespace,
                                  case.target.name, kubeconfig=self._kubeconfig)
@@ -62,6 +81,29 @@ class Injector:
             if self._ready_holds(case.ready_when.type, got, case.ready_when.value):
                 return True
             time.sleep(2)
+        return False
+
+    def _events_contain(self, case: Case) -> bool:
+        """True when an Event for the target matches the reason/message filter.
+
+        ready_when.path holds an optional event reason filter, ready_when.value
+        the required message substring.
+        """
+        args = ["get", "events"]
+        if case.target.namespace:
+            args += ["-n", case.target.namespace]
+        args += ["--field-selector", f"involvedObject.name={case.target.name}", "-o", "json"]
+        try:
+            payload = json.loads(run_kubectl(args, kubeconfig=self._kubeconfig) or "{}")
+        except Exception:  # noqa: BLE001 - transient errors mean "not ready yet"
+            return False
+        reason = (case.ready_when.path or "").strip()
+        needle = str(case.ready_when.value or "")
+        for item in payload.get("items") or []:
+            if reason and str(item.get("reason", "")) != reason:
+                continue
+            if needle and needle in str(item.get("message", "")):
+                return True
         return False
 
     @staticmethod
@@ -151,7 +193,21 @@ def check_registry_tag_absent(image: str, timeout: int = 15) -> None:
                              timeout=timeout, trust_env=False)
     except httpx.HTTPError as exc:
         raise InjectorError(f"registry {registry} unreachable: {exc}") from exc
-    if resp.status_code != 404:
-        raise InjectorError(
-            f"registry {registry} answered HTTP {resp.status_code} for "
-            f"{repository}:{reference}; cannot guarantee IMAGE_NOT_FOUND")
+    if resp.status_code == 404:
+        # A bare 404 is not enough: the registry API distinguishes NAME_UNKNOWN
+        # (repository absent) from MANIFEST_UNKNOWN (tag absent). Only the latter
+        # matches the IMAGE_NOT_FOUND ground truth.
+        code = ""
+        try:
+            errors = (resp.json() or {}).get("errors") or []
+            code = str((errors[0] or {}).get("code", "")) if errors else ""
+        except (ValueError, AttributeError, TypeError):
+            code = ""
+        if code and code != "MANIFEST_UNKNOWN":
+            raise InjectorError(
+                f"registry {registry} answered 404/{code} for {repository}:{reference}; "
+                "only MANIFEST_UNKNOWN can guarantee IMAGE_NOT_FOUND")
+        return
+    raise InjectorError(
+        f"registry {registry} answered HTTP {resp.status_code} for "
+        f"{repository}:{reference}; cannot guarantee IMAGE_NOT_FOUND")

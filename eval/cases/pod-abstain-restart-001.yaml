@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-abstain-restart-001
 case_version: "1"
-suite: phase1
 description: Pod restarted once with no diagnosable signal; agent must abstain (insufficient evidence)
 target:
   apiVersion: v1

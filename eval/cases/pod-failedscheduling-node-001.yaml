@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-failedscheduling-node-001
 case_version: "2"
-suite: phase1
 description: No node matches the pod's nodeSelector (FailedScheduling is the symptom)
 target:
   apiVersion: v1

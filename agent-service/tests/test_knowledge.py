@@ -152,6 +152,7 @@ def test_incident_search_used_by_agent():
             return ScriptedLLM.tool_response("submit_result", {
                 "symptom": "s", "root_cause_code": "", "insufficient_evidence": True,
                 "evidence": [], "root_cause": "", "confidence": "low", "recommendations": [],
+                "missing_evidence": ["no live evidence collected"],
                 "historical_cases": [{"retrieval_id": rid, "used_for": "hypothesis"}],
             })
 
@@ -159,6 +160,8 @@ def test_incident_search_used_by_agent():
         ScriptedLLM.tool_response("search_incidents", {
             "symptoms": ["CrashLoopBackOff", "OOMKilled"],
             "root_cause_candidates": ["CONTAINER_OOMKILLED"]}),
+        # Retrieval is not real-time evidence: an abstention still needs one real tool.
+        ScriptedLLM.tool_response("inspect", {"kind": "Pod", "namespace": "n", "name": "p"}),
     ])
     req = DiagnosisRequest(trigger=Trigger.manual,
                            resource=ResourceRef(kind="Pod", namespace="n", name="p", uid="u"),

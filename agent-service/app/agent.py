@@ -52,6 +52,12 @@ _TOOL_SCOPE: dict[str, tuple[Optional[str], str, str]] = {
     "query_logs": (None, "namespace", "name"),
 }
 
+FINALIZATION_ONE_TOOL = (
+    "Terminal-only round: exactly one tool call (submit_result) is allowed. "
+    "Multiple calls are rejected as a policy violation; retry with a single "
+    "submit_result built from the evidence already gathered."
+)
+
 FINALIZATION_ONLY_SUBMIT = (
     "Investigation budgets are exhausted: only submit_result is available now. "
     "Submit your conclusion from the evidence already gathered, or a valid "
@@ -337,9 +343,20 @@ class Agent:
                     assistant_msg["tool_calls"] = [self._tool_call_payload(tc) for tc in calls]
                 messages.append(assistant_msg)
 
-                # Every tool_call_id must be answered (strict providers reject a
-                # dangling id). Only submit_result is acted on; anything else the
-                # provider invented gets a terminal-only notice.
+                # Terminal-only is also single-tool-only: a round that returns
+                # more than one call (including two submit_result calls) is
+                # rejected as a whole, with every tool_call_id answered, so a
+                # strict provider never sees a dangling id.
+                if len(calls) > 1:
+                    for tc in calls:
+                        messages.append({"role": "tool", "tool_call_id": tc.id,
+                                         "content": FINALIZATION_ONE_TOOL})
+                    if trace is not None:
+                        trace.emit("agent.finalization_multi_tool_rejected",
+                                   "agent_planning",
+                                   {"tools": [tc.function.name for tc in calls]})
+                    continue
+
                 submit_tc = None
                 for tc in calls:
                     if tc.function.name == "submit_result":
@@ -607,6 +624,7 @@ class Agent:
                 if tool_err is None:
                     tool_results.append({
                         "tool": name,
+                        "tool_call_id": tc.id,
                         "args": args,
                         "output": output,
                         "kind": ("retrieval" if name in ("search_knowledge",

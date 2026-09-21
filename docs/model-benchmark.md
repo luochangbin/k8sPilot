@@ -9,7 +9,14 @@
 - 保留 Headlamp → Agent Service → 只读 Connector 链路；保留实时证据优先、知识仅辅助、证据不足可弃答的边界。
 - 不做模型路由、自动修复、多集群、多租户、本地 GPU 性能评测。
 
-## 2. 评分口径 v3（scorer_version = "3"）
+## 2. 评分口径
+
+> **当前口径是 `scorer_version = "5"`**（见 `eval/scorer.py`）。本节的其余内容记录的是
+> 2026-09-15 那次**历史 baseline（`scorer_version = "3"`）**的口径与结论，二者**不可直接比较**：
+> v4 增加了 `contains` 证据算子，v5 让 `contains` 与 `equals` 的算子语义对称。
+> 旧报告要参与比较，必须用同一个 scorer 从原始结果重算（`eval compare` 也会拒绝跨版本 delta）。
+
+### 2.1 历史 baseline 口径 v3（scorer_version = "3"）
 
 结果分类保留 `fixture_failed / system_failed / schema_failed / diagnosis_correct / diagnosis_incorrect`，并明确：
 

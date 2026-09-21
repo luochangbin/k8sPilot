@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-healthy-001
 case_version: "1"
-suite: phase1
 description: Pod is running and healthy; agent must report HEALTHY, not invent a fault
 target:
   apiVersion: v1

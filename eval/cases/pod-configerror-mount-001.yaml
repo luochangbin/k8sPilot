@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: pod-configerror-mount-001
 case_version: "2"
-suite: phase1
 description: Volume references a ConfigMap that does not exist (FailedMount is the symptom)
 target:
   apiVersion: v1

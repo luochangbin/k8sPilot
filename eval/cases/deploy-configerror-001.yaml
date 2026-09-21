@@ -1,7 +1,6 @@
 schema_version: eval.k8spilot.io/v1alpha1
 id: deploy-configerror-001
 case_version: "1"
-suite: phase1
 description: Deployment pods cannot start because envFrom references a missing ConfigMap; the cause is only visible after inspecting the child Pod (Deployment -> ReplicaSet -> Pod)
 target:
   apiVersion: apps/v1
