@@ -62,18 +62,26 @@
 ```powershell
 # 1) 启动 Agent，启用 profile 选择并使用 profiles 文件
 #    .env: LLM_PROFILES_FILE=llm-profiles.yaml / ENABLE_MODEL_PROFILE_SELECTION=true
-#          COMMANDCODE_API_KEY=...
-# 2) 多模型评测
-python -m eval benchmark --suite phase1 --models reference,candidate-a,candidate-b `
-  --runs 3 --seed 42 --max-diagnoses 72 --agent-url http://localhost:8001 `
-  --trace-dir D:\AI\k8sPilot\eval-trace --reports-dir reports
+#          COMMANDCODE_API_KEY=... （聚合器 profile）
+#    Agent 默认端口 8001
+# 2) 多模型评测（冻结基线套件 cause-level-v1，每 Case 5 次；--models 给 profile 名）
+python -m eval benchmark --suite cause-level-v1 `
+  --models qwen3.7-plus,kimi-k2.6,glm-5.2 `
+  --runs 5 --seed 42 `
+  --agent-url http://127.0.0.1:8001 `
+  --trace-dir D:\AI\k8sPilot\eval-trace --reports-dir reports `
+  --enable-knowledge on --enable-incidents on `
+  --pace-seconds 15 --infra-retries 2
 ```
+
+- `cause-level-v1` 的每个条目都 pin 了 `id@version`（如 `pod-oomkilled-001@1`），可用 `--case` 只重跑个别 Case；该套件里 `pod-image-notfound-001@1` 需要 registry 出口，离线环境会按设计 `fixture_failed`。
+- 参照基线建议走 DeepSeek 直连（provider `deepseek`，模型 `deepseek-flash`，请求 ID 必须与响应回显一致，否则整批判为不可比）。
 
 - `benchmark_id`：批次唯一（时间戳 + 随机后缀），不只依赖秒级时间戳。
 - `attempt_id`：每 Case × Model × repetition 唯一；运行计划先写盘（`model-benchmark.plan.json`），含执行顺序与 seed。
 - 首版串行；在每个 Case/repetition 分块内以固定 seed 打乱模型顺序。
 - 每次尝试独立：注入 → 就绪 → 诊断 → 收集 → 清理。**清理失败立即停止后续注入**，防止污染结果。
-- 不自动重跑失败的诊断；LLM 请求级重试由客户端单层控制并有界。
+- 诊断本身不重跑；`--infra-retries N` 只重跑**传输类**失败（连接错误 / 429 / 5xx / 超时），重跑的是同一次 attempt 并在行内记录 `infra_retry_index` / `infra_retry_errors`（默认 0，即不重跑）。模型或 Agent 侧的失败（弃答、预算耗尽、schema 非法）永不重跑。LLM 请求级重试由客户端单层控制并有界。
 - `--max-diagnoses` 为硬上限，`--time-limit-seconds` 为批次时间上限；达限停止启动新尝试并保留 partial 报告与 `stop_reason`。
 - 失败尝试逐条记录，不以缺失行掩盖。
 - 旧 `run --model` 仅作**声明标签**，不证明实际模型；单模型选择用 `run --model-profile`。
@@ -88,6 +96,7 @@ python -m eval benchmark --suite phase1 --models reference,candidate-a,candidate
 - 端到端耗时（含注入/清理）与 LLM/Tool 耗时分别记录，不宣称求和等于墙钟时间。
 - 只在**相同 Case 集合**上比较，困难子集单独展示；样本少时标明数量与波动，不从差值断言稳定优胜。
 - `comparable` 由**实际证据**计算而非固定 True：要求每个产生结论的模型都有服务端确认的身份（`resolved_profile`、`requested_model_id`、`config_fingerprint`）且 `requested==response`；缺失身份、ID 不一致、provider/protocol 或知识开关跨尝试不一致时标记 `comparable=false` 并给出 `incomparable_reason`，不按请求标签假装可比。
+- 生效预算三元组 `(effective_max_tool_calls, effective_max_agent_rounds, max_finalization_attempts)` 必须逐 Case、跨模型一致。**无 Trace 的行**（fixture 未运行，或被 runner 的 Case 超时取消）没有生效预算证据，不参与该一致性判定（否则任何一次超时都会让整批形式上不可比）；**有 Trace 但预算字段缺失**仍按 `unknown != same` 判不可比。
 - 不生成主观加权总分或自动推荐；模型 ID/Provider 变化为比较维度，其他条件变化需显式标记，不静默并入同一排名。
 
 ## 6. 费用与失败解释
@@ -103,6 +112,8 @@ python -m eval benchmark --suite phase1 --models reference,candidate-a,candidate
 - Profile 解析与错误、每诊断隔离与 403/422（`agent-service` 50 tests）。
 - benchmark 计划/预算/失败记录（`eval/tests/test_benchmark.py`）。
 - 命令：`agent-service/.venv/Scripts/python.exe -m pytest -q`（53 passed）、`... -m pytest eval/tests -q`（28 passed）、`git diff --check` 通过。
+
+> 当前测试总数（2026-09-23）：`pytest agent-service/tests eval/tests -q` → **238 passed**（含基础设施重试、无 Trace 行的预算门禁、端口统一等新增回归）。
 
 ### 真实闭环（阶段 D，已完成）
 
@@ -161,6 +172,8 @@ python -m eval benchmark --suite phase1 --models reference,candidate-a,candidate
 
 ### 8 模型全量对比（2026-09-15）
 
+> **已被"当前基线（2026-09-23）"取代**：本节数字来自 `scorer_version=3` + 当时的 Connector（缺 `Deployment→RS→Pod` 关系链）+ 各 profile `max_tokens=2048`，与当前口径**不可比**，仅作历史记录保留。
+
 - 条件：phase1 全 12 Case × 8 模型 × 1 次（seed=42，`scorer_version=3`），96 次尝试；报告 `reports/benchmark-20260915T134254-a3bdbb/`（`model-benchmark.json` / `attempts.jsonl` / `model-benchmark.md`；9 模型原始件保留为 `model-benchmark.all-models.*`）。模型：`deepseek/deepseek-v4.1-flash`（参考）、`MiniMaxAI/MiniMax-M2.5`、`moonshotai/Kimi-K2.5`、`moonshotai/Kimi-K2.6`、`zai-org/GLM-5.1`、`zai-org/GLM-5.2`、`Qwen/Qwen3.6-Plus`、`Qwen/Qwen3.7-Plus`。
 - **排除模型**：`MiniMaxAI/MiniMax-M2.7` 在本 key 下经 `/chat/completions` 返回 `400 No available providers match the 'only' filter…`，12/12 失败且无响应身份，已排除（报告记录 `excluded_models` / `exclusion_reason`）。排除后 `comparable=true`。
 - 结果（概率以 % 表示）：`GLM-5.2` 端到端正确率 100.0%、根因准确率 100.0%、弃答召回 100.0%；`reference`/`Kimi-K2.6`/`GLM-5.1`/`Qwen3.6-Plus` 根因准确率 90.9%；`MiniMax-M2.5`/`Qwen3.7-Plus` 81.8%；`Kimi-K2.5` 63.6%。完整质量与成本表见 `README.md`「模型对比」。
@@ -169,6 +182,15 @@ python -m eval benchmark --suite phase1 --models reference,candidate-a,candidate
 - 各指标定义、分母口径与失败分类见 `README.md`「模型对比 › 指标说明」。
 - 证据质量新增两项**可追溯性代理口径**：`evidence_extra_rate`（不匹配必需约束但可追溯的去重证据条目占比，即“额外有效证据率”）与 `evidence_unsupported_rate`（缺 source/value 的去重证据条目占比，即“无支撑证据率”）；二者不重叠，且**不代表内容真假**（本阶段不做真实性/虚构判定）。成本项新增 `llm_duration_ms` p50/p95 聚合。
 - 上述证据细分与 LLM 延迟已写入评分/报告代码；本次报告由存量 `diagnoses.db` 原始结果按同一口径重算（`rescore_note`），原始 9 模型件保留为 `model-benchmark.all-models.*`。
+
+### 当前基线（2026-09-23，scorer v5）
+
+口径：`cause-level-v1`（15 个 pinned Case；`pod-image-notfound-001@1` 需 registry 出口、本环境不可运行 → 实际 14）、`scorer_version=5`、根因词表 v2、预算 `(max_tool_calls=12, max_agent_rounds=12, max_finalization_attempts=2)`、`--infra-retries 2`、Agent 端口 8001。
+
+- **参照基线**（DeepSeek 直连 `deepseek-flash` × 5 次，70 次可运行）：正确率 **69/70 = 98.6%**、根因准确率 98.5%、错误根因 0.0%、弃答成功率 **100%（5/5）**、证据召回 71.1%、系统失败 **1.4%**（预算耗尽 1 / 180s 超时 0）、Token/正确 59,503、耗时 p50/p95 21.5s/79.5s。报告 `reports/benchmark-20260922T131652-74c541/`（单模型批次 `comparable=false` 属预期）。
+- **聚合器初筛**（7 模型 × 12 个共同 Case × 1 次，`stop_reason=time_limit_reached`）：`qwen3.7-plus` 12/12、`kimi-k2.6` 11/12、`qwen3.6-plus` 11/12、`glm-5.2` 10/12、`glm-5.1` 9/12、`minimax-m2.5` 8/12、`kimi-k2.5` 0/12（12 次里 11 次预算耗尽，淘汰）。报告 `reports/benchmark-20260922T151906-32759d/`。
+- **三候选决赛**（× 5 次，14 Case）：`qwen3.7-plus` 91.4%（系统失败 1.4%、弃答 0%）、`kimi-k2.6` 84.3%（8.6%、弃答 40%）、`glm-5.2` 82.9%（11.4%、弃答 0%、10 次 180s 超时）。三者均不满足"可作参照"（弃答 / 错误根因 / 超时），DeepSeek 直连是当前唯一全面达标者。报告 `reports/benchmark-20260922T205327-9dd69b/`。
+- **与 2026-09-15 的 8 模型对比不可直接比较**：那次运行于两个缺陷修复之前——(1) Connector 缺 `Deployment → ReplicaSet → Pod` 关系链，Deployment 类 Case 拿不到 Pod 证据（当时 0/5）；(2) 各 profile `max_tokens=2048` 会截断含 reasoning 的输出（`finish_reason=length`，每批约 69 次响应被截断）。修复后同一套件正确率 65.7% → 91.7%（仅修 Connector）→ 98.6%（再修 max_tokens）。完整质量/证据/成本表见 `README.md`「模型对比（2026-09-23）」。
 
 ### 尚未验证 / 风险
 
