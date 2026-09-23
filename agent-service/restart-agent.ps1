@@ -7,7 +7,7 @@
 # - LLM_* environment variables are cleared so agent-service/.env is used.
 # - Connector discovery is bounded with --request-timeout.
 #
-# Usage:  pwsh -File agent-service\restart-agent.ps1 [-Port 8000] [-ConnectorBaseUrl http://ip:8080]
+# Usage:  pwsh -File agent-service\restart-agent.ps1 [-Port 8001] [-ConnectorBaseUrl http://ip:8080]
 #
 # If the cluster API is unreachable, the connector Pod IP cannot be discovered;
 # pass -ConnectorBaseUrl to start anyway (e.g. the last known Pod IP). Discovery
@@ -26,12 +26,12 @@
 # this script finished in ~3s. Launch it detached and verify by polling instead:
 #   Start-Process pwsh -ArgumentList '-NoProfile','-File','<abs path>\restart-agent.ps1' -WindowStyle Hidden
 #   Get-Content <abs path>\agent-service\.agent.pid     # pid changed => restarted
-#   Invoke-RestMethod http://localhost:8000/healthz     # status = ok
+#   Invoke-RestMethod http://localhost:8001/healthz     # status = ok
 # The same rule applies to any long-running process started from a piped shell:
 # redirect to a file and poll a artifact, never wait on the pipe.
 
 param(
-    [int]$Port = 8000,
+    [int]$Port = 8001,
     [string]$ConnectorBaseUrl
 )
 
@@ -112,6 +112,10 @@ $a = Start-Process -FilePath $Python `
 Set-Content -Path $PidFile -Value $a.Id
 
 # 5. Health check, failing fast if the process died.
+# Probe 127.0.0.1, never `localhost`: uvicorn binds IPv4 (0.0.0.0) only, while
+# Windows resolves `localhost` to ::1 first and that refused IPv6 connect costs
+# ~2s on this machine, so `localhost` + `-TimeoutSec 1` can never observe a
+# healthy service and every restart would "time out" against a live agent.
 $healthy = $false
 for ($i = 0; $i -lt 30; $i++) {
     if ($a.HasExited) {
@@ -120,14 +124,23 @@ for ($i = 0; $i -lt 30; $i++) {
         throw "Agent exited during startup (ExitCode=$($a.ExitCode)); see $ErrLog"
     }
     try {
-        if ((Invoke-RestMethod "http://localhost:$Port/healthz" -TimeoutSec 1).status -eq 'ok') {
+        if ((Invoke-RestMethod "http://127.0.0.1:$Port/healthz" -TimeoutSec 2).status -eq 'ok') {
             $healthy = $true
             break
         }
     } catch { }
     Start-Sleep -Milliseconds 500
 }
-if (-not $healthy) { throw "Agent health check timed out on port $Port" }
+if (-not $healthy) {
+    # Surface why instead of only the timeout: the process may be alive but not
+    # serving, so print both logs before throwing.
+    Write-Output '=== agent.err.log (tail) ==='
+    Get-Content $ErrLog -Tail 50 -ErrorAction SilentlyContinue
+    Write-Output '=== agent.out.log (tail) ==='
+    Get-Content $OutLog -Tail 20 -ErrorAction SilentlyContinue
+    throw "Agent health check timed out on http://127.0.0.1:$Port/healthz " +
+          "(pid=$($a.Id) exited=$($a.HasExited)); see $ErrLog"
+}
 
 # 6. The listener must belong to the new process tree (venv spawns a child).
 $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop

@@ -18,7 +18,7 @@ Phase 2 不扩展生产诊断能力，而是把 Phase 1 的 Kubernetes-only Agen
    ```powershell
    set TRACE_DIR=D:\AI\k8sPilot\eval-reports\trace
    ```
-3. 保持 Agent Service 运行（默认 `http://localhost:8000`）。
+3. 保持 Agent Service 运行（默认 `http://localhost:8001`）。
 
 ## 冻结基线（`phase1`）
 

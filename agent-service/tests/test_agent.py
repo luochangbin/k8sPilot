@@ -1562,6 +1562,10 @@ def test_failure_traces_carry_the_budget_snapshot(tmp_path):
 
     def run_failure(label, connector, script, configure=None):
         agent = make_agent(ScriptedLLM(script), connector)
+        # Pin the finalization budget: the failure_reason asserted below is the
+        # investigation-budget path, so the test must not inherit whatever
+        # AGENT_FINALIZATION_ATTEMPTS the ambient agent-service/.env sets.
+        agent.cfg.max_finalization_attempts = 1
         agent.cfg.trace_dir = str(tmp_path / label)
         if configure:
             configure(agent)

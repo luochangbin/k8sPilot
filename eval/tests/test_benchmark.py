@@ -58,12 +58,14 @@ class FakeRunner:
         self.verdict = verdict
         self.trace_dir = Path(trace_dir) if trace_dir else None
         self.include_response = include_response
+        self.infra_retries = []
 
     def _k8s_version(self):
         return "fake"
 
     def run_case_attempt(self, case, run_id, attempt_index, *, enable_knowledge=None,
-                         enable_incidents=None, model_profile=None):
+                         enable_incidents=None, model_profile=None, infra_retries=0):
+        self.infra_retries.append(infra_retries)
         self.calls.append((case.id, model_profile))
         row = _row(case.id, verdict=self.verdict)
         row["diagnosis_id"] = f"diag_{len(self.calls)}"
@@ -172,7 +174,7 @@ def test_benchmark_records_failed_attempts(tmp_path):
 # ---- comparability evidence (review round 2) ----
 
 def _bench_row(case_id, model, *, identity_ok=True, fingerprint="fp1", params=None,
-               verdict="diagnosis_correct", attempts=1, error=None):
+               verdict="diagnosis_correct", attempts=1, error=None, **kw):
     row = {
         "case_id": case_id, "case_version": "1", "model_profile": model,
         "attempt_id": f"{case_id}__{model}", "verdict": verdict,
@@ -188,7 +190,9 @@ def _bench_row(case_id, model, *, identity_ok=True, fingerprint="fp1", params=No
         "llm_request_attempts": attempts, "provider": "commandcode",
         "protocol": "openai_chat_completions", "resolved_profile": model,
         "effective_knowledge_flags": {"knowledge": None, "incidents": None},
+        "trace_present": True,
     }
+    row.update(kw)
     return row
 
 
@@ -319,3 +323,49 @@ def test_single_profile_run_paces_between_attempts(monkeypatch, tmp_path):
     runner.run(suite_path, case_ids, 2, "paced", pace_seconds=15)
     # 2 cases x 2 runs = 4 attempts -> 3 sleeps.
     assert clock.sleeps == [15, 15, 15]
+
+
+def test_untraced_attempt_does_not_block_budget_comparability():
+    """A no-trace attempt (fixture never ran, or the runner cancelled it on the
+    case timeout) carries no evidence of its effective budget; it must not make
+    the batch incomparable, while still counting as an attempt."""
+    budgets = {"effective_max_tool_calls": 12, "effective_max_agent_rounds": 12,
+               "max_finalization_attempts": 2}
+    rows = [
+        _bench_row("c1", "m1", **budgets), _bench_row("c1", "m2", **budgets),
+        _bench_row("c2", "m2", **budgets),
+        # cancelled attempt: no trace, no budget, no identity
+        _bench_row("c2", "m1", verdict="system_failed", identity_ok=None, attempts=0,
+                   fingerprint=None, error="diagnosis timed out after 180s",
+                   trace_present=False, effective_max_tool_calls=None,
+                   effective_max_agent_rounds=None, max_finalization_attempts=None),
+    ]
+    rep = _build(rows, ["m1", "m2"])
+    assert "effective_budget_unknown" not in (rep["incomparable_reason"] or "")
+    assert rep["comparable"] is True, rep["incomparable_reason"]
+    assert rep["per_model"]["m1"]["attempt_count"] == 2
+
+
+def test_traced_row_with_missing_budget_stays_incomparable():
+    """Unknown != same still holds for a row that WAS traced: if its budget
+    fields are missing, comparability is refused."""
+    rows = [
+        _bench_row("c1", "m1", effective_max_tool_calls=12, effective_max_agent_rounds=12,
+                   max_finalization_attempts=2),
+        _bench_row("c1", "m2"),  # traced, but no budget recorded
+    ]
+    rep = _build(rows, ["m1", "m2"])
+    assert rep["comparable"] is False
+    assert "effective_budget_unknown" in rep["incomparable_reason"]
+
+
+def test_benchmark_forwards_and_records_infra_retries(tmp_path):
+    """`--infra-retries` reaches the attempt seam and is frozen in the batch
+    metadata, so a retry policy cannot silently differ between runs."""
+    runner = FakeRunner()
+    benchmark_id, run_dir = _run(tmp_path, runner=runner, infra_retries=2)
+    assert runner.infra_retries == [2] * 8
+    meta = json.loads((run_dir / "model-benchmark.plan.json").read_text(encoding="utf-8"))
+    assert meta["benchmark_id"] == benchmark_id
+    report = json.loads((run_dir / "model-benchmark.json").read_text(encoding="utf-8"))
+    assert report["meta"]["infra_retries"] == 2

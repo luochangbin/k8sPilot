@@ -222,7 +222,7 @@ W = range_minutes，夹取到 [1, 30]（默认 30；沿用既有上限，不提�
 - `eval`：**39 passed**（无回归）。
 - 插件：`tsc --noEmit` 0 错误、`eslint --max-warnings 0` 0 问题、`npm run build` 成功并安装到 `%APPDATA%\Headlamp\Config\plugins\ai-diagnosis-plugin\`、`vitest run` **37 passed**（viewer 身份/回退/修订订阅、API URL 构建与错误映射、Center 筛选与未读入口、徽标未读入口、详情页步骤）。
 
-真实 API 联调（Agent 8000 + 既有 Trace，viewer 随机 UUID）：
+真实 API 联调（Agent 8001 + 既有 Trace，viewer 随机 UUID）：
 
 ```text
 sessions=5  (全部 trigger=alert, alert=PodCrashLooping/open|closed, code=CONFIG_ERROR|CRASH_LOOP_BACKOFF, unread=True)

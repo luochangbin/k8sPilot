@@ -91,7 +91,7 @@ func (s Summary) RetryableStatus() int {
 // NewForwarder builds a Forwarder with a bounded HTTP client.
 func NewForwarder(agentURL string, timeout time.Duration, inspector Inspector, eventLimit int) *Forwarder {
 	if agentURL == "" {
-		agentURL = "http://localhost:8000"
+		agentURL = "http://localhost:8001"
 	}
 	if timeout <= 0 {
 		timeout = 10 * time.Second

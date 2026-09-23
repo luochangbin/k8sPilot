@@ -39,7 +39,7 @@ Alertmanager ──(webhook)──▶ Connector POST /alerts
 - `POST /alerts` 接收 Alertmanager webhook v4；逐条处理，单条失败不影响其余。
 - `ResolveTarget` 仅接受可诊断类型（Pod/Deployment/Node/PVC）：显式 `kind` 标签或 `pod/deployment/node/persistentvolumeclaim` 标签推断；缺 namespace / 不支持类型 → unresolved。
 - 轻量快照后转发 Agent；`fingerprint` 缺失时按 labels 派生稳定值。
-- 配置：`AGENT_URL`（默认 `http://localhost:8000`）、`ALERT_FORWARD_TIMEOUT_SECONDS`（默认 10）、`ALERT_SNAPSHOT_EVENT_LIMIT`（默认 10）、`ALERT_WEBHOOK_TOKEN`（共享 Bearer Token，空则关闭鉴权）、`ALERT_MAX_BATCH`（单批告警上限，默认 100）。
+- 配置：`AGENT_URL`（默认 `http://localhost:8001`）、`ALERT_FORWARD_TIMEOUT_SECONDS`（默认 10）、`ALERT_SNAPSHOT_EVENT_LIMIT`（默认 10）、`ALERT_WEBHOOK_TOKEN`（共享 Bearer Token，空则关闭鉴权）、`ALERT_MAX_BATCH`（单批告警上限，默认 100）。
 - 安全：`POST /alerts` 可触发付费诊断，因此
   - 配置 `ALERT_WEBHOOK_TOKEN` 后要求 `Authorization: Bearer <token>`（常量时间比较），Token 经 Secret 注入（`deploy/*.yaml` 中 `secretKeyRef`，可选键）；
   - 单批告警数超过 `ALERT_MAX_BATCH` 返回 413；
@@ -92,7 +92,7 @@ Alertmanager ──(webhook)──▶ Connector POST /alerts
 - `agent-service`：`tests/test_alerts.py` **10 项**（重复 firing 合并、resolved+refire、unresolved、并发单诊断、resolved 不受限流/无需 resource、迟到 resolved、重复 unresolved 去重、持久化、风暴限流 429、缺 context 400）→ 全量 **63 passed**。
 - `connector`：`internal/alerts/alerts_test.go` 5 项 + `internal/server/alerts_test.go` 5 项（失败→502、429 透传、缺 Token→401、超批量→413、`HTTPStatus`/`RetryableStatus`）→ `go build ./...` / `go test ./...` / `go vet ./...` 全过。
 
-真机闭环（本地 Connector 8081 → Agent 8000 → 集群，`aiops-eval/eval-crashloop`，模拟 Alertmanager 推送）：
+真机闭环（本地 Connector 8081 → Agent 8001 → 集群，`aiops-eval/eval-crashloop`，模拟 Alertmanager 推送）：
 
 | 步骤 | 结果 |
 |---|---|

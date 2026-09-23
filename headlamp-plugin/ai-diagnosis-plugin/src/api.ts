@@ -11,7 +11,7 @@ import type {
 
 export const AGENT_BASE_URL =
   (window as unknown as { __K8S_PILOT_AGENT_BASE__?: string }).__K8S_PILOT_AGENT_BASE__ ??
-  'http://localhost:8000';
+  'http://localhost:8001';
 
 export class ApiError extends Error {
   status: number;

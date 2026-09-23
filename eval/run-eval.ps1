@@ -32,7 +32,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot  = Split-Path -Parent $PSScriptRoot
 $AgentDir  = Join-Path $RepoRoot "agent-service"
 $Python    = Join-Path $AgentDir ".venv\Scripts\python.exe"
-$AgentPort = 8000
+$AgentPort = 8001
 $AgentPid  = $null
 
 function Write-Step([string]$msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }

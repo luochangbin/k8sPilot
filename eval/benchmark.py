@@ -122,7 +122,7 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
                   model_label: str = "", runner: Any = None,
                   enable_knowledge: Optional[bool] = None,
                   enable_incidents: Optional[bool] = None,
-                  pace_seconds: float = 0.0) -> tuple[str, Path]:
+                  pace_seconds: float = 0.0, infra_retries: int = 0) -> tuple[str, Path]:
     suite_raw = load_suite(suite_path)
     cases_dir = Path(__file__).resolve().parent / "cases"
     loaded = [resolve_and_load_case_entry(cases_dir, cid) for cid in case_ids]
@@ -162,6 +162,7 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
         "time_limit_seconds": time_limit_seconds,
         "enable_knowledge": enable_knowledge,
         "enable_incidents": enable_incidents,
+        "infra_retries": infra_retries,
         "declared_model_label": model_label or None,
         # Declared Case budgets (the per-attempt *effective* values are recorded
         # on each row from the trace root span).
@@ -195,7 +196,7 @@ def run_benchmark(*, suite_path: Path, case_ids: list[str], models: list[str],
         row = runner.run_case_attempt(
             case, benchmark_id, attempt["execution_order"],
             enable_knowledge=enable_knowledge, enable_incidents=enable_incidents,
-            model_profile=attempt["model_profile"],
+            model_profile=attempt["model_profile"], infra_retries=infra_retries,
         )
         t1 = _now_iso()
         trace = _read_trace(trace_dir, row.get("diagnosis_id"))
@@ -328,6 +329,15 @@ def build_benchmark_report(benchmark_id: str, meta: dict[str, Any],
         }
         for model in covered:
             for r in model_rows_of(model):
+                # An attempt that produced no trace -- the fixture never ran
+                # (fixture_failed) or the runner cancelled it after the case
+                # timeout -- carries no evidence about its effective budget.
+                # Such a row says nothing about the budget a model ran under, so
+                # it must not make the whole batch incomparable; it still counts
+                # as an attempt everywhere else. A *traced* row whose budget
+                # fields are missing is still flagged (unknown != same).
+                if not r.get("trace_present"):
+                    continue
                 signatures[model].setdefault(case_key(r), set()).add(budget_signature(r))
         within_model = sorted({
             key for sig in signatures.values() for key, values in sig.items()

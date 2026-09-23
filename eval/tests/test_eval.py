@@ -1260,7 +1260,8 @@ def test_benchmark_flags_budget_variation_across_models():
     base = {**_row(_case(), verdict="diagnosis_correct"),
             "identity_ok": True, "llm_request_attempts": 1, "provider": "test",
             "protocol": "openai_chat_completions", "config_fingerprint": "fp-1",
-            "effective_parameters": {}, "case_id": "c-1", "case_version": "1"}
+            "effective_parameters": {}, "case_id": "c-1", "case_version": "1",
+            "trace_present": True}
 
     def run(models_budgets):
         rows = []
@@ -1390,7 +1391,8 @@ def test_benchmark_detects_budget_drift_within_one_model():
             "identity_ok": True, "llm_request_attempts": 1, "provider": "test",
             "protocol": "openai_chat_completions", "config_fingerprint": "fp-1",
             "effective_parameters": {}, "case_id": "c-1", "case_version": "1",
-            "effective_max_agent_rounds": 12, "max_finalization_attempts": 1}
+            "effective_max_agent_rounds": 12, "max_finalization_attempts": 1,
+            "trace_present": True}
 
     def rows_for(budgets_by_model):
         out = []
@@ -1589,3 +1591,77 @@ def test_compare_ignores_fixture_failed_rows_for_budget_consistency(tmp_path):
 
     result = compare_runs(make_run("b-fx"), make_run("c-fx"))
     assert result["comparable"] is True, result["incomparable_reason"]
+
+
+def test_infra_failure_classification_is_transport_only():
+    """Provider/transport failures are re-runnable; model failures are not."""
+    from eval.runner import is_infra_failure
+
+    assert is_infra_failure({"verdict": "system_failed", "trace_failure_layer": "llm_transport"})
+    assert is_infra_failure({"verdict": "system_failed",
+                             "error": "LLM request failed after 5 attempts: Connection error."})
+    assert is_infra_failure({"verdict": "system_failed",
+                             "error": "LLM request failed with status 429"})
+    assert is_infra_failure({"verdict": "system_failed",
+                             "error": "diagnosis timed out after 180s"})
+    # A model/agent failure must never be retried away.
+    assert not is_infra_failure({"verdict": "system_failed", "error": "agent crashed"})
+    assert not is_infra_failure({"verdict": "system_failed",
+                                 "error": "invalid diagnostic result schema"})
+    assert not is_infra_failure({"verdict": "wrong_root_cause", "error": "Connection error"})
+    assert not is_infra_failure({"verdict": "abstained"})
+    assert not is_infra_failure({"verdict": "diagnosis_correct"})
+
+
+def test_infra_retry_reruns_the_same_attempt_and_records_it(monkeypatch, tmp_path):
+    """A transport failure is re-run (same attempt index), and the discarded
+    errors stay visible on the row instead of being silently dropped."""
+    runner = _make_runner(tmp_path)
+    scripted = [
+        {"verdict": "system_failed", "error": "Connection error"},
+        {"verdict": "system_failed", "error": "LLM request failed with status 503"},
+        {"verdict": "diagnosis_correct", "error": None},
+    ]
+    seen = []
+
+    def fake_run_case(case, run_id, attempt_index, **kwargs):
+        seen.append(attempt_index)
+        return dict(scripted[len(seen) - 1])
+
+    monkeypatch.setattr(runner, "_run_case", fake_run_case)
+    row = runner.run_case_attempt(_case(), "run-1", 4, infra_retries=3)
+    assert seen == [4, 4, 4], "retry must re-run the same attempt, not a new one"
+    assert row["verdict"] == "diagnosis_correct"
+    assert row["infra_retry_index"] == 2
+    assert len(row["infra_retry_errors"]) == 2
+
+
+def test_infra_retry_is_bounded_and_off_by_default(monkeypatch, tmp_path):
+    runner = _make_runner(tmp_path)
+    calls = []
+
+    def fake_run_case(case, run_id, attempt_index, **kwargs):
+        calls.append(attempt_index)
+        return {"verdict": "system_failed", "error": "Connection error"}
+
+    monkeypatch.setattr(runner, "_run_case", fake_run_case)
+    row = runner.run_case_attempt(_case(), "run-1", 0, infra_retries=2)
+    assert len(calls) == 3, "1 original + 2 retries, then stop"
+    assert row["infra_retry_index"] == 2 and row["verdict"] == "system_failed"
+
+    calls.clear()
+    row = runner.run_case_attempt(_case(), "run-1", 1)
+    assert len(calls) == 1 and "infra_retry_index" not in row
+
+
+def test_infra_retry_never_masks_a_model_failure(monkeypatch, tmp_path):
+    runner = _make_runner(tmp_path)
+    calls = []
+
+    def fake_run_case(case, run_id, attempt_index, **kwargs):
+        calls.append(attempt_index)
+        return {"verdict": "wrong_root_cause", "error": None}
+
+    monkeypatch.setattr(runner, "_run_case", fake_run_case)
+    row = runner.run_case_attempt(_case(), "run-1", 0, infra_retries=3)
+    assert len(calls) == 1 and "infra_retry_index" not in row

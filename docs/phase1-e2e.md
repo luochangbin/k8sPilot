@@ -40,7 +40,7 @@ kubectl -n k8spilot rollout status deploy/agent-service
   headlamp server --plugins-dir <abs>/ai-diagnosis-plugin/dist
   ```
 - 或用桌面版 Headlamp，将插件目录加入插件路径。
-- 确保浏览器可访问 `http://localhost:8000`（Agent Service）；如否，按插件 README 设置 `window.__K8S_PILOT_AGENT_BASE__`。
+- 确保浏览器可访问 `http://localhost:8001`（Agent Service）；如否，按插件 README 设置 `window.__K8S_PILOT_AGENT_BASE__`。
 
 ## 2. 故障注入
 

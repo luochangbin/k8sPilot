@@ -48,7 +48,7 @@ func Load() *Config {
 		DataSourceTimeout: time.Duration(getInt("DATASOURCE_TIMEOUT_SECONDS", 10)) * time.Second,
 		MetricsMaxSeries:  getInt("METRICS_MAX_SERIES", 5),
 
-		AgentURL:                getStr("AGENT_URL", "http://localhost:8000"),
+		AgentURL:                getStr("AGENT_URL", "http://localhost:8001"),
 		AlertForwardTimeout:     time.Duration(getInt("ALERT_FORWARD_TIMEOUT_SECONDS", 10)) * time.Second,
 		AlertSnapshotEventLimit: getInt("ALERT_SNAPSHOT_EVENT_LIMIT", 10),
 		AlertWebhookToken:       os.Getenv("ALERT_WEBHOOK_TOKEN"),

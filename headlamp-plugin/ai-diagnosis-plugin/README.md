@@ -11,12 +11,12 @@ Headlamp 插件（Phase 1）：在 **Pod 详情页**提供「智能诊断」入�
 
 ## 配置 Agent Service 地址
 
-默认 `http://localhost:8000`。覆盖方式（二选一）：
+默认 `http://localhost:8001`。覆盖方式（二选一）：
 
 1. 运行时注入：在 Headlamp 加载插件前设置全局变量
    ```html
    <script>
-     window.__K8S_PILOT_AGENT_BASE__ = 'http://agent-service.k8spilot.svc.cluster.local:8000';
+     window.__K8S_PILOT_AGENT_BASE__ = 'http://agent-service.k8spilot.svc.cluster.local:8001';
    </script>
    ```
 2. 编辑 `src/DiagnosisSection.tsx` 顶部的 `AGENT_BASE_URL` 常量后重新构建。
@@ -45,5 +45,5 @@ npm run build    # 产物输出到 dist/
 
 ## 注意
 
-- 浏览器直连 Agent Service，需要其可达（本机 `localhost:8000` 或集群内 Headlamp 同网络可达的 Service）。
+- 浏览器直连 Agent Service，需要其可达（本机 `localhost:8001` 或集群内 Headlamp 同网络可达的 Service）。
 - Phase 1 不提供聊天、追问、告警入口或修复操作。

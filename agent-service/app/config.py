@@ -25,7 +25,7 @@ class Config:
     """Phase 1 agent service configuration."""
 
     def __init__(self) -> None:
-        self.agent_port: int = int(_env("AGENT_PORT", "8000"))
+        self.agent_port: int = int(_env("AGENT_PORT", "8001"))
         self.connector_base_url: str = _env(
             "CONNECTOR_BASE_URL",
             "http://ai-agent-connector.k8spilot.svc.cluster.local:8080",

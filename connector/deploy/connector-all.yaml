@@ -88,7 +88,7 @@ spec:
             # Phase 5 alert webhook: the Agent Service address reachable from
             # this pod (this deployment: the Windows host on the VMnet8 bridge).
             - name: AGENT_URL
-              value: http://192.168.81.1:8000
+              value: http://192.168.81.1:8001
             - name: ALERT_FORWARD_TIMEOUT_SECONDS
               value: "10"
             - name: ALERT_SNAPSHOT_EVENT_LIMIT

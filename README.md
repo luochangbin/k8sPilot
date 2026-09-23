@@ -136,7 +136,7 @@ python -m venv .venv
 确认服务可用：
 
 ```powershell
-Invoke-RestMethod http://localhost:8000/healthz
+Invoke-RestMethod http://localhost:8001/healthz
 ```
 
 ### 3. 构建并安装 Headlamp 插件

@@ -52,7 +52,7 @@ $env:DIAGNOSIS_DB = "D:\AI\k8sPilot\eval-trace\diagnoses.db"
 .\start-agent.ps1
 ```
 
-验证历史：跑一次诊断后 `curl http://localhost:8000/api/v1/diagnoses`，重启 agent 后再次 `curl` 应仍能查到。
+验证历史：跑一次诊断后 `curl http://localhost:8001/api/v1/diagnoses`，重启 agent 后再次 `curl` 应仍能查到。
 
 ## 验收项
 

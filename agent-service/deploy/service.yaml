@@ -8,5 +8,5 @@ spec:
     app: agent-service
   ports:
     - name: http
-      port: 8000
+      port: 8001
       targetPort: http

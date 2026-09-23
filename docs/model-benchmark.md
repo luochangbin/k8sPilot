@@ -65,7 +65,7 @@
 #          COMMANDCODE_API_KEY=...
 # 2) 多模型评测
 python -m eval benchmark --suite phase1 --models reference,candidate-a,candidate-b `
-  --runs 3 --seed 42 --max-diagnoses 72 --agent-url http://localhost:8000 `
+  --runs 3 --seed 42 --max-diagnoses 72 --agent-url http://localhost:8001 `
   --trace-dir D:\AI\k8sPilot\eval-trace --reports-dir reports
 ```
 

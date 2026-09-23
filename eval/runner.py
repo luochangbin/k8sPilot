@@ -22,6 +22,23 @@ from .scorer import (ROOT_CAUSE_VOCABULARY_VERSION, SCORER_VERSION, score_case,
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# Provider/transport failures are not model-quality outcomes: they are re-run at
+# the attempt level (and counted on the row, never hidden) instead of scored.
+_INFRA_ERROR_MARKERS = (
+    "connection error", "connection reset", "temporarily unavailable", "rate limit",
+    "429", "502", "503", "504", "bad gateway", "timed out", "timeout",
+)
+
+
+def is_infra_failure(row: dict[str, Any]) -> bool:
+    """True when a failed attempt failed for provider/transport reasons."""
+    if row.get("verdict") != "system_failed":
+        return False
+    if row.get("trace_failure_layer") == "llm_transport":
+        return True
+    error = (row.get("error") or "").lower()
+    return any(marker in error for marker in _INFRA_ERROR_MARKERS)
+
 
 class RunnerError(Exception):
     pass
@@ -42,7 +59,7 @@ class Runner:
             profile: str, *, enable_knowledge: Optional[bool] = None,
             enable_incidents: Optional[bool] = None,
             model_profile: Optional[str] = None,
-            pace_seconds: float = 0.0) -> tuple[str, Path]:
+            pace_seconds: float = 0.0, infra_retries: int = 0) -> tuple[str, Path]:
         suite_raw = load_suite(suite_path)
         loaded = [resolve_and_load_case_entry(self._cases_dir(), cid) for cid in case_ids]
         cases = [case for case, _path in loaded]
@@ -84,9 +101,11 @@ class Runner:
                 if pace_seconds > 0 and attempt_index > 0:
                     time.sleep(pace_seconds)
                 attempt_index += 1
-                row = self._run_case(case, run_id, attempt, enable_knowledge=enable_knowledge,
-                                     enable_incidents=enable_incidents,
-                                     model_profile=model_profile)
+                row = self.run_case_attempt(case, run_id, attempt,
+                                            enable_knowledge=enable_knowledge,
+                                            enable_incidents=enable_incidents,
+                                            model_profile=model_profile,
+                                            infra_retries=infra_retries)
                 rows.append(row)
                 write_jsonl(run_dir / "case-results.jsonl", [row])
 
@@ -101,13 +120,32 @@ class Runner:
     def run_case_attempt(self, case: Case, run_id: str, attempt_index: int, *,
                          enable_knowledge: Optional[bool] = None,
                          enable_incidents: Optional[bool] = None,
-                         model_profile: Optional[str] = None) -> dict[str, Any]:
+                         model_profile: Optional[str] = None,
+                         infra_retries: int = 0) -> dict[str, Any]:
         """Run one inject→diagnose→collect→cleanup attempt (public seam for the
-        multi-model benchmark orchestration)."""
-        return self._run_case(case, run_id, attempt_index,
-                              enable_knowledge=enable_knowledge,
-                              enable_incidents=enable_incidents,
-                              model_profile=model_profile)
+        multi-model benchmark orchestration).
+
+        A transport/provider failure says nothing about model quality, so such an
+        attempt is re-run up to `infra_retries` times; the number of retries and
+        the discarded errors stay on the row (never hidden).
+        """
+        row = self._run_case(case, run_id, attempt_index,
+                             enable_knowledge=enable_knowledge,
+                             enable_incidents=enable_incidents,
+                             model_profile=model_profile)
+        retries_used = 0
+        discarded: list[str] = []
+        while retries_used < infra_retries and is_infra_failure(row):
+            discarded.append((row.get("error") or "")[:200])
+            retries_used += 1
+            row = self._run_case(case, run_id, attempt_index,
+                                 enable_knowledge=enable_knowledge,
+                                 enable_incidents=enable_incidents,
+                                 model_profile=model_profile)
+        if retries_used:
+            row["infra_retry_index"] = retries_used
+            row["infra_retry_errors"] = discarded
+        return row
 
     def _load_case(self, case_id: str) -> Case:
         # `case-id` or `case-id@version` (pinned historical definition); the
