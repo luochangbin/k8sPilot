@@ -1,0 +1,9 @@
+source_type: product_doc
+title: Example product user guide
+product: example-product
+versions:
+  - "1.0"
+resource_kinds:
+  - Pod
+  - PVC
+source_uri: https://docs.example.invalid/product/guide.pdf

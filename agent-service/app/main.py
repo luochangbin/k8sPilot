@@ -92,17 +92,25 @@ def create_app(cfg: Optional[Config] = None, store: Optional[SessionStore] = Non
         return ExecutionContext(llm=OpenAILLM.from_resolved(resolved), metadata=_metadata(resolved))
 
     knowledge = None
-    if cfg.knowledge_db_path:
-        from .knowledge.service import KnowledgeService
-        from .knowledge.store import KnowledgeStore
-        knowledge = KnowledgeService(KnowledgeStore(cfg.knowledge_db_path))
+    knowledge_backend = "(disabled)"
+    try:
+        from .knowledge.factory import create_knowledge_store
+        knowledge_store = create_knowledge_store(cfg)
+        if knowledge_store is not None:
+            from .knowledge.service import KnowledgeService
+            knowledge = KnowledgeService(knowledge_store)
+            knowledge_backend = type(knowledge_store).__name__
+    except Exception as exc:
+        # Do not include exception text: database errors may include credentials.
+        logging.getLogger("k8spilot.agent").error(
+            "knowledge retrieval disabled during initialization (%s)", type(exc).__name__)
     agent = Agent(cfg, connector, llm, knowledge=knowledge)
 
     logger = logging.getLogger("k8spilot.agent")
     logger.info("agent service started: connector=%s llm_base=%s model=%s db=%s knowledge=%s",
                 cfg.connector_base_url, cfg.llm_base_url, cfg.llm_model,
                 cfg.db_path or "(in-memory)",
-                cfg.knowledge_db_path or "(disabled)")
+                knowledge_backend)
 
     app = FastAPI(title="k8sPilot Agent Service", version="0.1.0")
     app.add_middleware(

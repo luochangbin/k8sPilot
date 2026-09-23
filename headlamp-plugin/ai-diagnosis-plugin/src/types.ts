@@ -40,6 +40,8 @@ export interface KnowledgeReference {
     source_uri?: string;
     section?: string;
     version?: string;
+    page_start?: number | null;
+    page_end?: number | null;
   };
 }
 

@@ -27,6 +27,7 @@ connector/connector-*
 headlamp/
 
 # Runtime data
+/PostgreSQL/
 *.pid
 *.log
 *.db

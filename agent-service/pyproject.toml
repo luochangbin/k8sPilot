@@ -17,6 +17,12 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+knowledge = [
+    "psycopg[binary]>=3.2",
+    "pgvector>=0.3",
+    "fastembed>=0.8.1",
+    "pypdf>=5.0",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

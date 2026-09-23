@@ -36,7 +36,12 @@ class KnowledgeService:
             doc = h["document"]
             content = h["chunk_content"]
             if len(content) > MAX_CONTENT_CHARS:
-                content = content[:MAX_CONTENT_CHARS] + "..."
+                content = content[:MAX_CONTENT_CHARS - 3] + "..."
+            remaining = MAX_TOTAL_CHARS - total
+            if len(content) > remaining:
+                if remaining <= 0:
+                    break
+                content = content[:remaining - 3] + "..." if remaining > 3 else content[:remaining]
             total += len(content)
             refs.append(KnowledgeReference(
                 retrieval_id=f"kb_{uuid.uuid4().hex[:10]}",
@@ -49,7 +54,9 @@ class KnowledgeService:
                     "source_uri": doc.source_uri,
                     "section": h["section"],
                     "version": ",".join(doc.versions) if doc.versions else "",
-                    "updated_at": doc.valid_until or doc.valid_from or "",
+                    "updated_at": doc.updated_at or "",
+                    "page_start": h.get("page_start"),
+                    "page_end": h.get("page_end"),
                 },
             ))
         return refs

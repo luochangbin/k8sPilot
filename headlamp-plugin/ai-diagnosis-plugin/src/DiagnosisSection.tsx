@@ -43,6 +43,8 @@ interface Citation {
   section?: string;
   version?: string;
   updated_at?: string;
+  page_start?: number | null;
+  page_end?: number | null;
 }
 
 interface KnowledgeReference {
@@ -345,6 +347,16 @@ function KnowledgeRefBlock({ references }: { references: KnowledgeReference[] })
       {references.map(ref => {
         const citation = ref.citation ?? {};
         const used = usedForLabel(ref.used_for);
+        const validPageRange =
+          Number.isInteger(citation.page_start) &&
+          Number.isInteger(citation.page_end) &&
+          (citation.page_start ?? 0) > 0 &&
+          (citation.page_end ?? 0) >= (citation.page_start ?? 0);
+        const pageLabel = validPageRange
+          ? citation.page_start === citation.page_end
+            ? `第 ${citation.page_start} 页`
+            : `第 ${citation.page_start}–${citation.page_end} 页`
+          : undefined;
         return (
           <Box key={ref.retrieval_id} sx={{ mb: 1.5 }}>
             <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
@@ -361,6 +373,7 @@ function KnowledgeRefBlock({ references }: { references: KnowledgeReference[] })
                 citation.document_id,
                 citation.section && `§ ${citation.section}`,
                 citation.version && `v${citation.version}`,
+                pageLabel,
               ]
                 .filter(Boolean)
                 .join(' · ')}

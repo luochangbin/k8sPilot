@@ -41,6 +41,9 @@ class KnowledgeDocument:
     acl_tags: list[str] = field(default_factory=list)
     status: str = DOC_ACTIVE
     content: str = ""           # normalized body used for chunking
+    updated_at: Optional[str] = None
+    source_format: Optional[str] = None
+    resource_kinds: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -50,6 +53,8 @@ class KnowledgeChunk:
     section: str
     content: str
     document: Optional[KnowledgeDocument] = None  # denormalized convenience
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
 
 
 @dataclass
@@ -66,6 +71,7 @@ class IncidentCase:
     remediation_summary: str = ""
     verification: dict[str, Any] = field(default_factory=dict)
     evidence_summary: str = ""   # bounded text of the original evidence
+    checksum: str = ""
 
 
 @dataclass

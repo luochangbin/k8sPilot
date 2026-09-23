@@ -65,6 +65,18 @@ class Config:
         # Phase 4 knowledge & experience: SQLite file path; empty disables
         # the retrieval module (agent then runs Phase 3-only).
         self.knowledge_db_path: str = _env("KNOWLEDGE_DB", "").strip()
+        # Optional semantic knowledge store. PostgreSQL takes precedence over
+        # the legacy SQLite keyword-only store when both are configured.
+        self.knowledge_database_url: str = _env("KNOWLEDGE_DATABASE_URL", "").strip()
+        self.knowledge_database_schema: str = _env(
+            "KNOWLEDGE_DATABASE_SCHEMA", "k8spilot_knowledge"
+        ).strip()
+        self.knowledge_embedding_model: str = _env(
+            "KNOWLEDGE_EMBEDDING_MODEL", "minishlab/potion-multilingual-128M"
+        ).strip()
+        self.knowledge_embedding_cache_dir: str = _resolve_repo_path(
+            _env("KNOWLEDGE_EMBEDDING_CACHE_DIR", "PostgreSQL/models").strip()
+        )
 
         # Model profiles (handoff §4). The YAML file path is resolved relative
         # to the agent-service root when not absolute; empty keeps the legacy
@@ -94,3 +106,13 @@ def _resolve_agent_path(value: str) -> str:
         return ""
     path = Path(value)
     return str(path if path.is_absolute() else _AGENT_SERVICE_ROOT / path)
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_repo_path(value: str) -> str:
+    if not value:
+        return ""
+    path = Path(value)
+    return str(path if path.is_absolute() else _REPO_ROOT / path)

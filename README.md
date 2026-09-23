@@ -32,7 +32,7 @@ k8sPilot 是一个面向单集群 Kubernetes 的 **Headlamp 智能诊断插件**
 - **Headlamp 原生入口**：无需切换到独立控制台，在资源详情页发起诊断并查看结果。
 - **Agentic 故障调查**：Agent 根据已获得的证据动态选择 `inspect`、`relations`、`events`、`logs`、`query_metrics` 和 `query_logs`，而不是一次性抓取全部集群数据。
 - **多源实时证据**：查询 Kubernetes 状态、关系、Events 和 Pod Logs；Prometheus 指标已验证可用。Loki 查询仍有已知问题，数据源不可用时诊断会记录降级原因。
-- **知识与经验检索**：检索模块代码已存在，但当前没有维护中的知识库，默认不启用；导入边界见下文。
+- **知识与经验检索**：可导入 Markdown 运维手册、文本型 PDF 用户指南和已审核 Incident；本地 Embedding 配合 PostgreSQL/pgvector 与词项检索，实时集群证据仍优先。
 - **可解释诊断结果**：Root Cause 必须由实时 Evidence 支撑；证据不足时明确返回缺失证据，不编造唯一结论。
 - **可重复能力评测**：通过故障注入、Trace、自动评分、冻结基线和候选版本对照，量化准确率、证据质量、成本与延迟。
 - **最小权限边界**：Agent 不持有 kubeconfig；集群访问集中在使用只读 ServiceAccount 的 Connector 中。
@@ -44,7 +44,7 @@ flowchart LR
     User["SRE / Developer"] --> Headlamp["Headlamp<br/>AI Diagnosis Plugin"]
     Headlamp --> Agent["Agent Service<br/>Session + Tool Calling"]
     Agent <--> LLM["OpenAI-compatible LLM"]
-    Agent -. "可选，默认关闭" .-> Knowledge["Knowledge & Incident Store"]
+    Agent -. "配置后按需调用" .-> Knowledge["PostgreSQL + pgvector<br/>Knowledge & Incident Store"]
     Agent --> Connector["Read-only Connector"]
     Connector --> K8s["Kubernetes API"]
     Connector --> Prometheus["Prometheus"]
@@ -60,7 +60,7 @@ Headlamp 中点击「智能诊断」
   → Agent 形成初始假设
   → 按需调用 Connector 获取实时事实
   → 用新证据验证、修正或放弃假设
-  → 如显式配置知识库，再检索历史 Incident / Runbook
+  → 知识库配置后，Agent 可按需检索历史 Incident / Runbook / 用户指南
   → 输出 Root Cause、Evidence、Confidence 与 Recommendations
 ```
 
@@ -175,26 +175,19 @@ kubectl -n observability get pods
 
 Connector 会通过 `/capabilities` 暴露可用数据源。Prometheus 或 Loki 不可用时，诊断仍会继续，并在结果中记录降级原因。详细部署与验收方式见 [Phase 3 部署文档](docs/phase3-deploy.md)。
 
-### 知识库（当前默认关闭）
+### 知识库（可选）
 
-当前没有维护中的真实运维知识库，`KNOWLEDGE_DB` 默认未设置。检索代码已存在，但当前不属于开箱即用的诊断能力。
-
-摄取命令只读取 `agent-service/app/knowledge/seeds.py` 中的 `SEED_DOCUMENTS` 和 `SEED_INCIDENTS`。它不扫描任意 Markdown/PDF 目录，也不导入 JSON、YAML、网页或向量数据库。要试用，需先把资料映射到 `KnowledgeDocument` / `IncidentCase` 种子数据，再生成 SQLite FTS5 数据库：
+配置 `KNOWLEDGE_DATABASE_URL` 后，Agent 默认会把 `search_knowledge` 和 `search_incidents` 作为可用工具，是否调用由每次诊断按需决定；请求可显式关闭知识检索。文本经本地 Embedding 后写入 PostgreSQL/pgvector，文档片段使用向量与词项 RRF 检索，历史 Incident 仅做词项检索且只有 `verified` 记录可返回。旧 `KNOWLEDGE_DB` SQLite seeds 路径仍保留，但文件导入使用 PostgreSQL，不会自动迁移旧库。
 
 ```powershell
-# 从仓库根目录运行
+# 从仓库根目录执行；首次启用前先按知识库指南准备 PostgreSQL 与 .env
 cd agent-service
-$knowledgeDb = Join-Path (Resolve-Path ..) 'data\knowledge.db'
-.\.venv\Scripts\python -m app.knowledge.ingest --db $knowledgeDb --show
+if (-not (Test-Path .venv\Scripts\python.exe)) { python -m venv .venv }
+.\.venv\Scripts\python.exe -m pip install -e ".[knowledge]"
+.\.venv\Scripts\python.exe -m app.knowledge.ingest --import ..\docs\knowledge-examples
 ```
 
-然后在 `agent-service/.env` 中设置知识库绝对路径并重启 Agent Service：
-
-```dotenv
-KNOWLEDGE_DB=D:\AI\k8sPilot\data\knowledge.db
-```
-
-只有当前版本 `KnowledgeStore` 创建且表结构兼容的数据库才能复用。字段映射与验收方式见[知识增强文档](docs/phase4-knowledge.md#导入已有知识库)。
+导入支持带 YAML frontmatter 的 `.md`、带同名 `.metadata.yaml` sidecar 的文本型 `.pdf`，以及以 Markdown 表示的 Incident。示例目录只含演示资料，不包含组织内部的真实知识。PDF 扫描件不做 OCR；知识片段会进入现有诊断提示并可能发给配置的外部 LLM。数据库、模型缓存和安全边界、增量导入与删除方法见[知识库与检索指南](docs/knowledge-retrieval.md)。
 
 ## 可重复的 Agent 评测
 
@@ -246,7 +239,7 @@ python -m eval compare --baseline $baselineRun --candidate $candidateRun --repor
 | Phase 1 | Headlamp 单集群人工诊断 | 功能完成；故障注入与端到端验收步骤见文档 |
 | Phase 2 | Agent 评测、基线与回归闭环 | Eval Harness 与原因级评测已实现；本页列出当前模型评测 |
 | Phase 3 | Prometheus/Loki、持久化历史、多资源入口 | 代码已实现；Prometheus 查询已验证，Loki 查询链路仍有问题 |
-| Phase 4 | Runbook 与历史 Incident 检索 | 检索代码已存在，但默认关闭；尚无维护中的真实知识库 |
+| Phase 4 | Runbook 与历史 Incident 检索 | PostgreSQL/pgvector、Markdown/PDF 导入和本地 Embedding 已实现；是否启用取决于运行配置，真实知识需用户导入 |
 | Phase 5 | Alertmanager 告警自动诊断 | Webhook 到诊断链路已用模拟告警验收；Alertmanager 实际部署接入待完成 |
 | Phase 6 | 只读修复计划与人工审批 | 规划中，当前无实现 |
 | Phase 7 | Policy + Executor 受控执行与审计 | 规划中，当前无实现 |
@@ -289,7 +282,8 @@ npm run build
 | [Phase 1 E2E](docs/phase1-e2e.md) | 部署、故障注入和 Headlamp 端到端验收 |
 | [Phase 2 Eval](docs/phase2-eval.md) | Case、Runner、评分、基线与候选版本对照 |
 | [Phase 3 Deploy](docs/phase3-deploy.md) | Prometheus、Loki、持久化历史与降级验证 |
-| [Phase 4 Knowledge](docs/phase4-knowledge.md) | 知识摄取、历史 Incident、引用约束与消融实验（**暂不实现：缺乏知识库**） |
+| [Phase 4 Knowledge](docs/phase4-knowledge.md) | Phase 4 设计、评测和历史记录 |
+| [知识库与检索指南](docs/knowledge-retrieval.md) | PostgreSQL、本地 Embedding、MD/PDF/Incident 导入、增量更新与边界 |
 | [Phase 5 Alerts](docs/phase5-alerts.md) | 告警 Webhook、fingerprint 去重与生命周期、自动诊断 |
 | [Diagnosis Center](docs/diagnosis-center.md) | 诊断中心：会话列表、未读、Timeline、未解析告警 |
 | [Model Benchmark](docs/model-benchmark.md) | 评分口径 v5、模型 Profile、多模型评测与报告 |
