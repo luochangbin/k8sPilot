@@ -10,7 +10,7 @@
 
 [诊断效果](#诊断效果) · [核心能力](#核心能力) · [工作方式](#工作方式) · [快速开始](#快速开始) · [Agent 评测](#可重复的-agent-评测) · [模型对比](#模型对比2026-09-23) · [路线图](#路线图) · [项目文档](#项目文档)
 
-k8sPilot 是一个面向单集群 Kubernetes 的 **Headlamp 智能诊断插件**。运维人员可以直接在 Pod、Deployment、Node 或 PVC 详情页点击「智能诊断」，由 LLM Agent 按需查询资源状态、关联关系、Events、日志与指标，最终返回结构化的症状、调查过程、Root Cause、Evidence、置信度和修复建议。
+k8sPilot 是一个面向单集群 Kubernetes 的 **Headlamp 智能诊断插件**。运维人员可在 Pod、Deployment、Node 或 PVC 详情页发起诊断；Agent 按需调查集群事实，返回根因、证据、置信度和建议。
 
 它不是一个只会解释报错的聊天机器人：**Connector 负责获取事实，Agent 负责形成并验证假设，Eval Harness 负责证明诊断能力是否真的提升。**
 
@@ -31,8 +31,8 @@ k8sPilot 是一个面向单集群 Kubernetes 的 **Headlamp 智能诊断插件**
 
 - **Headlamp 原生入口**：无需切换到独立控制台，在资源详情页发起诊断并查看结果。
 - **Agentic 故障调查**：Agent 根据已获得的证据动态选择 `inspect`、`relations`、`events`、`logs`、`query_metrics` 和 `query_logs`，而不是一次性抓取全部集群数据。
-- **多源实时证据**：融合 Kubernetes API、Pod Logs、Prometheus 指标和 Loki 日志；外部数据源不可用时自动降级到 Kubernetes-only 路径。
-- **知识与经验增强（Phase 4，暂不实现：缺乏知识库）**：Runbook / 已知问题 / 已验证历史 Incident 的检索机制与消融实验代码已保留，但当前没有真实运维知识库，默认关闭（`KNOWLEDGE_DB` 未设置即不启用）。
+- **多源实时证据**：查询 Kubernetes 状态、关系、Events 和 Pod Logs；Prometheus 指标已验证可用。Loki 查询仍有已知问题，数据源不可用时诊断会记录降级原因。
+- **知识与经验检索**：检索模块代码已存在，但当前没有维护中的知识库，默认不启用；导入边界见下文。
 - **可解释诊断结果**：Root Cause 必须由实时 Evidence 支撑；证据不足时明确返回缺失证据，不编造唯一结论。
 - **可重复能力评测**：通过故障注入、Trace、自动评分、冻结基线和候选版本对照，量化准确率、证据质量、成本与延迟。
 - **最小权限边界**：Agent 不持有 kubeconfig；集群访问集中在使用只读 ServiceAccount 的 Connector 中。
@@ -44,7 +44,7 @@ flowchart LR
     User["SRE / Developer"] --> Headlamp["Headlamp<br/>AI Diagnosis Plugin"]
     Headlamp --> Agent["Agent Service<br/>Session + Tool Calling"]
     Agent <--> LLM["OpenAI-compatible LLM"]
-    Agent --> Knowledge["Knowledge & Incident Store<br/>(Phase 4 · 暂不实现)"]
+    Agent -. "可选，默认关闭" .-> Knowledge["Knowledge & Incident Store"]
     Agent --> Connector["Read-only Connector"]
     Connector --> K8s["Kubernetes API"]
     Connector --> Prometheus["Prometheus"]
@@ -60,7 +60,7 @@ Headlamp 中点击「智能诊断」
   → Agent 形成初始假设
   → 按需调用 Connector 获取实时事实
   → 用新证据验证、修正或放弃假设
-  → 必要时检索历史 Incident / Runbook（Phase 4，暂不实现：缺乏知识库）
+  → 如显式配置知识库，再检索历史 Incident / Runbook
   → 输出 Root Cause、Evidence、Confidence 与 Recommendations
 ```
 
@@ -84,21 +84,24 @@ RAG 和历史案例只能辅助调查，不能替代当前集群中的实时证�
 
 ## 快速开始
 
-下面以 **kind + Windows PowerShell 7** 为例，先跑通 Kubernetes-only 诊断闭环。Prometheus、Loki 和知识库均为可选增强能力。
+下面以 **kind + Windows PowerShell 7** 为例运行本地 Agent、集群内只读 Connector 和 Headlamp 插件。
+
+每个编号步骤都从仓库根目录开始；Connector 的 `port-forward` 和 Agent Service 会占用终端，请分别保持运行，后续步骤另开终端执行。
 
 ### 前置条件
 
-- 一个可访问的 Kubernetes 集群，以及可用的 `kubectl`
-- Docker；使用 kind 时还需要 `kind`
+- Docker、`kubectl` 和 kind
 - Python 3.11+
 - Node.js 与 npm
 - 一个支持 Function Calling 的 OpenAI-compatible LLM 接口
 
-### 1. 构建并部署只读 Connector
+### 1. 创建集群并部署只读 Connector
 
 ```powershell
-docker build -t ai-agent-connector:phase3 ./connector
-kind load docker-image ai-agent-connector:phase3 --name <cluster-name>
+# 如尚无 kind 集群，先创建；已有同名集群时跳过
+kind create cluster --name k8spilot
+docker build -t connector:phase5 ./connector
+kind load docker-image connector:phase5 --name k8spilot
 kubectl apply -f connector/deploy/connector-all.yaml
 kubectl -n k8spilot rollout status deployment/ai-agent-connector
 ```
@@ -111,11 +114,12 @@ kubectl -n k8spilot port-forward service/ai-agent-connector 8080:8080
 
 ### 2. 配置并启动 Agent Service
 
-Agent Service 只读取自身目录下的 `.env`。复制模板后填写配置；`.env` 已被 `.gitignore` 排除，不要提交 API Key。
+Agent Service 只读取自身目录下的 `.env`。复制模板并填写有效的 LLM 地址、模型和 API Key；不要提交 `.env`。
 
 ```powershell
 cd agent-service
 Copy-Item .env.template .env
+notepad .env
 ```
 
 ```dotenv
@@ -142,6 +146,7 @@ Invoke-RestMethod http://localhost:8001/healthz
 ### 3. 构建并安装 Headlamp 插件
 
 ```powershell
+# 在仓库根目录运行
 cd headlamp-plugin/ai-diagnosis-plugin
 npm install
 npm run build
@@ -151,7 +156,7 @@ New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
 Copy-Item -Path '.\dist\*' -Destination $pluginDir -Recurse -Force
 ```
 
-确认 `%APPDATA%\Headlamp\Config\plugins\ai-diagnosis-plugin\main.js` 已生成，然后重启 Headlamp。进入 Pod、Deployment、Node 或 PVC 详情页，点击「智能诊断」。插件是由 Headlamp 直接加载的前端构建产物，不需要单独运行插件服务；Agent Service 仍需保持运行。
+确认 `%APPDATA%\Headlamp\Config\plugins\ai-diagnosis-plugin\main.js` 已生成，然后重启 Headlamp。进入 Pod、Deployment、Node 或 PVC 详情页，点击「智能诊断」。插件是 Headlamp 直接加载的前端构建产物，不需要单独运行插件服务；Agent Service 仍需保持运行。若要使用告警自动诊断，先把 `connector-all.yaml` 中的 `AGENT_URL` 改为 Connector Pod 可访问的 Agent 地址。
 
 只有开发插件、需要监听源码变化和热加载时才执行：
 
@@ -170,25 +175,26 @@ kubectl -n observability get pods
 
 Connector 会通过 `/capabilities` 暴露可用数据源。Prometheus 或 Loki 不可用时，诊断仍会继续，并在结果中记录降级原因。详细部署与验收方式见 [Phase 3 部署文档](docs/phase3-deploy.md)。
 
-### 5. 导入并启用知识库（可选 · Phase 4 暂不实现）
+### 知识库（当前默认关闭）
 
-> **状态：暂不实现（缺乏知识库）**。当前没有可用的真实运维知识库，`KNOWLEDGE_DB` 默认未设置、知识检索模块默认关闭。代码与消融实验保留在 `agent-service/app/knowledge` 与 `eval` 中作机制记录，以下步骤仅在未来接入知识库时使用，不属当前交付范围。
+当前没有维护中的真实运维知识库，`KNOWLEDGE_DB` 默认未设置。检索代码已存在，但当前不属于开箱即用的诊断能力。
 
-Phase 4 使用本地 SQLite FTS5 保存 Runbook、Known Issue 和人工验证过的 Incident。当前支持复用由 k8sPilot 生成的兼容 `knowledge.db`，或先把已有资料映射为 `KnowledgeDocument` / `IncidentCase` 种子数据，再执行内置摄取命令：
+摄取命令只读取 `agent-service/app/knowledge/seeds.py` 中的 `SEED_DOCUMENTS` 和 `SEED_INCIDENTS`。它不扫描任意 Markdown/PDF 目录，也不导入 JSON、YAML、网页或向量数据库。要试用，需先把资料映射到 `KnowledgeDocument` / `IncidentCase` 种子数据，再生成 SQLite FTS5 数据库：
 
 ```powershell
+# 从仓库根目录运行
 cd agent-service
 $knowledgeDb = Join-Path (Resolve-Path ..) 'data\knowledge.db'
 .\.venv\Scripts\python -m app.knowledge.ingest --db $knowledgeDb --show
 ```
 
-随后在 `agent-service/.env` 中设置知识库的绝对路径并重启 Agent Service：
+然后在 `agent-service/.env` 中设置知识库绝对路径并重启 Agent Service：
 
 ```dotenv
 KNOWLEDGE_DB=D:\AI\k8sPilot\data\knowledge.db
 ```
 
-当前 CLI 不会直接扫描任意 Markdown 目录，也不接受 JSON、YAML、网页或第三方数据库。已有资料的字段映射、种子示例、重复导入规则和验收步骤见 [知识增强文档](docs/phase4-knowledge.md#导入已有知识库)。
+只有当前版本 `KnowledgeStore` 创建且表结构兼容的数据库才能复用。字段映射与验收方式见[知识增强文档](docs/phase4-knowledge.md#导入已有知识库)。
 
 ## 可重复的 Agent 评测
 
@@ -203,27 +209,33 @@ Versioned Cases
   → Report / Baseline Comparison
 ```
 
-当前 Phase 2 冻结基线包含 12 个故障 Case、每个 Case 运行 5 次，覆盖 OOMKilled、ImagePullBackOff、FailedScheduling、CrashLoop、ConfigError、PVC 挂载失败、健康状态与主动弃答场景：
+当前原因级评测使用版本化 `cause-level-v1` Case 与 scorer v5。评测会在目标集群注入并清理测试资源；请先确认 `kubectl` 指向专用测试集群，且 Agent 的 `TRACE_DIR` 与 Runner 使用同一路径。
 
-| 指标 | 基线结果 |
-|---|---:|
-| Root Cause Accuracy | 63.3% |
-| Schema Valid Rate | 100% |
-| 有效运行 | 12 Cases × 5 Runs |
-
-运行评测：
+先在一个终端启动 Agent（从仓库根目录执行；另一个终端运行评测）：
 
 ```powershell
-python -m eval run --suite phase1 --runs 5 --profile candidate --trace-dir ./eval-trace
+$traceDir = Join-Path (Resolve-Path .) 'eval-trace'
+cd agent-service
+.\start-agent.ps1 -TraceDir $traceDir
+```
+
+再从仓库根目录运行 Runner：
+
+```powershell
+$traceDir = Join-Path (Resolve-Path .) 'eval-trace'
+python -m eval run --suite cause-level-v1 --runs 5 --profile baseline --trace-dir $traceDir
 ```
 
 对比基线与候选版本：
 
 ```powershell
-python -m eval compare --baseline <baseline-run> --candidate <candidate-run> --reports-dir reports
+# 输入先前两次 eval run 输出的实际 run ID（目录位于 reports/ 下）
+$baselineRun = Read-Host 'Baseline run ID'
+$candidateRun = Read-Host 'Candidate run ID'
+python -m eval compare --baseline $baselineRun --candidate $candidateRun --reports-dir reports
 ```
 
-评测同时记录 Root Cause Accuracy、Wrong Root Cause Rate、Abstention Accuracy、Evidence Recall、Tool Calls、Token Usage 和 Diagnosis Duration。完整说明见 [Phase 2 评测文档](docs/phase2-eval.md)。
+`--profile` 用于标记本次运行（例如 `baseline` 或 `candidate`），模型配置由 Agent Service 提供。评测记录根因、错误根因、弃答、证据、Token、工具调用和耗时；旧 `phase1` 冻结基线与当前原因级套件、评分器版本不可直接比较。命令及比较方式见[评测说明](docs/phase2-eval.md)。
 
 ## 路线图
 
@@ -231,13 +243,13 @@ python -m eval compare --baseline <baseline-run> --candidate <candidate-run> --r
 
 | Phase | 能力 | 状态 |
 |---|---|---|
-| Phase 1 | Headlamp 单集群人工诊断 | ✅ 已完成 |
-| Phase 2 | Agent 评测、基线与回归闭环 | ✅ 已完成 |
-| Phase 3 | Prometheus/Loki、持久化历史、多资源入口 | ✅ 已实现 |
-| Phase 4 | Runbook RAG 与历史 Incident 检索 | ⏸️ 暂不实现（缺乏知识库） |
-| Phase 5 | Alertmanager 告警自动诊断 | ✅ 已实现（Alertmanager 部署待接入） |
-| Phase 6 | 只读修复计划与人工审批 | 🗺️ 规划中 |
-| Phase 7 | Policy + Executor 受控执行与审计 | 🗺️ 规划中 |
+| Phase 1 | Headlamp 单集群人工诊断 | 功能完成；故障注入与端到端验收步骤见文档 |
+| Phase 2 | Agent 评测、基线与回归闭环 | Eval Harness 与原因级评测已实现；本页列出当前模型评测 |
+| Phase 3 | Prometheus/Loki、持久化历史、多资源入口 | 代码已实现；Prometheus 查询已验证，Loki 查询链路仍有问题 |
+| Phase 4 | Runbook 与历史 Incident 检索 | 检索代码已存在，但默认关闭；尚无维护中的真实知识库 |
+| Phase 5 | Alertmanager 告警自动诊断 | Webhook 到诊断链路已用模拟告警验收；Alertmanager 实际部署接入待完成 |
+| Phase 6 | 只读修复计划与人工审批 | 规划中，当前无实现 |
+| Phase 7 | Policy + Executor 受控执行与审计 | 规划中，当前无实现 |
 
 ## 安全与设计边界
 
@@ -286,19 +298,18 @@ npm run build
 
 运行口径：套件 `cause-level-v1`（15 个 pinned Case；`pod-image-notfound-001@1` 需要 registry 出口，本环境不可运行 → 实际 14 个）；`scorer_version=5`、根因词表 v2（原因级）；Agent 端口 8001；预算 `max_tool_calls=12 / max_agent_rounds=12 / max_finalization_attempts=2`；`--infra-retries 2`（连接类失败自动重跑同一次 attempt，行内记录 `infra_retry_*`）；`--pace-seconds` 节流。参照基线走 **DeepSeek 直连**（provider `deepseek`，模型 `deepseek-flash`），其余模型走 **CommandCode Provider API**（OpenAI-compatible `/chat/completions`）。
 
-原始报告（逐 Case / 逐次尝试明细在同目录 `attempts.jsonl`，可比性判定见 `model-benchmark.json` 的 `comparable`）：
+本地评测产物（不会纳入仓库）：逐 Case / 逐次尝试明细保存在各批次目录的 `attempts.jsonl`，可比性判定见本地 `model-benchmark.json` 的 `comparable` 字段。以下批次目录仅供本地查阅，README 已内嵌汇总数据，不依赖这些目录展示结果：
 
-| 批次 | 规模 | 目录 |
-|---|---|---|
-| 参照基线 | 14 Case × 5 次 = 70 次可运行 | `reports/benchmark-20260922T131652-74c541/` |
-| 聚合器初筛 | 7 模型 × 12 Case × 1 次 = 84 次 | `reports/benchmark-20260922T151906-32759d/` |
-| 三候选决赛 | 3 模型 × 14 Case × 5 次 = 210 次 | `reports/benchmark-20260922T205327-9dd69b/` |
+| 批次 | 规模 |
+|---|---|
+| 参照基线 | 14 Case × 5 次 = 70 次可运行 |
+| 聚合器初筛 | 7 模型 × 12 Case × 1 次 = 84 次 |
+| 三候选决赛 | 3 模型 × 14 Case × 5 次 = 210 次 |
 
 > **与 2026-09-15 的历史结果不可比**（本文件旧版为 phase1 套件、`scorer_version=3`、8 模型 × 1 次）。旧口径下有两个环境/配置缺陷已经修复：(1) Connector 缺少 `Deployment → ReplicaSet → Pod` 关系链，Deployment 类 Case 拿不到 Pod 证据（当时 0/5）；(2) 各 profile 的 `max_tokens=2048` 会把含 reasoning 的输出截断（`finish_reason=length`，每批约 69 次响应被截断）而虚耗轮次。同一套件下的正确率随修复提升：**65.7%**（旧 Connector + 2048）→ **91.7%**（仅修 Connector，同集合 12 Case）→ **98.6%**（再修 `max_tokens=8192`，见下）。
 
 模型（profile → 远程模型 ID）：`deepseek-flash → deepseek-flash`（直连）、`reference → deepseek/deepseek-v4.1-flash`、`minimax-m2.5 → MiniMaxAI/MiniMax-M2.5`、`kimi-k2.5 → moonshotai/Kimi-K2.5`、`kimi-k2.6 → moonshotai/Kimi-K2.6`、`glm-5.1 → zai-org/GLM-5.1`、`glm-5.2 → zai-org/GLM-5.2`、`qwen3.6-plus → Qwen/Qwen3.6-Plus`、`qwen3.7-plus → Qwen/Qwen3.7-Plus`。
 
-> 身份门禁：benchmark 要求 **响应回显的模型 ID == 请求的模型 ID**，否则整批判为不可比。"DeepSeek V4 flash" 在直连侧必须请求 `deepseek-flash`（请求 `deepseek-v4-flash` 会被回显成 `deepseek-flash` 而判 `model_id_mismatch`）。
 
 ### 一、参照基线：DeepSeek 直连 5×（70 次可运行）
 
@@ -338,12 +349,14 @@ npm run build
 
 ### 三、三个候选 5× 决赛（14 Case × 5 = 70 次/模型）
 
+> 可比性说明：本节前三个候选模型来自同一决赛批次，该批次报告标记 `comparable=true`。DeepSeek 直连基线来自独立参照批次，单模型报告标记 `comparable=false` 属预期；下表的 DeepSeek 行仅提供同套件、同评分器条件下的背景参照，不是同批次横向比较。
+
 | 模型 | 端到端 | 根因准确率 | 错误根因率 | 弃答成功率 | 可回答覆盖率 | 证据召回率 | 系统失败率（其中 180s 超时） | Token / 正确 | 耗时 p50 / p95 |
 |---|---|---|---|---|---|---|---|---|---|
 | **qwen3.7-plus** | **64/70 = 91.4%** | 98.5% | 7.1% | 0.0% | 98.5% | 45.3% | **1.4%（0）** | 49,655 | 64.8s / 139.4s |
 | kimi-k2.6 | 59/70 = 84.3% | 87.7% | 7.1% | 40.0% | 90.8% | 65.3% | 8.6%（8） | 37,983 | 67.4s / 155.6s |
 | glm-5.2 | 58/70 = 82.9% | 89.2% | 5.7% | 0.0% | 89.2% | 66.4% | 11.4%（10） | 35,956 | 53.4s / 147.5s |
-| （锚点）deepseek-flash | 69/70 = 98.6% | 98.5% | 0.0% | 100% | 98.5% | 71.1% | 1.4%（0） | 59,503 | 21.5s / 79.5s |
+| （独立直连参照）deepseek-flash | 69/70 = 98.6% | 98.5% | 0.0% | 100% | 98.5% | 71.1% | 1.4%（0） | 59,503 | 21.5s / 79.5s |
 
 结论：
 
