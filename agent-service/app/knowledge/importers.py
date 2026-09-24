@@ -359,8 +359,10 @@ def _make_chunks(doc: KnowledgeDocument, page_ranges: list[tuple[int, str]],
     from .ingest import chunk_document
 
     tokenizer = getattr(getattr(store, "embeddings", None), "count_tokens", None)
-    max_tokens = getattr(getattr(store, "embeddings", None), "max_tokens", None)
-    target_tokens = min(480, max_tokens - 1) if tokenizer and max_tokens else None
+    target_tokens = getattr(getattr(store, "embeddings", None),
+                            "max_document_tokens", None)
+    if not tokenizer:
+        target_tokens = None
     chunks: list[KnowledgeChunk] = []
     if page_ranges:
         for page_num, page_text in page_ranges:

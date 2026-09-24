@@ -124,7 +124,7 @@ def main() -> None:
         ap.error("--db is only valid for the legacy SQLite seed operation")
     if not (args.import_path or args.list or args.delete):
         ap.error("specify --import, --list, --delete, or legacy --db")
-    store = _configured_store()
+    store = _configured_store(require_postgres=args.import_path is not None)
     if args.import_path:
         from .importers import import_path
         results = import_path(args.import_path, store)
@@ -164,12 +164,19 @@ def _seed(db_path: str, show: bool) -> None:
               f"incidents(verified)={len(store.list_incidents('verified'))}")
 
 
-def _configured_store() -> Any:
+def _configured_store(*, require_postgres: bool = False) -> Any:
     from ..config import Config
     from .factory import create_knowledge_store
-    store = create_knowledge_store(Config())
+    from .postgres_store import PostgresKnowledgeStore
+
+    settings = Config()
+    if require_postgres and not settings.knowledge_database_url:
+        raise SystemExit("file import requires KNOWLEDGE_DATABASE_URL (PostgreSQL)")
+    store = create_knowledge_store(settings)
     if store is None:
-        raise SystemExit("knowledge store is disabled; configure KNOWLEDGE_DATABASE_URL")
+        raise SystemExit("knowledge store is disabled or unavailable")
+    if require_postgres and not isinstance(store, PostgresKnowledgeStore):
+        raise SystemExit("file import requires a PostgreSQL knowledge store")
     return store
 
 

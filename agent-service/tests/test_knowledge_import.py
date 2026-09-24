@@ -209,6 +209,46 @@ def test_token_limited_chunks_use_embedding_text_and_preserve_content():
     assert all(piece.page_start == 3 and piece.page_end == 3 for piece in pieces)
 
 
+@pytest.mark.parametrize(("model_limit", "safe_limit"), [(256, 224), (512, 480)])
+def test_import_chunks_use_embedding_provider_safe_limit(model_limit, safe_limit):
+    from app.knowledge.importers import _make_chunks
+
+    class Embeddings:
+        max_tokens = model_limit
+        max_document_tokens = safe_limit
+
+        def count_tokens(self, texts):
+            return [len(text) for text in texts]
+
+    doc = KnowledgeDocument(
+        document_id="limited", source_type="runbook", title="Limited",
+        content="x" * 1000,
+    )
+    chunks = _make_chunks(doc, [], MemoryStore(Embeddings()))
+
+    assert len(chunks) > 1
+    assert "".join(chunk.content for chunk in chunks) == doc.content
+    assert all(len(f"{chunk.section}\n{chunk.content}") <= safe_limit for chunk in chunks)
+
+
+def test_file_import_rejects_sqlite_only_configuration_without_creating_legacy_db(
+    monkeypatch, tmp_path
+):
+    import sys
+
+    from app.knowledge import ingest
+
+    sqlite_path = tmp_path / "legacy.db"
+    monkeypatch.setenv("KNOWLEDGE_DATABASE_URL", "")
+    monkeypatch.setenv("KNOWLEDGE_DB", str(sqlite_path))
+    monkeypatch.setattr(sys, "argv", ["ingest", "--import", str(tmp_path)])
+
+    with pytest.raises(SystemExit):
+        ingest.main()
+
+    assert not sqlite_path.exists()
+
+
 def test_verified_incident_sample_checksum_is_stable(tmp_path):
     source = tmp_path / "verified.md"
     source.write_text(

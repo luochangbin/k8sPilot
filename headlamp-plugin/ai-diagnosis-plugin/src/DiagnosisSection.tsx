@@ -293,6 +293,16 @@ function usedForLabel(usedFor?: string): string | null {
   return USED_FOR_LABELS[usedFor] ?? usedFor;
 }
 
+function isHttpSource(sourceUri?: string): boolean {
+  if (!sourceUri) return false;
+  try {
+    const url = new URL(sourceUri);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 function EvidenceBlock({ evidence }: { evidence: Evidence[] }) {
   return (
     <Box
@@ -347,6 +357,8 @@ function KnowledgeRefBlock({ references }: { references: KnowledgeReference[] })
       {references.map(ref => {
         const citation = ref.citation ?? {};
         const used = usedForLabel(ref.used_for);
+        const sourceUri = citation.source_uri;
+        const sourceIsLink = isHttpSource(sourceUri);
         const validPageRange =
           Number.isInteger(citation.page_start) &&
           Number.isInteger(citation.page_end) &&
@@ -377,17 +389,21 @@ function KnowledgeRefBlock({ references }: { references: KnowledgeReference[] })
               ]
                 .filter(Boolean)
                 .join(' · ')}
-              {citation.source_uri && (
+              {sourceUri && (
                 <>
                   {' · '}
-                  <a
-                    href={citation.source_uri}
-                    target="_blank"
-                    rel="noreferrer"
-                    style={{ color: 'inherit' }}
-                  >
-                    来源文档
-                  </a>
+                  {sourceIsLink ? (
+                    <a
+                      href={sourceUri}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ color: 'inherit' }}
+                    >
+                      来源文档
+                    </a>
+                  ) : (
+                    <span>{sourceUri}</span>
+                  )}
                 </>
               )}
             </Typography>

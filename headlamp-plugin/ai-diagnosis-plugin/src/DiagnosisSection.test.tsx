@@ -1,3 +1,4 @@
+/** @vitest-environment jsdom */
 /** Manual-entry section: polling lifecycle and request contract. */
 
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -145,5 +146,47 @@ describe('DiagnosisSection', () => {
 
     const posted = calls[0].body as { resource: { apiVersion: string } };
     expect(posted.resource.apiVersion).toBe('apps/v1');
+  });
+
+  it('renders local filenames as text and only links HTTP(S) knowledge sources', async () => {
+    vi.useRealTimers();
+    try {
+      const result = {
+        symptom: 'Pod is pending',
+        evidence: [],
+        root_cause: 'Scheduling constraints',
+        recommendations: [],
+        missing_evidence: [],
+        investigation_steps: [],
+        knowledge_references: [
+          {
+            retrieval_id: 'local',
+            content: 'Local guide excerpt',
+            citation: { title: 'Local guide', source_uri: 'guide.pdf' },
+          },
+          {
+            retrieval_id: 'web',
+            content: 'Web guide excerpt',
+            citation: { title: 'Web guide', source_uri: 'https://docs.example/guide' },
+          },
+        ],
+      };
+      stubFetch([
+        () => ({ diagnosis_id: 'diag_A' }),
+        () => ({ ...diagnosis('completed'), result }),
+      ]);
+
+      render(<DiagnosisSection resource={resource() as never} />);
+      fireEvent.click(screen.getByRole('button', { name: '智能诊断' }));
+      await screen.findByText('Local guide excerpt');
+
+      const sourceLinks = screen.getAllByRole('link', { name: '来源文档' });
+      expect(sourceLinks).toHaveLength(1);
+      expect(sourceLinks[0].getAttribute('href')).toBe('https://docs.example/guide');
+      expect(screen.getByText('guide.pdf')).toBeTruthy();
+      expect(screen.queryByRole('link', { name: 'guide.pdf' })).toBeNull();
+    } finally {
+      vi.useFakeTimers();
+    }
   });
 });
